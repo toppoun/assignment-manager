@@ -1,0 +1,9 @@
+[package]
+name = "assignment-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+ical = { version = "0.11", default-features = false, features = ["ical"] }
+serde = { version = "1", features = ["derive"] }
