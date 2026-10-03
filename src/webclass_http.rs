@@ -50,18 +50,24 @@ pub struct WebClassClient {
 }
 
 impl WebClassClient {
-    /// Accept the authenticated client supplied by the future authentication module.
+    /// Accept the authenticated client supplied by the authentication module.
     ///
     /// The caller must build it with `reqwest::redirect::Policy::none()`,
     /// `reqwest::retry::never()`, and a finite timeout (for example, 15 seconds).
     /// reqwest cannot inspect or change these policies on an already built client.
     /// This constructor trusts that crate-internal contract; it creates no HTTP client.
-    #[cfg_attr(not(test), allow(dead_code))] // The production caller arrives in Phase 5C.
     pub(crate) fn from_http(http: Client) -> Self {
         Self {
             http,
             base_url: Url::parse(ORIGIN).expect("the fixed WebClass origin is a valid URL"),
         }
+    }
+
+    /// Internal offline test seam; production callers always use the fixed origin.
+    #[cfg(test)]
+    pub(crate) fn set_test_origin(&mut self, origin: Url) {
+        assert!(matches!(origin.host_str(), Some("127.0.0.1" | "localhost")));
+        self.base_url = origin;
     }
 
     /// Return raw JSON text; JSON validity and course interpretation belong to the parser.

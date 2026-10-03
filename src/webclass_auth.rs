@@ -1,14 +1,675 @@
-//! Offline parsers for the observed WebClass authentication response shapes.
-//! No requests, script execution, URL resolution, or credential storage occur here.
-
-// Production callers arrive in Phase 5C; keep these helpers internal meanwhile.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Hosei HTTP authentication and internal parsers for the observed response shapes.
+//! Credentials are borrowed for one login attempt; scripts are never executed.
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
+use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::cookie::Jar;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, ORIGIN, REFERER};
+use reqwest::{StatusCode, Url};
 use scraper::{Html, Selector};
 use serde_json::Value;
+
+use crate::webclass_http::{WebClassClient, WebClassHttpError};
+
+const HOPPII_ORIGIN: &str = "https://hoppii2025.hosei.ac.jp";
+const IDP_ORIGIN: &str = "https://idp.hosei.ac.jp";
+const WEBCLASS_ORIGIN: &str = "https://lms2025.hosei.ac.jp";
+const USER_PAGE: &str = "/portal/u001/index.php";
+const PORTAL_PUBLIC: &str = "/portal/index.php?next=";
+const PORTAL_LOGIN: &str = "/portal/login/login.php?next=";
+const PARM: &str = "/portal/sso/Parm.php?auth_mode=1&group_id=";
+const AUTHENTICATE: &str = "/openam/json/authenticate";
+const XUI: &str = "/openam/XUI/";
+const CONSENT: &str = "/openam/saml2/consent/";
+const CONSENT_API: &str = "/openam/json/saml2/consent/";
+const TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_REDIRECTS: usize = 10;
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+const PASSWORD_LOGIN_SELECTION: u64 = 0;
+
+/// Borrowed credentials. Deliberately implements neither Debug, Clone nor Serialize.
+///
+/// ```compile_fail
+/// use assignment_manager::webclass_auth::HoseiCredentials;
+/// let credentials = HoseiCredentials::new("student-test", "synthetic-password");
+/// format!("{credentials:?}");
+/// ```
+/// ```compile_fail
+/// use assignment_manager::webclass_auth::HoseiCredentials;
+/// let credentials = HoseiCredentials::new("student-test", "synthetic-password");
+/// credentials.clone();
+/// ```
+/// ```compile_fail
+/// use assignment_manager::webclass_auth::HoseiCredentials;
+/// let credentials = HoseiCredentials::new("student-test", "synthetic-password");
+/// serde_json::to_string(&credentials);
+/// ```
+pub struct HoseiCredentials<'a> {
+    university_id: &'a str,
+    password: &'a str,
+}
+
+impl<'a> HoseiCredentials<'a> {
+    pub fn new(university_id: &'a str, password: &'a str) -> Self {
+        Self {
+            university_id,
+            password,
+        }
+    }
+}
+
+/// Fixed diagnostic labels; no server-provided data is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStep {
+    HoppiiToIdp,
+    IdpToOpenAm,
+    OpenAmInitial,
+    OpenAmCredentials,
+    OpenAmScripted2,
+    OpenAmSuccess,
+    Saml,
+    Consent,
+    HoppiiSession,
+    WebClassSso,
+    WebClassRedirect,
+    ApiVerification,
+}
+
+/// Contains only fixed categories, steps and HTTP status codes, never transport causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoseiAuthError {
+    ClientInitialization,
+    Timeout(AuthStep),
+    Request(AuthStep),
+    HttpStatus(AuthStep, StatusCode),
+    ProtocolChanged(AuthStep),
+    RedirectLimit(AuthStep),
+    ConsentFailed,
+    HoppiiSessionFailed,
+    ApiVerificationFailed,
+}
+
+impl fmt::Display for HoseiAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientInitialization => write!(f, "could not initialize Hosei HTTP session"),
+            Self::Timeout(step) => write!(f, "Hosei authentication timed out at {step:?}"),
+            Self::Request(step) => write!(f, "Hosei authentication request failed at {step:?}"),
+            Self::HttpStatus(step, status) => {
+                write!(f, "Hosei authentication returned HTTP {status} at {step:?}")
+            }
+            Self::ProtocolChanged(step) => {
+                write!(f, "unexpected Hosei authentication protocol at {step:?}")
+            }
+            Self::RedirectLimit(step) => {
+                write!(f, "Hosei authentication redirect limit reached at {step:?}")
+            }
+            Self::ConsentFailed => write!(f, "Hosei SAML consent failed"),
+            Self::HoppiiSessionFailed => {
+                write!(f, "HOPPII application session was not established")
+            }
+            Self::ApiVerificationFailed => {
+                write!(f, "WebClass authentication API verification failed")
+            }
+        }
+    }
+}
+
+impl Error for HoseiAuthError {}
+
+/// Stateless authenticator. Every login creates a new client and an in-memory cookie jar.
+pub struct HoseiAuthenticator;
+
+impl Default for HoseiAuthenticator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HoseiAuthenticator {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Log in once and verify `/courses` as a JSON array before returning the client.
+    /// Does not store credentials, retry authentication, or access credential storage.
+    pub fn login(
+        &self,
+        credentials: HoseiCredentials<'_>,
+    ) -> Result<WebClassClient, HoseiAuthError> {
+        self.login_with_endpoints(credentials, &AuthEndpoints::production())
+    }
+
+    fn login_with_endpoints(
+        &self,
+        credentials: HoseiCredentials<'_>,
+        endpoints: &AuthEndpoints,
+    ) -> Result<WebClassClient, HoseiAuthError> {
+        let session = AuthSession::new(endpoints)?;
+        let auth_url = session.discover_openam()?;
+        let success = session.authenticate(&auth_url, credentials)?;
+        let success_url = resolve_destination(
+            &endpoints.idp,
+            success.success_url(),
+            &endpoints.idp,
+            AuthStep::OpenAmSuccess,
+        )?;
+        session.install_openam_cookie(success.token_id())?;
+        drop(success);
+        session.saml_to_hoppii(success_url)?;
+        session.establish_hoppii_session()?;
+        session.webclass_sso()?;
+
+        let client = WebClassClient::from_http(session.http.clone());
+        #[cfg(test)]
+        let client = {
+            let mut client = client;
+            client.set_test_origin(endpoints.webclass.clone());
+            client
+        };
+        let body = client.fetch_courses_json().map_err(|error| match error {
+            WebClassHttpError::Timeout => HoseiAuthError::Timeout(AuthStep::ApiVerification),
+            WebClassHttpError::Request => HoseiAuthError::Request(AuthStep::ApiVerification),
+            WebClassHttpError::HttpStatus(status) => {
+                HoseiAuthError::HttpStatus(AuthStep::ApiVerification, status)
+            }
+            _ => HoseiAuthError::ApiVerificationFailed,
+        })?;
+        serde_json::from_str::<Vec<Value>>(&body)
+            .map_err(|_| HoseiAuthError::ApiVerificationFailed)?;
+        Ok(client)
+    }
+}
+
+// This configuration never crosses the public API. Tests replace only the three origins.
+struct AuthEndpoints {
+    hoppii: Url,
+    idp: Url,
+    webclass: Url,
+    timeout: Duration,
+}
+
+impl AuthEndpoints {
+    fn production() -> Self {
+        Self {
+            hoppii: Url::parse(HOPPII_ORIGIN).expect("fixed HOPPII origin"),
+            idp: Url::parse(IDP_ORIGIN).expect("fixed IdP origin"),
+            webclass: Url::parse(WEBCLASS_ORIGIN).expect("fixed WebClass origin"),
+            timeout: TIMEOUT,
+        }
+    }
+}
+
+struct AuthSession<'a> {
+    http: Client,
+    jar: Arc<Jar>,
+    endpoints: &'a AuthEndpoints,
+}
+
+impl<'a> AuthSession<'a> {
+    fn new(endpoints: &'a AuthEndpoints) -> Result<Self, HoseiAuthError> {
+        let jar = Arc::new(Jar::default());
+        let builder = Client::builder()
+            .cookie_provider(Arc::clone(&jar))
+            .timeout(endpoints.timeout)
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .referer(false);
+        #[cfg(test)]
+        let builder = builder.no_proxy();
+        let http = builder
+            .build()
+            .map_err(|_| HoseiAuthError::ClientInitialization)?;
+        Ok(Self {
+            http,
+            jar,
+            endpoints,
+        })
+    }
+
+    fn discover_openam(&self) -> Result<Url, HoseiAuthError> {
+        let response = send(
+            self.http.get(endpoint(&self.endpoints.hoppii, USER_PAGE)),
+            AuthStep::HoppiiToIdp,
+        )?;
+        let idp_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::HoppiiToIdp)?;
+        let response = send(self.http.get(idp_url), AuthStep::IdpToOpenAm)?;
+        let xui_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::IdpToOpenAm)?;
+        parse_xui_auth_url(&xui_url, &self.endpoints.idp)
+    }
+
+    fn openam_post(&self, url: &Url) -> RequestBuilder {
+        self.http
+            .post(url.clone())
+            .header("Accept-API-Version", "protocol=1.0,resource=2.0")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-Username", "anonymous")
+            .header("X-Password", "anonymous")
+            .header("X-NoSession", "true")
+            .header(REFERER, endpoint(&self.endpoints.idp, XUI).as_str())
+    }
+
+    fn authenticate(
+        &self,
+        auth_url: &Url,
+        credentials: HoseiCredentials<'_>,
+    ) -> Result<OpenAmSuccess, HoseiAuthError> {
+        let initial = read_ok(
+            send(self.openam_post(auth_url), AuthStep::OpenAmInitial)?,
+            AuthStep::OpenAmInitial,
+        )?;
+        let state = parse_openam_state(&initial)
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::OpenAmInitial))?;
+        drop(initial);
+        let raw = credential_payload(state, credentials)?;
+        let response = send(
+            self.openam_post(auth_url).json(&raw),
+            AuthStep::OpenAmCredentials,
+        );
+        // Drop the credential-bearing tree before inspecting either the response or error.
+        drop(raw);
+        let text = read_ok(response?, AuthStep::OpenAmCredentials)?;
+        let state = parse_openam_state(&text)
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::OpenAmCredentials))?;
+        drop(text);
+        state
+            .validate_scripted2()
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::OpenAmScripted2))?;
+        let raw = state.into_raw();
+        let response = send(
+            self.openam_post(auth_url).json(&raw),
+            AuthStep::OpenAmScripted2,
+        );
+        drop(raw);
+        let text = read_ok(response?, AuthStep::OpenAmScripted2)?;
+        parse_openam_success(&text)
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::OpenAmSuccess))
+    }
+
+    fn install_openam_cookie(&self, token: &str) -> Result<(), HoseiAuthError> {
+        // RFC 6265 cookie-octet: prevent an opaque token from injecting cookie attributes.
+        if token.is_empty()
+            || !token.bytes().all(
+                |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+            )
+        {
+            return Err(HoseiAuthError::ProtocolChanged(AuthStep::OpenAmSuccess));
+        }
+        let domain = self.endpoints.idp.host_str().expect("fixed IdP has a host");
+        // Only the private localhost test configuration uses HTTP.
+        let secure = if self.endpoints.idp.scheme() == "https" {
+            "; Secure"
+        } else {
+            ""
+        };
+        let cookie =
+            format!("iPlanetDirectoryPro={token}; Domain={domain}; Path=/; HttpOnly{secure}");
+        self.jar.add_cookie_str(&cookie, &self.endpoints.idp);
+        Ok(())
+    }
+
+    fn saml_to_hoppii(&self, success_url: Url) -> Result<(), HoseiAuthError> {
+        let response = send(self.http.get(success_url), AuthStep::Saml)?;
+        let response = if is_redirect(response.status()) {
+            let consent_url =
+                redirect_destination(&response, &self.endpoints.idp, AuthStep::Consent)?;
+            if consent_url.path() != CONSENT {
+                return Err(HoseiAuthError::ProtocolChanged(AuthStep::Consent));
+            }
+            self.consent(&consent_url)?
+        } else {
+            response
+        };
+        let base = response.url().clone();
+        let text = read_ok(response, AuthStep::Saml)?;
+        let form = parse_auto_submit_form(&text)
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::Saml))?;
+        form.validate_saml()
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::Saml))?;
+        let action =
+            resolve_destination(&base, form.action(), &self.endpoints.hoppii, AuthStep::Saml)?;
+        let response = send(
+            self.http.post(action).form(&form_pairs(&form)),
+            AuthStep::Saml,
+        )?;
+        if !matches!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
+        ) {
+            require_ok(&response, AuthStep::Saml)?;
+            return Err(HoseiAuthError::ProtocolChanged(AuthStep::Saml));
+        }
+        self.follow_hoppii_get_redirects(response)?;
+        Ok(())
+    }
+
+    fn consent(&self, url: &Url) -> Result<Response, HoseiAuthError> {
+        let step = AuthStep::Consent;
+        let consent_id = required_query_parameter(url, "consentID", step)?;
+        let original = required_query_parameter(url, "originalRequestURI", step)?;
+        if consent_id.is_empty() || matches!(consent_id.as_str(), "." | "..") || original.is_empty()
+        {
+            return Err(HoseiAuthError::ConsentFailed);
+        }
+        let mut return_url =
+            resolve_destination(&self.endpoints.idp, &original, &self.endpoints.idp, step)?;
+        return_url
+            .query_pairs_mut()
+            .append_pair("consentID", &consent_id);
+        let mut api = endpoint(&self.endpoints.idp, CONSENT_API);
+        api.path_segments_mut()
+            .expect("fixed HTTP URL")
+            .pop_if_empty()
+            .push(&consent_id);
+        api.query_pairs_mut()
+            .append_pair("_action", "getAttributes");
+        let text = read_ok(
+            send(
+                self.http
+                    .post(api.clone())
+                    .header("Accept-API-Version", "protocol=1.0,resource=1.0")
+                    .json(&serde_json::json!({"history": null})),
+                step,
+            )?,
+            step,
+        )?;
+        let attributes: Value =
+            serde_json::from_str(&text).map_err(|_| HoseiAuthError::ConsentFailed)?;
+        let attributes = attributes.as_array().ok_or(HoseiAuthError::ConsentFailed)?;
+        let mut names = Vec::new();
+        for item in attributes {
+            let item = item.as_object().ok_or(HoseiAuthError::ConsentFailed)?;
+            if let Some(name) = item.get("attributeName") {
+                names.push(
+                    name.as_str()
+                        .filter(|name| !name.is_empty())
+                        .ok_or(HoseiAuthError::ConsentFailed)?,
+                );
+            }
+        }
+        api.set_query(None);
+        api.query_pairs_mut().append_pair("_action", "agree");
+        let response = send(self.http.post(api)
+            .header("Accept-API-Version", "protocol=1.0,resource=1.0")
+            .json(&serde_json::json!({"type": "ASK_IF_CHANGE", "attributes": names, "history": null})), step)?;
+        if !response.status().is_success() {
+            return Err(HoseiAuthError::HttpStatus(step, response.status()));
+        }
+        send(self.http.get(return_url), AuthStep::Saml)
+    }
+
+    /// Only bounded same-origin GETs; never replay a SAML POST on a redirect.
+    fn follow_hoppii_get_redirects(
+        &self,
+        mut response: Response,
+    ) -> Result<Response, HoseiAuthError> {
+        for followed in 0..=MAX_REDIRECTS {
+            if !is_redirect(response.status()) {
+                require_ok(&response, AuthStep::HoppiiSession)?;
+                return Ok(response);
+            }
+            let target =
+                redirect_destination(&response, &self.endpoints.hoppii, AuthStep::HoppiiSession)?;
+            if followed == MAX_REDIRECTS {
+                return Err(HoseiAuthError::RedirectLimit(AuthStep::HoppiiSession));
+            }
+            response = send(self.http.get(target), AuthStep::HoppiiSession)?;
+        }
+        unreachable!("bounded loop returns at the limit")
+    }
+
+    fn establish_hoppii_session(&self) -> Result<(), HoseiAuthError> {
+        let origin = &self.endpoints.hoppii;
+        let response = send(
+            self.http
+                .get(endpoint(origin, PORTAL_LOGIN))
+                .header(REFERER, endpoint(origin, PORTAL_PUBLIC).as_str()),
+            AuthStep::HoppiiSession,
+        )?;
+        self.follow_hoppii_get_redirects(response)?;
+        let response = send(
+            self.http
+                .get(endpoint(origin, USER_PAGE))
+                .header(REFERER, endpoint(origin, PORTAL_LOGIN).as_str()),
+            AuthStep::HoppiiSession,
+        )?;
+        let response = self.follow_hoppii_get_redirects(response)?;
+        if response.url().path() != USER_PAGE {
+            return Err(HoseiAuthError::HoppiiSessionFailed);
+        }
+        Ok(())
+    }
+
+    fn webclass_sso(&self) -> Result<(), HoseiAuthError> {
+        let response = send(
+            self.http
+                .get(endpoint(&self.endpoints.hoppii, PARM))
+                .header(
+                    REFERER,
+                    endpoint(&self.endpoints.hoppii, USER_PAGE).as_str(),
+                )
+                .header(ACCEPT, "text/html"),
+            AuthStep::WebClassSso,
+        )?;
+        let base = response.url().clone();
+        let text = read_ok(response, AuthStep::WebClassSso)?;
+        let form = parse_auto_submit_form(&text)
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::WebClassSso))?;
+        form.validate_hoppii_csso()
+            .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::WebClassSso))?;
+        let action = resolve_destination(
+            &base,
+            form.action(),
+            &self.endpoints.webclass,
+            AuthStep::WebClassSso,
+        )?;
+        let response = send(
+            self.http
+                .post(action)
+                .header(REFERER, base.as_str())
+                .header(ORIGIN, self.endpoints.hoppii.origin().ascii_serialization())
+                .form(&form_pairs(&form)),
+            AuthStep::WebClassSso,
+        )?;
+        self.follow_webclass_redirects(response)
+    }
+
+    fn follow_webclass_redirects(&self, mut response: Response) -> Result<(), HoseiAuthError> {
+        let step = AuthStep::WebClassRedirect;
+        for followed in 0..=MAX_REDIRECTS {
+            let base = response.url().clone();
+            let target = if is_redirect(response.status()) {
+                Some(redirect_destination(
+                    &response,
+                    &self.endpoints.webclass,
+                    step,
+                )?)
+            } else {
+                let text = read_ok(response, step)?;
+                parse_webclass_js_redirect(&text)
+                    .map_err(|_| HoseiAuthError::ProtocolChanged(step))?
+                    .map(|location| {
+                        resolve_destination(&base, &location, &self.endpoints.webclass, step)
+                    })
+                    .transpose()?
+            };
+            let Some(target) = target else { return Ok(()) };
+            if followed == MAX_REDIRECTS {
+                return Err(HoseiAuthError::RedirectLimit(step));
+            }
+            response = send(self.http.get(target).header(REFERER, base.as_str()), step)?;
+        }
+        unreachable!("bounded loop returns at the limit")
+    }
+}
+
+fn endpoint(origin: &Url, path: &str) -> Url {
+    origin.join(path).expect("fixed endpoint path")
+}
+
+fn resolve_destination(
+    base: &Url,
+    location: &str,
+    origin: &Url,
+    step: AuthStep,
+) -> Result<Url, HoseiAuthError> {
+    let target = base
+        .join(location)
+        .map_err(|_| HoseiAuthError::ProtocolChanged(step))?;
+    if target.origin() != origin.origin()
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
+        return Err(HoseiAuthError::ProtocolChanged(step));
+    }
+    Ok(target)
+}
+
+fn is_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn redirect_destination(
+    response: &Response,
+    origin: &Url,
+    step: AuthStep,
+) -> Result<Url, HoseiAuthError> {
+    if !is_redirect(response.status()) {
+        require_ok(response, step)?;
+        return Err(HoseiAuthError::ProtocolChanged(step));
+    }
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(HoseiAuthError::ProtocolChanged(step))?;
+    resolve_destination(response.url(), location, origin, step)
+}
+
+fn send(request: RequestBuilder, step: AuthStep) -> Result<Response, HoseiAuthError> {
+    request.send().map_err(|error| transport_error(error, step))
+}
+
+fn transport_error(error: reqwest::Error, step: AuthStep) -> HoseiAuthError {
+    if error.is_timeout() {
+        HoseiAuthError::Timeout(step)
+    } else {
+        HoseiAuthError::Request(step)
+    }
+}
+
+fn require_ok(response: &Response, step: AuthStep) -> Result<(), HoseiAuthError> {
+    if response.status() == StatusCode::OK {
+        Ok(())
+    } else if !response.status().is_success() {
+        Err(HoseiAuthError::HttpStatus(step, response.status()))
+    } else {
+        Err(HoseiAuthError::ProtocolChanged(step))
+    }
+}
+
+fn read_ok(response: Response, step: AuthStep) -> Result<String, HoseiAuthError> {
+    require_ok(&response, step)?;
+    let bytes = response
+        .bytes()
+        .map_err(|error| transport_error(error, step))?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| HoseiAuthError::ProtocolChanged(step))
+}
+
+fn required_query_parameter(
+    url: &Url,
+    name: &str,
+    step: AuthStep,
+) -> Result<String, HoseiAuthError> {
+    let mut matches = url.query_pairs().filter(|(key, _)| key == name);
+    let (_, value) = matches
+        .next()
+        .ok_or(HoseiAuthError::ProtocolChanged(step))?;
+    if matches.next().is_some() {
+        return Err(HoseiAuthError::ProtocolChanged(step));
+    }
+    Ok(value.into_owned())
+}
+
+fn parse_xui_auth_url(xui: &Url, idp: &Url) -> Result<Url, HoseiAuthError> {
+    let step = AuthStep::IdpToOpenAm;
+    resolve_destination(idp, xui.as_str(), idp, step)?;
+    if xui.path() != XUI {
+        return Err(HoseiAuthError::ProtocolChanged(step));
+    }
+    let (_, query) = xui
+        .fragment()
+        .and_then(|fragment| fragment.split_once("/&"))
+        .filter(|(route, query)| !route.is_empty() && !query.is_empty())
+        .ok_or(HoseiAuthError::ProtocolChanged(step))?;
+    let mut params = xui.clone();
+    params.set_fragment(None);
+    params.set_query(Some(query));
+    let mut auth_url = endpoint(idp, AUTHENTICATE);
+    for name in [
+        "realm",
+        "forward",
+        "spEntityID",
+        "askConsent",
+        "goto",
+        "AMAuthCookie",
+    ] {
+        let mut value = required_query_parameter(&params, name, step)?;
+        if name == "goto" {
+            if value.starts_with('/') && !value.starts_with("//") && !value.starts_with("/openam/")
+            {
+                value.insert_str(0, "/openam");
+            }
+            resolve_destination(idp, &value, idp, step)?;
+        }
+        auth_url.query_pairs_mut().append_pair(name, &value);
+    }
+    Ok(auth_url)
+}
+
+fn credential_payload(
+    state: OpenAmState,
+    credentials: HoseiCredentials<'_>,
+) -> Result<Value, HoseiAuthError> {
+    state
+        .validate_credential_callbacks()
+        .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::OpenAmCredentials))?;
+    let mut raw = state.into_raw();
+    for callback in raw["callbacks"]
+        .as_array_mut()
+        .expect("validated callbacks")
+    {
+        let value = match callback["type"].as_str() {
+            Some("NameCallback") => Value::String(credentials.university_id.to_owned()),
+            Some("PasswordCallback") => Value::String(credentials.password.to_owned()),
+            Some("ConfirmationCallback") => Value::from(PASSWORD_LOGIN_SELECTION),
+            _ => continue, // Validation permits only the read-only TextOutputCallback here.
+        };
+        callback["input"][0]["value"] = value;
+    }
+    Ok(raw)
+}
+
+fn form_pairs(form: &AutoSubmitForm) -> Vec<(&str, &str)> {
+    form.fields()
+        .iter()
+        .map(|field| (field.name(), field.value()))
+        .collect()
+}
 
 /// Only fixed field names and categories are retained, never response values or causes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +743,7 @@ impl OpenAmState {
             .expect("parse_openam_state validated callbacks; raw is private")
     }
 
+    #[cfg(test)]
     pub(crate) fn callback_types(&self) -> impl Iterator<Item = &str> {
         self.callbacks().iter().map(|callback| {
             callback["type"]
@@ -168,7 +830,7 @@ impl OpenAmState {
         Ok(())
     }
 
-    /// Transfer the unchanged tree for future selective edits and reposting.
+    /// Transfer the unchanged tree for selective edits and reposting.
     /// Serializing this Value retains unknown fields; callers must never log it.
     pub(crate) fn into_raw(self) -> Value {
         self.raw
@@ -437,6 +1099,10 @@ fn quoted_redirect(value: &str) -> Result<String, WebClassAuthParseError> {
     }
     Err(WebClassAuthParseError::InvalidRedirect)
 }
+
+#[cfg(test)]
+#[path = "webclass_auth_tests.rs"]
+mod flow_tests;
 
 #[cfg(test)]
 mod tests {
