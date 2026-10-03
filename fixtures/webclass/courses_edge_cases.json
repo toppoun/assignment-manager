@@ -1,0 +1,71 @@
+[
+  {
+    "group_id": "fixture-course-004",
+    "group_name": "共通演習",
+    "group_memo": "テスト用のお知らせです。",
+    "level_one": "fixture-level-004",
+    "level_two": null,
+    "status": "0",
+    "group_name_en": null,
+    "open_period_start": "",
+    "open_period_end": "",
+    "class_id": "fixture-class-004",
+    "semester": "2",
+    "day_of_week": "0",
+    "class_order": "0",
+    "activity_type": "0",
+    "year": 2026,
+    "children": "",
+    "course_perm": "128",
+    "perms": {
+      "PERM_COURSE_RESULT": false
+    },
+    "is_author": false
+  },
+  {
+    "group_id": "fixture-course-005",
+    "group_name": "複数時限演習",
+    "group_memo": "",
+    "level_one": "fixture-level-005",
+    "level_two": null,
+    "status": "0",
+    "group_name_en": null,
+    "open_period_start": "",
+    "open_period_end": "",
+    "class_id": "fixture-class-005",
+    "semester": "2",
+    "day_of_week": "1",
+    "class_order": "1",
+    "activity_type": "0",
+    "year": 2026,
+    "children": "a:1:{i:0;a:2:{s:11:\"day_of_week\";i:1;s:11:\"class_order\";i:2;}}",
+    "course_perm": "128",
+    "perms": {
+      "PERM_COURSE_RESULT": false
+    },
+    "is_author": false
+  },
+  {
+    "group_id": "fixture-course-006",
+    "group_name": "基礎ゼミ",
+    "group_memo": "",
+    "level_one": null,
+    "level_two": null,
+    "status": "0",
+    "group_name_en": "",
+    "open_period_start": "",
+    "open_period_end": "",
+    "class_id": "fixture-class-006",
+    "semester": "2",
+    "day_of_week": "0",
+    "class_order": "0",
+    "activity_type": "0",
+    "year": 2025,
+    "children": "",
+    "course_perm": "128",
+    "perms": {
+      "PERM_COURSE_RESULT": false
+    },
+    "is_author": false
+  }
+]

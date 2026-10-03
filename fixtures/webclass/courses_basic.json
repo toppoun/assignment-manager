@@ -1,0 +1,71 @@
+[
+  {
+    "group_id": "fixture-course-001",
+    "group_name": "線形代数",
+    "group_memo": "",
+    "level_one": "fixture-level-001",
+    "level_two": null,
+    "status": "0",
+    "group_name_en": null,
+    "open_period_start": "",
+    "open_period_end": "",
+    "class_id": "fixture-class-001",
+    "semester": "2",
+    "day_of_week": "1",
+    "class_order": "4",
+    "activity_type": "0",
+    "year": 2026,
+    "children": "",
+    "course_perm": "128",
+    "perms": {
+      "PERM_COURSE_RESULT": false
+    },
+    "is_author": false
+  },
+  {
+    "group_id": "fixture-course-002",
+    "group_name": "プログラミング演習",
+    "group_memo": "",
+    "level_one": "fixture-level-002",
+    "level_two": null,
+    "status": "0",
+    "group_name_en": null,
+    "open_period_start": "",
+    "open_period_end": "",
+    "class_id": "fixture-class-002",
+    "semester": "2",
+    "day_of_week": "2",
+    "class_order": "1",
+    "activity_type": "0",
+    "year": 2026,
+    "children": "",
+    "course_perm": "128",
+    "perms": {
+      "PERM_COURSE_RESULT": false
+    },
+    "is_author": false
+  },
+  {
+    "group_id": "fixture-course-003",
+    "group_name": "データベース基礎",
+    "group_memo": "",
+    "level_one": "fixture-level-003",
+    "level_two": null,
+    "status": "0",
+    "group_name_en": null,
+    "open_period_start": "",
+    "open_period_end": "",
+    "class_id": "fixture-class-003",
+    "semester": "2",
+    "day_of_week": "5",
+    "class_order": "2",
+    "activity_type": "0",
+    "year": 2026,
+    "children": "",
+    "course_perm": "128",
+    "perms": {
+      "PERM_COURSE_RESULT": false
+    },
+    "is_author": false
+  }
+]

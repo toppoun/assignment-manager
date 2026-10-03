@@ -1,0 +1,101 @@
+[
+  {
+    "contents_id": "fixture-content-001",
+    "contents_kind": "Question",
+    "contents_name": "演習課題A",
+    "contents_perm": "7",
+    "group_id": "fixture-course-002",
+    "auther_id": "fixture-author-001",
+    "time_limit": "0",
+    "start_date": "2026-09-01 09:00:00",
+    "end_date": "2026-10-31 23:59:59",
+    "border": null,
+    "exec_times": "0",
+    "disp_order": "4",
+    "allow_update": "1",
+    "new_mark": "1",
+    "allowed_user": "",
+    "lock_password": false,
+    "exec_password": false,
+    "created_by_id": "fixture-author-001",
+    "unit": false,
+    "scores": [
+      {
+        "user_id": "fixture-user-001",
+        "username": "student001",
+        "realname": "テスト　太郎",
+        "max_score": null,
+        "answer_datetime": null
+      }
+    ],
+    "hidden_score": false,
+    "enquete": false,
+    "hidden_content": false
+  },
+  {
+    "contents_id": "fixture-content-002",
+    "contents_kind": "Question",
+    "contents_name": "演習課題B",
+    "contents_perm": "7",
+    "group_id": "fixture-course-002",
+    "auther_id": "fixture-author-001",
+    "time_limit": "0",
+    "start_date": "2026-09-02 09:00:00",
+    "end_date": "2026-11-01 23:59:59",
+    "border": null,
+    "exec_times": "0",
+    "disp_order": "5",
+    "allow_update": "1",
+    "new_mark": "1",
+    "allowed_user": "",
+    "lock_password": false,
+    "exec_password": false,
+    "created_by_id": "fixture-author-001",
+    "unit": false,
+    "scores": [
+      {
+        "user_id": "fixture-user-001",
+        "username": "student001",
+        "realname": "テスト　太郎",
+        "max_score": null,
+        "answer_datetime": null
+      }
+    ],
+    "hidden_score": false,
+    "enquete": false,
+    "hidden_content": false
+  },
+  {
+    "contents_id": "fixture-content-003",
+    "contents_kind": "Question",
+    "contents_name": "演習課題C",
+    "contents_perm": "7",
+    "group_id": "fixture-course-002",
+    "auther_id": "fixture-author-001",
+    "time_limit": "0",
+    "start_date": "2026-09-03 09:00:00",
+    "end_date": "2026-11-02 23:59:59",
+    "border": null,
+    "exec_times": "0",
+    "disp_order": "6",
+    "allow_update": "1",
+    "new_mark": "1",
+    "allowed_user": "",
+    "lock_password": false,
+    "exec_password": false,
+    "created_by_id": "fixture-author-001",
+    "unit": false,
+    "scores": [
+      {
+        "user_id": "fixture-user-001",
+        "username": "student001",
+        "realname": "テスト　太郎",
+        "max_score": null,
+        "answer_datetime": null
+      }
+    ],
+    "hidden_score": false,
+    "enquete": false,
+    "hidden_content": false
+  }
+]

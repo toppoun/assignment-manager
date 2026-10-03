@@ -1,0 +1,101 @@
+[
+  {
+    "contents_id": "fixture-content-004",
+    "contents_kind": "Question",
+    "contents_name": "未回答の課題",
+    "contents_perm": "7",
+    "group_id": "fixture-course-002",
+    "auther_id": "fixture-author-001",
+    "time_limit": "0",
+    "start_date": "2026-09-01 09:00:00",
+    "end_date": "2026-10-31 23:59:59",
+    "border": null,
+    "exec_times": "0",
+    "disp_order": "1",
+    "allow_update": "1",
+    "new_mark": "1",
+    "allowed_user": "",
+    "lock_password": false,
+    "exec_password": false,
+    "created_by_id": "fixture-author-001",
+    "unit": false,
+    "scores": [
+      {
+        "user_id": "fixture-user-001",
+        "username": "student001",
+        "realname": "テスト　太郎",
+        "max_score": null,
+        "answer_datetime": null
+      }
+    ],
+    "hidden_score": false,
+    "enquete": false,
+    "hidden_content": false
+  },
+  {
+    "contents_id": "fixture-content-005",
+    "contents_kind": "Question",
+    "contents_name": "回答済みの課題",
+    "contents_perm": "7",
+    "group_id": "fixture-course-002",
+    "auther_id": "fixture-author-001",
+    "time_limit": "0",
+    "start_date": "2026-09-01 09:00:00",
+    "end_date": "2026-10-31 23:59:59",
+    "border": null,
+    "exec_times": "0",
+    "disp_order": "0",
+    "allow_update": "1",
+    "new_mark": "1",
+    "allowed_user": "",
+    "lock_password": false,
+    "exec_password": false,
+    "created_by_id": "fixture-author-001",
+    "unit": false,
+    "scores": [
+      {
+        "user_id": "fixture-user-001",
+        "username": "student001",
+        "realname": "テスト　太郎",
+        "max_score": 3,
+        "answer_datetime": "2026-09-20 10:20:30"
+      }
+    ],
+    "hidden_score": false,
+    "enquete": false,
+    "hidden_content": false
+  },
+  {
+    "contents_id": "fixture-content-006",
+    "contents_kind": "Question",
+    "contents_name": "0点で回答済みの課題",
+    "contents_perm": "7",
+    "group_id": "fixture-course-002",
+    "auther_id": "fixture-author-001",
+    "time_limit": "0",
+    "start_date": "2026-09-01 09:00:00",
+    "end_date": "2026-10-31 23:59:59",
+    "border": null,
+    "exec_times": "0",
+    "disp_order": "10",
+    "allow_update": "1",
+    "new_mark": "1",
+    "allowed_user": "",
+    "lock_password": false,
+    "exec_password": false,
+    "created_by_id": "fixture-author-001",
+    "unit": false,
+    "scores": [
+      {
+        "user_id": "fixture-user-001",
+        "username": "student001",
+        "realname": "テスト　太郎",
+        "max_score": 0,
+        "answer_datetime": "2026-09-21 11:22:33"
+      }
+    ],
+    "hidden_score": false,
+    "enquete": false,
+    "hidden_content": false
+  }
+]
