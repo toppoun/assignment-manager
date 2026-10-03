@@ -1,0 +1,23 @@
+{
+  "authId": "synthetic-openam-scripted2-auth-id",
+  "stage": "Scripted2",
+  "callbacks": [
+    {
+      "type": "HiddenValueCallback",
+      "output": [
+        { "name": "value", "value": "synthetic-hidden-value" },
+        { "name": "id", "value": "synthetic-hidden-field-id" }
+      ],
+      "input": [
+        { "name": "IDToken401", "value": "synthetic-hidden-input" }
+      ]
+    },
+    {
+      "type": "TextOutputCallback",
+      "output": [
+        { "name": "message", "value": "Synthetic Scripted2 output" },
+        { "name": "messageType", "value": 0 }
+      ]
+    }
+  ]
+}

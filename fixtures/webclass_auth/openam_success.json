@@ -1,0 +1,4 @@
+{
+  "tokenId": "synthetic-openam-token",
+  "successUrl": "/openam/SSORedirect/metaAlias/synthetic-idp?ReqID=synthetic-request-id"
+}

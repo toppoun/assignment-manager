@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Synthetic SAML response</title></head>
+<body onload="document.getElementById('synthetic-saml-form').submit()">
+  <form id="synthetic-saml-form" method="post" action="https://synthetic-hoppii.example.invalid/synthetic-saml/acs?requestId=synthetic-saml-request-id">
+    <input type="hidden" name="SAMLResponse" value="synthetic-saml-response-not-an-assertion">
+    <input type="hidden" name="RelayState" value="synthetic-relay-state">
+  </form>
+</body>
+</html>

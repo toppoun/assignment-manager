@@ -1,0 +1,44 @@
+{
+  "authId": "synthetic-openam-initial-auth-id",
+  "stage": "SyntheticInitial",
+  "callbacks": [
+    {
+      "type": "TextOutputCallback",
+      "output": [
+        { "name": "message", "value": "Synthetic initial authentication message" },
+        { "name": "messageType", "value": 0 }
+      ]
+    },
+    {
+      "type": "ConfirmationCallback",
+      "output": [
+        { "name": "prompt", "value": "Synthetic confirmation prompt" },
+        { "name": "messageType", "value": 0 },
+        { "name": "options", "value": ["Synthetic continue", "Synthetic cancel"] },
+        { "name": "optionType", "value": -1 },
+        { "name": "defaultOption", "value": 0 }
+      ],
+      "input": [
+        { "name": "IDToken301", "value": 0 }
+      ]
+    },
+    {
+      "type": "PasswordCallback",
+      "output": [
+        { "name": "prompt", "value": "Synthetic password prompt" }
+      ],
+      "input": [
+        { "name": "IDToken201", "value": "" }
+      ]
+    },
+    {
+      "type": "NameCallback",
+      "output": [
+        { "name": "prompt", "value": "Synthetic username prompt" }
+      ],
+      "input": [
+        { "name": "IDToken101", "value": "" }
+      ]
+    }
+  ]
+}
