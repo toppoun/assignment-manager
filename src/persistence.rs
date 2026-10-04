@@ -1,7 +1,7 @@
-//! SQLite schema v1 and domain readers. No authentication or import data enters this API.
+//! SQLite schema v1, domain readers and explicit entity creation/source binding.
 //!
-//! Domain insertion helpers are private and test-only for Phase 6B1. Production
-//! writes will be purpose-specific to respect source/local field ownership.
+//! Bindings accept non-secret logical identifiers only. Authentication values and
+//! feed URLs must never be passed as identities. Candidate import/merge is separate.
 
 use std::error::Error;
 use std::fmt;
@@ -9,14 +9,16 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, TransactionBehavior, ffi, params};
 
 use crate::domain::{
     Assignment, AssignmentId, ClassSlot, CompletionState, Course, CourseId, DayOfWeek, Deadline,
     ScheduleEntry, SubmissionTarget,
 };
+use crate::import::{ExternalRecordKey, OriginKind};
 
 const SCHEMA_VERSION: i64 = 1;
+const ID_INSERT_ATTEMPTS: usize = 4;
 const TABLES: [&str; 5] = [
     "courses",
     "assignments",
@@ -102,6 +104,11 @@ pub enum PersistenceError {
     Database,
     InvalidStoredData,
     Constraint,
+    IdGenerationFailed,
+    InvalidExternalIdentity,
+    EntityAlreadyBound,
+    ExternalIdentityAlreadyBound,
+    NotFound,
 }
 
 impl fmt::Display for PersistenceError {
@@ -114,11 +121,26 @@ impl fmt::Display for PersistenceError {
             Self::Database => "SQLite operation failed",
             Self::InvalidStoredData => "invalid stored domain data",
             Self::Constraint => "SQLite constraint violation",
+            Self::IdGenerationFailed => "could not allocate an internal ID",
+            Self::InvalidExternalIdentity => "external identity is empty or whitespace-only",
+            Self::EntityAlreadyBound => "entity already has a source binding",
+            Self::ExternalIdentityAlreadyBound => "external identity already has a binding",
+            Self::NotFound => "binding target does not exist",
         })
     }
 }
 
 impl Error for PersistenceError {}
+
+/// Fields for a normal hand-entered assignment. Completion starts as `Incomplete`;
+/// no external identity or caller-supplied internal ID is accepted.
+pub struct ManualAssignmentInput {
+    pub title: String,
+    pub deadline: Option<Deadline>,
+    pub course_id: Option<CourseId>,
+    pub submission: SubmissionTarget,
+    pub submission_url: Option<String>,
+}
 
 /// Concrete synchronous SQLite store. The caller chooses the database path.
 pub struct SqliteStore {
@@ -176,36 +198,315 @@ impl SqliteStore {
             )
             .optional()
             .map_err(database_error)?;
-        let course = if let Some(stored) = stored {
-            validate_metadata(&stored.created_at, &stored.updated_at)?;
-            let mut schedule = Vec::new();
-            let mut stmt = tx
-                .prepare(
-                    "SELECT position, entry_kind, day, period
-                     FROM course_schedule WHERE course_id = ?1 ORDER BY position",
-                )
-                .map_err(database_error)?;
-            let mut rows = stmt.query([id.as_str()]).map_err(database_error)?;
-            while let Some(row) = rows.next().map_err(database_error)? {
-                let position: i64 = row.get(0).map_err(database_error)?;
-                if usize::try_from(position).ok() != Some(schedule.len()) {
-                    return Err(PersistenceError::InvalidStoredData);
-                }
-                let kind: String = row.get(1).map_err(database_error)?;
-                let day: Option<String> = row.get(2).map_err(database_error)?;
-                let period: Option<i64> = row.get(3).map_err(database_error)?;
-                schedule.push(decode_schedule(&kind, day.as_deref(), period)?);
-            }
-            Some(Course {
-                id: CourseId::new(stored.id),
-                name: stored.name,
-                schedule,
-            })
-        } else {
-            None
-        };
+        let course = stored.map(|row| row.decode(&tx)).transpose()?;
         tx.commit().map_err(database_error)?;
         Ok(course)
+    }
+
+    /// Create a hand-entered assignment with a generated ID and no source binding.
+    /// A supplied course must already exist; completion always starts as `Incomplete`.
+    pub fn create_manual_assignment(
+        &mut self,
+        input: ManualAssignmentInput,
+    ) -> Result<Assignment, PersistenceError> {
+        self.create_assignment_inner(input, None)
+    }
+
+    // Optional binding is an internal atomic operation, not a candidate import API.
+    fn create_assignment_inner(
+        &mut self,
+        input: ManualAssignmentInput,
+        source: Option<&ExternalRecordKey>,
+    ) -> Result<Assignment, PersistenceError> {
+        if let Some(key) = source {
+            validate_external_key(key)?;
+        }
+        let tx = self.conn.transaction().map_err(database_error)?;
+        let timestamp = encode_timestamp(&Utc::now());
+        let mut assignment = Assignment {
+            id: AssignmentId::new(""),
+            course_id: input.course_id,
+            title: input.title,
+            deadline: input.deadline,
+            submission: input.submission,
+            submission_url: input.submission_url,
+            completion: CompletionState::Incomplete,
+        };
+        insert_with_generated_id(
+            || generate_internal_id(&tx, "a_"),
+            |id| {
+                assignment.id = AssignmentId::new(id);
+                insert_assignment_row(&tx, &assignment, &timestamp)
+            },
+        )?;
+        if let Some(key) = source {
+            insert_assignment_binding(&tx, &assignment.id, key)?;
+        }
+        tx.commit().map_err(database_error)?;
+        Ok(assignment)
+    }
+
+    /// Create a course with a generated ID and an ordered schedule, without binding.
+    pub fn create_course(
+        &mut self,
+        name: impl Into<String>,
+        schedule: Vec<ScheduleEntry>,
+    ) -> Result<Course, PersistenceError> {
+        self.create_course_inner(name.into(), schedule, None)
+    }
+
+    /// Atomically create a course, schedule and source binding. `external_id` must
+    /// be a non-secret logical course ID (WebClass uses its opaque `group_id`).
+    /// Moodle feed labels are assignment scopes, not course identifiers.
+    pub fn create_course_with_source(
+        &mut self,
+        name: impl Into<String>,
+        schedule: Vec<ScheduleEntry>,
+        origin: OriginKind,
+        external_id: &str,
+    ) -> Result<Course, PersistenceError> {
+        self.create_course_inner(name.into(), schedule, Some((origin, external_id)))
+    }
+
+    fn create_course_inner(
+        &mut self,
+        name: String,
+        schedule: Vec<ScheduleEntry>,
+        source: Option<(OriginKind, &str)>,
+    ) -> Result<Course, PersistenceError> {
+        if let Some((_, external_id)) = source {
+            validate_external_identity(external_id)?;
+        }
+        let tx = self.conn.transaction().map_err(database_error)?;
+        let timestamp = encode_timestamp(&Utc::now());
+        let mut course = Course {
+            id: CourseId::new(""),
+            name,
+            schedule,
+        };
+        // Only the entity PK insert is retried, never schedule or binding errors.
+        insert_with_generated_id(
+            || generate_internal_id(&tx, "c_"),
+            |id| {
+                course.id = CourseId::new(id);
+                insert_course_row(&tx, &course, &timestamp)
+            },
+        )?;
+        insert_course_schedule(&tx, &course)?;
+        if let Some((origin, external_id)) = source {
+            insert_course_binding(&tx, &course.id, origin, external_id)?;
+        }
+        tx.commit().map_err(database_error)?;
+        Ok(course)
+    }
+
+    /// Bind the exact existing assignment chosen by the caller. A second binding
+    /// or an already-used complete key is rejected, including identical rebinds.
+    /// Moodle keys use a non-secret feed label as scope and VEVENT UID as ID;
+    /// never supply a feed/token URL, cookie, credential or authentication payload.
+    pub fn bind_assignment_source(
+        &mut self,
+        id: &AssignmentId,
+        key: &ExternalRecordKey,
+    ) -> Result<(), PersistenceError> {
+        validate_external_key(key)?;
+        let tx = self.conn.transaction().map_err(database_error)?;
+        insert_assignment_binding(&tx, id, key)?;
+        tx.commit().map_err(database_error)
+    }
+
+    /// Find an assignment by its complete, case-sensitive, unnormalized key.
+    /// Absence is `None`; multiple matches are invalid stored data.
+    pub fn find_assignment_by_external_key(
+        &self,
+        key: &ExternalRecordKey,
+    ) -> Result<Option<Assignment>, PersistenceError> {
+        validate_external_key(key)?;
+        let stored = self
+            .conn
+            .query_one(
+                "SELECT a.id, a.course_id, a.title, a.deadline_kind, a.deadline_value,
+                    a.submission, a.submission_url, a.completion, a.created_at, a.updated_at
+             FROM assignment_sources s JOIN assignments a ON a.id = s.assignment_id
+             WHERE s.origin = ?1 AND s.scope = ?2 AND s.external_id = ?3",
+                params![encode_origin(key.origin), key.scope, key.id],
+                StoredAssignment::from_row,
+            )
+            .optional()
+            .map_err(database_error)?;
+        stored.map(StoredAssignment::decode).transpose()
+    }
+
+    /// Bind an explicitly selected existing course to a non-secret logical ID.
+    /// No matching by name or implicit course creation is performed.
+    pub fn bind_course_source(
+        &mut self,
+        id: &CourseId,
+        origin: OriginKind,
+        external_id: &str,
+    ) -> Result<(), PersistenceError> {
+        validate_external_identity(external_id)?;
+        let tx = self.conn.transaction().map_err(database_error)?;
+        insert_course_binding(&tx, id, origin, external_id)?;
+        tx.commit().map_err(database_error)
+    }
+
+    /// Find a course and schedule by exact origin and non-secret external course ID.
+    pub fn find_course_by_source(
+        &self,
+        origin: OriginKind,
+        external_id: &str,
+    ) -> Result<Option<Course>, PersistenceError> {
+        validate_external_identity(external_id)?;
+        let tx = self.conn.unchecked_transaction().map_err(database_error)?;
+        let stored = tx
+            .query_one(
+                "SELECT c.id, c.name, c.created_at, c.updated_at
+             FROM course_sources s JOIN courses c ON c.id = s.course_id
+             WHERE s.origin = ?1 AND s.external_id = ?2",
+                params![encode_origin(origin), external_id],
+                StoredCourse::from_row,
+            )
+            .optional()
+            .map_err(database_error)?;
+        let course = stored.map(|row| row.decode(&tx)).transpose()?;
+        tx.commit().map_err(database_error)?;
+        Ok(course)
+    }
+
+    /// Resolve only an already-bound WebClass group to its internal course ID.
+    pub fn find_webclass_course_id(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<CourseId>, PersistenceError> {
+        Ok(self
+            .find_course_by_source(OriginKind::WebClass, group_id)?
+            .map(|course| course.id))
+    }
+}
+
+fn generate_internal_id(conn: &Connection, prefix: &str) -> rusqlite::Result<String> {
+    conn.query_one("SELECT ?1 || lower(hex(randomblob(16)))", [prefix], |row| {
+        row.get(0)
+    })
+}
+
+fn insert_with_generated_id(
+    mut generate: impl FnMut() -> rusqlite::Result<String>,
+    mut insert: impl FnMut(&str) -> rusqlite::Result<()>,
+) -> Result<(), PersistenceError> {
+    for _ in 0..ID_INSERT_ATTEMPTS {
+        let id = generate().map_err(|_| PersistenceError::IdGenerationFailed)?;
+        match insert(&id) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.sqlite_error().is_some_and(|error| {
+                    error.extended_code == ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                }) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(database_error(error)),
+        }
+    }
+    Err(PersistenceError::IdGenerationFailed)
+}
+
+fn insert_assignment_row(
+    conn: &Connection,
+    assignment: &Assignment,
+    timestamp: &str,
+) -> rusqlite::Result<()> {
+    let (kind, value) = encode_deadline(assignment.deadline.as_ref());
+    conn.execute(
+        "INSERT INTO assignments (
+            id, course_id, title, deadline_kind, deadline_value, submission,
+            submission_url, completion, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![
+            assignment.id.as_str(),
+            assignment.course_id.as_ref().map(CourseId::as_str),
+            assignment.title,
+            kind,
+            value,
+            encode_submission(assignment.submission),
+            assignment.submission_url,
+            encode_completion(assignment.completion),
+            timestamp
+        ],
+    )
+    .map(|_| ())
+}
+
+fn insert_course_row(conn: &Connection, course: &Course, timestamp: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO courses (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        params![course.id.as_str(), course.name, timestamp],
+    )
+    .map(|_| ())
+}
+
+fn insert_course_schedule(conn: &Connection, course: &Course) -> Result<(), PersistenceError> {
+    for (position, entry) in course.schedule.iter().enumerate() {
+        let position = i64::try_from(position).map_err(|_| PersistenceError::Constraint)?;
+        let (kind, day, period) = encode_schedule(*entry);
+        conn.execute(
+            "INSERT INTO course_schedule (course_id, position, entry_kind, day, period)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![course.id.as_str(), position, kind, day, period],
+        )
+        .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn validate_external_identity(value: &str) -> Result<(), PersistenceError> {
+    if value.trim().is_empty() {
+        Err(PersistenceError::InvalidExternalIdentity)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_external_key(key: &ExternalRecordKey) -> Result<(), PersistenceError> {
+    validate_external_identity(&key.scope)?;
+    validate_external_identity(&key.id)
+}
+
+fn insert_assignment_binding(
+    conn: &Connection,
+    id: &AssignmentId,
+    key: &ExternalRecordKey,
+) -> Result<(), PersistenceError> {
+    conn.execute(
+        "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id.as_str(), encode_origin(key.origin), key.scope, key.id],
+    )
+    .map_err(binding_error)?;
+    Ok(())
+}
+
+fn insert_course_binding(
+    conn: &Connection,
+    id: &CourseId,
+    origin: OriginKind,
+    external_id: &str,
+) -> Result<(), PersistenceError> {
+    conn.execute(
+        "INSERT INTO course_sources (course_id, origin, external_id) VALUES (?1, ?2, ?3)",
+        params![id.as_str(), encode_origin(origin), external_id],
+    )
+    .map_err(binding_error)?;
+    Ok(())
+}
+
+fn binding_error(error: rusqlite::Error) -> PersistenceError {
+    match error.sqlite_error().map(|error| error.extended_code) {
+        Some(ffi::SQLITE_CONSTRAINT_PRIMARYKEY) => PersistenceError::EntityAlreadyBound,
+        Some(ffi::SQLITE_CONSTRAINT_UNIQUE) => PersistenceError::ExternalIdentityAlreadyBound,
+        Some(ffi::SQLITE_CONSTRAINT_FOREIGNKEY) => PersistenceError::NotFound,
+        _ => database_error(error),
     }
 }
 
@@ -290,7 +591,8 @@ fn database_error(error: rusqlite::Error) -> PersistenceError {
         rusqlite::Error::InvalidColumnType(..)
         | rusqlite::Error::FromSqlConversionFailure(..)
         | rusqlite::Error::IntegralValueOutOfRange(..)
-        | rusqlite::Error::Utf8Error(..) => PersistenceError::InvalidStoredData,
+        | rusqlite::Error::Utf8Error(..)
+        | rusqlite::Error::QueryReturnedMoreThanOneRow => PersistenceError::InvalidStoredData,
         _ => PersistenceError::Database,
     }
 }
@@ -357,6 +659,33 @@ impl StoredCourse {
             updated_at: row.get(3)?,
         })
     }
+
+    fn decode(self, conn: &Connection) -> Result<Course, PersistenceError> {
+        validate_metadata(&self.created_at, &self.updated_at)?;
+        let mut schedule = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT position, entry_kind, day, period
+             FROM course_schedule WHERE course_id = ?1 ORDER BY position",
+            )
+            .map_err(database_error)?;
+        let mut rows = stmt.query([&self.id]).map_err(database_error)?;
+        while let Some(row) = rows.next().map_err(database_error)? {
+            let position: i64 = row.get(0).map_err(database_error)?;
+            if usize::try_from(position).ok() != Some(schedule.len()) {
+                return Err(PersistenceError::InvalidStoredData);
+            }
+            let kind: String = row.get(1).map_err(database_error)?;
+            let day: Option<String> = row.get(2).map_err(database_error)?;
+            let period: Option<i64> = row.get(3).map_err(database_error)?;
+            schedule.push(decode_schedule(&kind, day.as_deref(), period)?);
+        }
+        Ok(Course {
+            id: CourseId::new(self.id),
+            name: self.name,
+            schedule,
+        })
+    }
 }
 
 fn encode_timestamp(value: &DateTime<Utc>) -> String {
@@ -381,7 +710,6 @@ fn validate_metadata(created_at: &str, updated_at: &str) -> Result<(), Persisten
     Ok(())
 }
 
-#[cfg(test)]
 fn encode_deadline(deadline: Option<&Deadline>) -> (Option<&'static str>, Option<String>) {
     match deadline {
         None => (None, None),
@@ -411,7 +739,6 @@ fn decode_deadline(
     }
 }
 
-#[cfg(test)]
 fn encode_completion(value: CompletionState) -> &'static str {
     match value {
         CompletionState::Incomplete => "incomplete",
@@ -427,7 +754,6 @@ fn decode_completion(value: &str) -> Result<CompletionState, PersistenceError> {
     }
 }
 
-#[cfg(test)]
 fn encode_submission(value: SubmissionTarget) -> &'static str {
     match value {
         SubmissionTarget::Unknown => "unknown",
@@ -449,7 +775,6 @@ fn decode_submission(value: &str) -> Result<SubmissionTarget, PersistenceError> 
     }
 }
 
-#[cfg(test)]
 fn encode_day(value: DayOfWeek) -> &'static str {
     match value {
         DayOfWeek::Monday => "mon",
@@ -475,13 +800,20 @@ fn decode_day(value: &str) -> Result<DayOfWeek, PersistenceError> {
     }
 }
 
-#[cfg(test)]
 fn encode_schedule(entry: ScheduleEntry) -> (&'static str, Option<&'static str>, Option<u8>) {
     match entry {
         ScheduleEntry::OnDemand => ("on_demand", None, None),
         ScheduleEntry::Timetabled(slot) => {
             ("timetabled", Some(encode_day(slot.day)), Some(slot.period))
         }
+    }
+}
+
+fn encode_origin(origin: OriginKind) -> &'static str {
+    match origin {
+        OriginKind::Moodle => "moodle",
+        OriginKind::WebClass => "webclass",
+        OriginKind::Manual => "manual",
     }
 }
 
@@ -507,73 +839,29 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use rusqlite::{ffi, params};
-
     use super::*;
-    use crate::import::OriginKind;
 
     const STAMP: &str = "2026-10-04T14:59:00.123456789Z";
     const PRIVATE: &str = "SYNTHETIC_PRIVATE_VALUE_6B1";
 
-    // Intentionally absent from production builds: these insert supplied internal
-    // IDs, without upsert, merge, source binding or completion update semantics.
+    // Test-only wrappers retain synthetic IDs for the Phase 6B1 tests, while
+    // exercising the same private row writers used by production creation.
     impl SqliteStore {
         fn insert_assignment(&self, assignment: &Assignment) -> Result<(), PersistenceError> {
-            let (kind, value) = encode_deadline(assignment.deadline.as_ref());
             let timestamp = encode_timestamp(&Utc::now());
-            self.conn
-                .execute(
-                    "INSERT INTO assignments (
-                        id, course_id, title, deadline_kind, deadline_value, submission,
-                        submission_url, completion, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-                    params![
-                        assignment.id.as_str(),
-                        assignment.course_id.as_ref().map(CourseId::as_str),
-                        assignment.title,
-                        kind,
-                        value,
-                        encode_submission(assignment.submission),
-                        assignment.submission_url,
-                        encode_completion(assignment.completion),
-                        timestamp,
-                    ],
-                )
-                .map_err(database_error)?;
-            Ok(())
+            insert_assignment_row(&self.conn, assignment, &timestamp).map_err(database_error)
         }
 
         fn insert_course(&mut self, course: &Course) -> Result<(), PersistenceError> {
             let tx = self.conn.transaction().map_err(database_error)?;
             let timestamp = encode_timestamp(&Utc::now());
-            tx.execute(
-                "INSERT INTO courses (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
-                params![course.id.as_str(), course.name, timestamp],
-            )
-            .map_err(database_error)?;
-            for (position, entry) in course.schedule.iter().enumerate() {
-                let position = i64::try_from(position).map_err(|_| PersistenceError::Constraint)?;
-                let (kind, day, period) = encode_schedule(*entry);
-                tx.execute(
-                    "INSERT INTO course_schedule (course_id, position, entry_kind, day, period)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![course.id.as_str(), position, kind, day, period],
-                )
-                .map_err(database_error)?;
-            }
+            insert_course_row(&tx, course, &timestamp).map_err(database_error)?;
+            insert_course_schedule(&tx, course)?;
             tx.commit().map_err(database_error)
         }
     }
 
-    // Source codecs are test-only until Phase 6B2 introduces source readers/writers.
-    fn encode_origin(origin: OriginKind) -> &'static str {
-        match origin {
-            OriginKind::Moodle => "moodle",
-            OriginKind::WebClass => "webclass",
-            OriginKind::Manual => "manual",
-        }
-    }
-
+    // Binding readers filter by the production encoder; no public raw source reader.
     fn decode_origin(value: &str) -> Result<OriginKind, PersistenceError> {
         match value {
             "moodle" => Ok(OriginKind::Moodle),
@@ -1636,6 +1924,31 @@ mod tests {
                 "Constraint",
                 "SQLite constraint violation",
             ),
+            (
+                PersistenceError::IdGenerationFailed,
+                "IdGenerationFailed",
+                "could not allocate an internal ID",
+            ),
+            (
+                PersistenceError::InvalidExternalIdentity,
+                "InvalidExternalIdentity",
+                "external identity is empty or whitespace-only",
+            ),
+            (
+                PersistenceError::EntityAlreadyBound,
+                "EntityAlreadyBound",
+                "entity already has a source binding",
+            ),
+            (
+                PersistenceError::ExternalIdentityAlreadyBound,
+                "ExternalIdentityAlreadyBound",
+                "external identity already has a binding",
+            ),
+            (
+                PersistenceError::NotFound,
+                "NotFound",
+                "binding target does not exist",
+            ),
         ] {
             assert_eq!(format!("{error:?}"), debug);
             assert_eq!(error.to_string(), display);
@@ -1679,5 +1992,729 @@ mod tests {
         let error = store.get_assignment(&private_assignment.id).unwrap_err();
         assert_eq!(error, PersistenceError::Database);
         assert_safe(error);
+    }
+
+    fn manual_input() -> ManualAssignmentInput {
+        ManualAssignmentInput {
+            title: "Hand-entered report 日本語 ' ?1".into(),
+            deadline: Some(Deadline::DateTime(decode_timestamp(STAMP).unwrap())),
+            course_id: None,
+            submission: SubmissionTarget::External,
+            submission_url: Some("https://submit.example.invalid/manual".into()),
+        }
+    }
+
+    fn external_key(origin: OriginKind, scope: &str, id: &str) -> ExternalRecordKey {
+        ExternalRecordKey {
+            origin,
+            scope: scope.into(),
+            id: id.into(),
+        }
+    }
+
+    fn assert_generated_id(id: &str, prefix: &str) {
+        let hex = id.strip_prefix(prefix).unwrap();
+        assert_eq!(hex.len(), 32);
+        assert!(
+            hex.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    #[test]
+    fn production_manual_creation_generates_distinct_ids_without_fake_bindings() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let created_course = store.create_course("", vec![]).unwrap();
+            assert_generated_id(created_course.id.as_str(), "c_");
+            assert!(ids.insert(created_course.id.as_str().to_owned()));
+            assert_eq!(
+                store.get_course(&created_course.id).unwrap(),
+                Some(created_course.clone())
+            );
+            let mut input = manual_input();
+            input.course_id = Some(created_course.id);
+            let created = store.create_manual_assignment(input).unwrap();
+            assert_generated_id(created.id.as_str(), "a_");
+            assert!(ids.insert(created.id.as_str().to_owned()));
+            assert_eq!(created.completion, CompletionState::Incomplete);
+            assert_eq!(created.title, manual_input().title);
+            assert_eq!(created.deadline, manual_input().deadline);
+            assert_eq!(created.submission, SubmissionTarget::External);
+            assert_eq!(created.submission_url, manual_input().submission_url);
+            assert_eq!(store.get_assignment(&created.id).unwrap(), Some(created));
+        }
+        assert_eq!(count(&store.conn, "assignments"), 16);
+        assert_eq!(count(&store.conn, "courses"), 16);
+        assert_eq!(count(&store.conn, "assignment_sources"), 0);
+        assert_eq!(count(&store.conn, "course_sources"), 0);
+    }
+
+    #[test]
+    fn production_creation_and_bindings_preserve_metadata_and_survive_reopen() {
+        let temp = TempDb::new();
+        let created_course;
+        let manual;
+        let bound;
+        let key = external_key(OriginKind::Moodle, "cis-feed", "Opaque-0001@calendar");
+        let group_id = " Group-0001 ";
+        let timestamps;
+        {
+            let mut store = SqliteStore::open(&temp.path).unwrap();
+            let before = Utc::now();
+            created_course = store
+                .create_course_with_source(
+                    "Course",
+                    vec![
+                        slot(DayOfWeek::Sunday, 255),
+                        ScheduleEntry::OnDemand,
+                        slot(DayOfWeek::Monday, 0),
+                        slot(DayOfWeek::Monday, 0),
+                    ],
+                    OriginKind::WebClass,
+                    group_id,
+                )
+                .unwrap();
+            let mut input = manual_input();
+            input.course_id = Some(created_course.id.clone());
+            manual = store.create_manual_assignment(input).unwrap();
+            let mut input = manual_input();
+            input.deadline = None;
+            input.submission = SubmissionTarget::None;
+            input.submission_url = None;
+            bound = store.create_manual_assignment(input).unwrap();
+            assert_eq!(count(&store.conn, "assignment_sources"), 0);
+            let after = Utc::now();
+            timestamps = [
+                store
+                    .conn
+                    .query_row(
+                        "SELECT created_at, updated_at FROM courses WHERE id = ?1",
+                        [created_course.id.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap(),
+                store
+                    .conn
+                    .query_row(
+                        "SELECT created_at, updated_at FROM assignments WHERE id = ?1",
+                        [manual.id.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap(),
+                store
+                    .conn
+                    .query_row(
+                        "SELECT created_at, updated_at FROM assignments WHERE id = ?1",
+                        [bound.id.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap(),
+            ];
+            for (created, updated) in &timestamps {
+                assert_eq!(created, updated);
+                let instant = decode_timestamp(created).unwrap();
+                assert!(before <= instant && instant <= after);
+                assert_eq!(encode_timestamp(&instant), *created);
+            }
+            store.bind_assignment_source(&bound.id, &key).unwrap();
+            // Binding changes only the source relation, not domain or metadata.
+            assert_eq!(
+                store.get_assignment(&bound.id).unwrap(),
+                Some(bound.clone())
+            );
+        }
+        let store = SqliteStore::open(&temp.path).unwrap();
+        assert_eq!(
+            store.get_assignment(&manual.id).unwrap(),
+            Some(manual.clone())
+        );
+        assert_eq!(manual.completion, CompletionState::Incomplete);
+        assert_eq!(
+            store.get_assignment(&bound.id).unwrap(),
+            Some(bound.clone())
+        );
+        assert_eq!(
+            store.find_assignment_by_external_key(&key).unwrap(),
+            Some(bound.clone())
+        );
+        assert_eq!(
+            store
+                .find_course_by_source(OriginKind::WebClass, group_id)
+                .unwrap(),
+            Some(created_course.clone())
+        );
+        assert_eq!(
+            store.find_webclass_course_id(group_id).unwrap(),
+            Some(created_course.id.clone())
+        );
+        let restored = [
+            store
+                .conn
+                .query_row(
+                    "SELECT created_at, updated_at FROM courses WHERE id = ?1",
+                    [created_course.id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            store
+                .conn
+                .query_row(
+                    "SELECT created_at, updated_at FROM assignments WHERE id = ?1",
+                    [manual.id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            store
+                .conn
+                .query_row(
+                    "SELECT created_at, updated_at FROM assignments WHERE id = ?1",
+                    [bound.id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+        ];
+        assert_eq!(restored, timestamps);
+        assert_eq!(count(&store.conn, "assignment_sources"), 1);
+    }
+
+    #[test]
+    fn assignment_binding_and_lookup_use_complete_opaque_keys() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for key in [
+            external_key(OriginKind::WebClass, " Group-01 ", " AbC0001 "),
+            external_key(OriginKind::Moodle, " Group-01 ", " AbC0001 "),
+            external_key(OriginKind::Manual, " Group-01 ", " AbC0001 "),
+            external_key(OriginKind::WebClass, " group-01 ", " AbC0001 "),
+            external_key(OriginKind::WebClass, " Group-01 ", " abc0001 "),
+            external_key(OriginKind::WebClass, "Group-01", " AbC0001 "),
+            external_key(OriginKind::WebClass, " Group-01 ", "AbC0001"),
+        ] {
+            assert_eq!(store.find_assignment_by_external_key(&key).unwrap(), None);
+            let created = store.create_manual_assignment(manual_input()).unwrap();
+            store.bind_assignment_source(&created.id, &key).unwrap();
+            assert_eq!(
+                store.find_assignment_by_external_key(&key).unwrap(),
+                Some(created.clone())
+            );
+            let raw: (String, String, String) = store.conn.query_row(
+                "SELECT origin, scope, external_id FROM assignment_sources WHERE assignment_id = ?1",
+                [created.id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(raw, (encode_origin(key.origin).into(), key.scope, key.id));
+        }
+        assert_eq!(count(&store.conn, "assignments"), 7);
+        assert_eq!(count(&store.conn, "assignment_sources"), 7);
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&external_key(
+                    OriginKind::WebClass,
+                    "unknown",
+                    "unknown"
+                ))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn assignment_binding_conflicts_have_distinct_safe_errors_and_preserve_entities() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = store.create_manual_assignment(manual_input()).unwrap();
+        let second = store.create_manual_assignment(manual_input()).unwrap();
+        let key = external_key(OriginKind::Manual, "manual-logical-source", "0001");
+        store.bind_assignment_source(&first.id, &key).unwrap();
+        assert_eq!(
+            store.bind_assignment_source(&second.id, &key),
+            Err(PersistenceError::ExternalIdentityAlreadyBound)
+        );
+        assert_eq!(
+            store.bind_assignment_source(
+                &first.id,
+                &external_key(OriginKind::Manual, "other", "other")
+            ),
+            Err(PersistenceError::EntityAlreadyBound)
+        );
+        assert!(store.bind_assignment_source(&first.id, &key).is_err());
+        assert_eq!(count(&store.conn, "assignment_sources"), 1);
+        assert_eq!(store.get_assignment(&first.id).unwrap(), Some(first));
+        assert_eq!(store.get_assignment(&second.id).unwrap(), Some(second));
+    }
+
+    #[test]
+    fn course_bindings_support_exact_origin_keys_and_explicit_late_binding() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let webclass = store
+            .create_course_with_source(
+                "Same name",
+                vec![ScheduleEntry::OnDemand],
+                OriginKind::WebClass,
+                " Group-01 ",
+            )
+            .unwrap();
+        let moodle = store
+            .create_course_with_source("Same name", vec![], OriginKind::Moodle, " Group-01 ")
+            .unwrap();
+        assert_eq!(
+            store
+                .find_course_by_source(OriginKind::WebClass, " Group-01 ")
+                .unwrap(),
+            Some(webclass.clone())
+        );
+        assert_eq!(
+            store
+                .find_course_by_source(OriginKind::Moodle, " Group-01 ")
+                .unwrap(),
+            Some(moodle)
+        );
+        assert_eq!(
+            store.find_webclass_course_id(" Group-01 ").unwrap(),
+            Some(webclass.id.clone())
+        );
+        for distinct in [" group-01 ", "Group-01", " Group-1 "] {
+            assert_eq!(store.find_webclass_course_id(distinct).unwrap(), None);
+            let created = store
+                .create_course_with_source("Same name", vec![], OriginKind::WebClass, distinct)
+                .unwrap();
+            assert_eq!(
+                store.find_webclass_course_id(distinct).unwrap(),
+                Some(created.id)
+            );
+        }
+        let manual = store
+            .create_course("Same name", vec![slot(DayOfWeek::Friday, 4)])
+            .unwrap();
+        assert_eq!(
+            store
+                .find_course_by_source(OriginKind::Manual, "manual-course")
+                .unwrap(),
+            None
+        );
+        store
+            .bind_course_source(&manual.id, OriginKind::Manual, "manual-course")
+            .unwrap();
+        assert_eq!(
+            store
+                .find_course_by_source(OriginKind::Manual, "manual-course")
+                .unwrap(),
+            Some(manual.clone())
+        );
+        assert_eq!(
+            store.bind_course_source(&manual.id, OriginKind::WebClass, "other"),
+            Err(PersistenceError::EntityAlreadyBound)
+        );
+        let unbound = store.create_course("Same name", vec![]).unwrap();
+        assert_eq!(
+            store.bind_course_source(&unbound.id, OriginKind::WebClass, " Group-01 "),
+            Err(PersistenceError::ExternalIdentityAlreadyBound)
+        );
+        assert_eq!(
+            store
+                .find_course_by_source(OriginKind::WebClass, "unknown")
+                .unwrap(),
+            None
+        );
+        assert_eq!(count(&store.conn, "course_sources"), 6);
+        assert_eq!(store.get_course(&manual.id).unwrap(), Some(manual));
+    }
+
+    #[test]
+    fn all_public_identity_boundaries_reject_blank_values_without_normalization() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let created = store.create_manual_assignment(manual_input()).unwrap();
+        let created_course = store.create_course("Course", vec![]).unwrap();
+        for blank in ["", " ", "\t\n", "\u{3000}", "\u{2003}"] {
+            for key in [
+                external_key(OriginKind::Manual, blank, "id"),
+                external_key(OriginKind::Manual, "scope", blank),
+            ] {
+                assert_eq!(
+                    store.bind_assignment_source(&created.id, &key),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+                assert_eq!(
+                    store.find_assignment_by_external_key(&key),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+                assert_eq!(
+                    store.create_assignment_inner(manual_input(), Some(&key)),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+            }
+            assert_eq!(
+                store.bind_course_source(&created_course.id, OriginKind::WebClass, blank),
+                Err(PersistenceError::InvalidExternalIdentity)
+            );
+            assert_eq!(
+                store.find_course_by_source(OriginKind::WebClass, blank),
+                Err(PersistenceError::InvalidExternalIdentity)
+            );
+            assert_eq!(
+                store.find_webclass_course_id(blank),
+                Err(PersistenceError::InvalidExternalIdentity)
+            );
+            assert_eq!(
+                store.create_course_with_source(
+                    "Course",
+                    vec![ScheduleEntry::OnDemand],
+                    OriginKind::WebClass,
+                    blank
+                ),
+                Err(PersistenceError::InvalidExternalIdentity)
+            );
+        }
+        assert_eq!(count(&store.conn, "assignments"), 1);
+        assert_eq!(count(&store.conn, "courses"), 1);
+        assert_eq!(count(&store.conn, "assignment_sources"), 0);
+        assert_eq!(count(&store.conn, "course_sources"), 0);
+        assert_eq!(count(&store.conn, "course_schedule"), 0);
+    }
+
+    #[test]
+    fn binding_missing_entities_is_rejected_without_implicit_creation() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let key = external_key(OriginKind::Manual, "scope", "id");
+        assert_eq!(
+            store.bind_assignment_source(&AssignmentId::new("absent"), &key),
+            Err(PersistenceError::NotFound)
+        );
+        assert_eq!(
+            store.bind_course_source(&CourseId::new("absent"), OriginKind::WebClass, "group"),
+            Err(PersistenceError::NotFound)
+        );
+        for table in TABLES {
+            assert_eq!(count(&store.conn, table), 0);
+        }
+        assert!(store.conn.is_autocommit());
+        let created = store.create_manual_assignment(manual_input()).unwrap();
+        store.bind_assignment_source(&created.id, &key).unwrap();
+        assert_eq!(
+            store.find_assignment_by_external_key(&key).unwrap(),
+            Some(created)
+        );
+    }
+
+    #[test]
+    fn production_course_binding_failure_rolls_back_entity_and_schedule() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .create_course_with_source(
+                "Existing",
+                vec![ScheduleEntry::OnDemand],
+                OriginKind::WebClass,
+                "group",
+            )
+            .unwrap();
+        assert_eq!(
+            store.create_course_with_source(
+                "Rejected",
+                vec![slot(DayOfWeek::Monday, 0), slot(DayOfWeek::Sunday, 255)],
+                OriginKind::WebClass,
+                "group"
+            ),
+            Err(PersistenceError::ExternalIdentityAlreadyBound)
+        );
+        assert_eq!(count(&store.conn, "courses"), 1);
+        assert_eq!(count(&store.conn, "course_schedule"), 1);
+        assert_eq!(count(&store.conn, "course_sources"), 1);
+        assert_eq!(
+            store
+                .find_course_by_source(OriginKind::WebClass, "group")
+                .unwrap(),
+            Some(first)
+        );
+        assert!(store.conn.is_autocommit());
+    }
+
+    #[test]
+    fn production_assignment_optional_binding_is_atomic() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let key = external_key(OriginKind::Manual, "scope", "id");
+        let first = store
+            .create_assignment_inner(manual_input(), Some(&key))
+            .unwrap();
+        assert_generated_id(first.id.as_str(), "a_");
+        assert_eq!(first.completion, CompletionState::Incomplete);
+        assert_eq!(
+            store.find_assignment_by_external_key(&key).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store.create_assignment_inner(manual_input(), Some(&key)),
+            Err(PersistenceError::ExternalIdentityAlreadyBound)
+        );
+        assert_eq!(count(&store.conn, "assignments"), 1);
+        assert_eq!(count(&store.conn, "assignment_sources"), 1);
+        assert_eq!(store.get_assignment(&first.id).unwrap(), Some(first));
+        assert!(store.conn.is_autocommit());
+    }
+
+    #[test]
+    fn production_course_schedule_failure_rolls_back_before_source_binding() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_slot BEFORE INSERT ON course_schedule WHEN NEW.position = 1 BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+        assert_eq!(
+            store.create_course_with_source(
+                "Rejected",
+                vec![ScheduleEntry::OnDemand; 2],
+                OriginKind::WebClass,
+                "group"
+            ),
+            Err(PersistenceError::Constraint)
+        );
+        assert_eq!(count(&store.conn, "courses"), 0);
+        assert_eq!(count(&store.conn, "course_schedule"), 0);
+        assert_eq!(count(&store.conn, "course_sources"), 0);
+        assert_eq!(store.find_webclass_course_id("group").unwrap(), None);
+        assert!(store.conn.is_autocommit());
+    }
+
+    #[test]
+    fn production_manual_creation_requires_an_existing_course() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut input = manual_input();
+        input.course_id = Some(CourseId::new("absent"));
+        assert_eq!(
+            store.create_manual_assignment(input),
+            Err(PersistenceError::Constraint)
+        );
+        for table in TABLES {
+            assert_eq!(count(&store.conn, table), 0);
+        }
+    }
+
+    #[test]
+    fn id_retry_handles_real_primary_key_collisions_for_both_entity_tables() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for prefix in ["a_", "c_"] {
+            let duplicate = format!("{prefix}{}", "0".repeat(32));
+            let fresh = format!("{prefix}{}", "1".repeat(32));
+            if prefix == "a_" {
+                store.insert_assignment(&assignment(&duplicate)).unwrap();
+            } else {
+                store.insert_course(&course(&duplicate, vec![])).unwrap();
+            }
+            let mut ids = [duplicate.as_str(), duplicate.as_str(), fresh.as_str()].into_iter();
+            let mut attempts = 0;
+            let insert = |id: &str| {
+                attempts += 1;
+                if prefix == "a_" {
+                    insert_assignment_row(&store.conn, &assignment(id), STAMP)
+                } else {
+                    insert_course_row(&store.conn, &course(id, vec![]), STAMP)
+                }
+            };
+            assert_eq!(
+                insert_with_generated_id(|| Ok(ids.next().unwrap().into()), insert),
+                Ok(())
+            );
+            assert_eq!(attempts, 3);
+            assert_eq!(
+                count(
+                    &store.conn,
+                    if prefix == "a_" {
+                        "assignments"
+                    } else {
+                        "courses"
+                    }
+                ),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn id_retry_is_bounded_and_exhaustion_does_not_expose_the_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.insert_assignment(&assignment(PRIVATE)).unwrap();
+        let mut attempts = 0;
+        let result = insert_with_generated_id(
+            || Ok(PRIVATE.into()),
+            |id| {
+                attempts += 1;
+                insert_assignment_row(&store.conn, &assignment(id), STAMP)
+            },
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error, PersistenceError::IdGenerationFailed);
+        assert_eq!(attempts, ID_INSERT_ATTEMPTS);
+        assert_eq!(count(&store.conn, "assignments"), 1);
+        assert_safe(error);
+    }
+
+    #[test]
+    fn id_retry_does_not_retry_other_constraints_or_database_errors() {
+        for code in [
+            ffi::SQLITE_CONSTRAINT_UNIQUE,
+            ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            ffi::SQLITE_CONSTRAINT_CHECK,
+            ffi::SQLITE_CONSTRAINT_TRIGGER,
+            ffi::SQLITE_BUSY,
+        ] {
+            let mut attempts = 0;
+            let result = insert_with_generated_id(
+                || Ok(PRIVATE.into()),
+                |_| {
+                    attempts += 1;
+                    Err(rusqlite::Error::SqliteFailure(
+                        ffi::Error::new(code),
+                        Some(PRIVATE.into()),
+                    ))
+                },
+            );
+            assert_eq!(attempts, 1);
+            let error = result.unwrap_err();
+            assert_eq!(
+                error,
+                if code == ffi::SQLITE_BUSY {
+                    PersistenceError::Database
+                } else {
+                    PersistenceError::Constraint
+                }
+            );
+            assert_safe(error);
+        }
+        let mut inserts = 0;
+        let result = insert_with_generated_id(
+            || Err(rusqlite::Error::InvalidPath(PathBuf::from(PRIVATE))),
+            |_| {
+                inserts += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(PersistenceError::IdGenerationFailed));
+        assert_eq!(inserts, 0);
+        assert_safe(result.unwrap_err());
+    }
+
+    #[test]
+    fn external_lookups_reject_multiple_matches_in_a_corrupted_schema() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let assignments = [
+            store.create_manual_assignment(manual_input()).unwrap(),
+            store.create_manual_assignment(manual_input()).unwrap(),
+        ];
+        let courses = [
+            store.create_course("Course", vec![]).unwrap(),
+            store.create_course("Course", vec![]).unwrap(),
+        ];
+        // Deliberately replace only source tables to simulate missing constraints.
+        store.conn.execute_batch("DROP TABLE assignment_sources; CREATE TABLE assignment_sources (assignment_id TEXT, origin TEXT, scope TEXT, external_id TEXT); DROP TABLE course_sources; CREATE TABLE course_sources (course_id TEXT, origin TEXT, external_id TEXT);").unwrap();
+        for entity in assignments {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO assignment_sources VALUES (?1, 'manual', 'scope', 'id')",
+                    [entity.id.as_str()],
+                )
+                .unwrap();
+        }
+        for entity in courses {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO course_sources VALUES (?1, 'webclass', 'group')",
+                    [entity.id.as_str()],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.find_assignment_by_external_key(&external_key(OriginKind::Manual, "scope", "id")),
+            Err(PersistenceError::InvalidStoredData)
+        );
+        assert_eq!(
+            store.find_course_by_source(OriginKind::WebClass, "group"),
+            Err(PersistenceError::InvalidStoredData)
+        );
+        assert_eq!(
+            store.find_webclass_course_id("group"),
+            Err(PersistenceError::InvalidStoredData)
+        );
+    }
+
+    #[test]
+    fn external_lookups_use_domain_validation_including_metadata_and_schedule() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let created = store.create_manual_assignment(manual_input()).unwrap();
+        let key = external_key(OriginKind::Manual, "scope", "id");
+        store.bind_assignment_source(&created.id, &key).unwrap();
+        let created_course = store
+            .create_course_with_source(
+                "Course",
+                vec![ScheduleEntry::OnDemand; 3],
+                OriginKind::WebClass,
+                "group",
+            )
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE assignments SET submission = ?1", [PRIVATE])
+            .unwrap();
+        assert_eq!(
+            store.find_assignment_by_external_key(&key),
+            Err(PersistenceError::InvalidStoredData)
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE assignments SET submission = 'external', created_at = ?1",
+                [PRIVATE],
+            )
+            .unwrap();
+        assert_eq!(
+            store.find_assignment_by_external_key(&key),
+            Err(PersistenceError::InvalidStoredData)
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE course_schedule SET position = 3 WHERE course_id = ?1 AND position = 2",
+                [created_course.id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.find_course_by_source(OriginKind::WebClass, "group"),
+            Err(PersistenceError::InvalidStoredData)
+        );
+        assert_eq!(
+            store.find_webclass_course_id("group"),
+            Err(PersistenceError::InvalidStoredData)
+        );
+    }
+
+    #[test]
+    fn production_binding_errors_discard_external_identity_and_sqlite_messages() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let created = store.create_manual_assignment(manual_input()).unwrap();
+        let created_course = store.create_course("Course", vec![]).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER reject_assignment_binding BEFORE INSERT ON assignment_sources BEGIN SELECT RAISE(ABORT, NEW.scope || NEW.external_id); END; CREATE TRIGGER reject_course_binding BEFORE INSERT ON course_sources BEGIN SELECT RAISE(ABORT, NEW.external_id); END;").unwrap();
+        let key = external_key(OriginKind::Manual, PRIVATE, PRIVATE);
+        let error = store.bind_assignment_source(&created.id, &key).unwrap_err();
+        assert_eq!(error, PersistenceError::Constraint);
+        assert_safe(error);
+        let error = store
+            .bind_course_source(&created_course.id, OriginKind::Manual, PRIVATE)
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::Constraint);
+        assert_safe(error);
+        assert_eq!(count(&store.conn, "assignment_sources"), 0);
+        assert_eq!(count(&store.conn, "course_sources"), 0);
+        assert_safe(binding_error(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT_PRIMARYKEY),
+            Some(PRIVATE.into()),
+        )));
+        assert_safe(binding_error(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT_UNIQUE),
+            Some(PRIVATE.into()),
+        )));
+        assert_safe(binding_error(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some(PRIVATE.into()),
+        )));
     }
 }
