@@ -441,4 +441,463 @@ mod tests {
             assert_secret_free(&error);
         }
     }
+
+    // Keep orchestration integration tests beside the existing private HTTP mock
+    // helpers, so no HTTP feed constructor or raw store access becomes public.
+    mod sync_tests {
+        use std::fs;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use chrono::{DateTime, Utc};
+        use rusqlite::{Connection, params, types::Value};
+
+        use super::*;
+        use crate::domain::{
+            Assignment, AssignmentId, CompletionState, Deadline, SubmissionTarget,
+        };
+        use crate::import::ExternalRecordKey;
+        use crate::persistence::{AssignmentImportSummary, SqliteStore};
+        use crate::sync::{MoodleSyncError, sync_moodle_once};
+
+        const MULTIPLE: &str = include_str!("../fixtures/moodle/calendar_multiple.ics");
+        const EMPTY: &str = include_str!("../fixtures/moodle/calendar_empty.ics");
+        const PRIVATE: &str = "SYNTHETIC_PRIVATE_SYNC_VALUE_7A";
+
+        struct TestDatabase {
+            directory: PathBuf,
+        }
+
+        impl TestDatabase {
+            fn new() -> Self {
+                static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let directory = std::env::temp_dir().join(format!(
+                    "assignment-manager-moodle-sync-{}-{nonce}-{sequence}",
+                    std::process::id()
+                ));
+                fs::create_dir(&directory).unwrap();
+                Self { directory }
+            }
+
+            fn path(&self) -> PathBuf {
+                self.directory.join("test.sqlite3")
+            }
+
+            fn open(&self) -> (SqliteStore, Connection) {
+                let store = SqliteStore::open(self.path()).unwrap();
+                let observer = Connection::open(self.path()).unwrap();
+                (store, observer)
+            }
+        }
+
+        impl Drop for TestDatabase {
+            fn drop(&mut self) {
+                for name in [
+                    "test.sqlite3",
+                    "test.sqlite3-journal",
+                    "test.sqlite3-wal",
+                    "test.sqlite3-shm",
+                ] {
+                    let _ = fs::remove_file(self.directory.join(name));
+                }
+                let _ = fs::remove_dir(&self.directory);
+            }
+        }
+
+        struct SyncMock {
+            feed: MoodleFeed,
+            listener: TcpListener,
+        }
+
+        impl SyncMock {
+            fn new() -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let feed = local_feed(listener.local_addr().unwrap());
+                Self { feed, listener }
+            }
+
+            fn sync(
+                &self,
+                client: &MoodleClient,
+                store: &mut SqliteStore,
+                status: &'static str,
+                body: &str,
+            ) -> Result<AssignmentImportSummary, MoodleSyncError> {
+                let (_, server) = mock_response_at(
+                    self.listener.try_clone().unwrap(),
+                    status,
+                    "",
+                    body.as_bytes().to_vec(),
+                );
+                let result = sync_moodle_once(client, &self.feed, store);
+                finish(server);
+                result
+            }
+        }
+
+        fn key(id: &str) -> ExternalRecordKey {
+            ExternalRecordKey {
+                origin: OriginKind::Moodle,
+                scope: SCOPE.into(),
+                id: id.into(),
+            }
+        }
+
+        fn stored(store: &SqliteStore, id: &str) -> Assignment {
+            store
+                .find_assignment_by_external_key(&key(id))
+                .unwrap()
+                .unwrap()
+        }
+
+        // Compare all persisted rows, including timestamps, bindings and courses.
+        fn snapshot(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
+            [
+                "assignments",
+                "assignment_sources",
+                "courses",
+                "course_sources",
+                "course_schedule",
+            ]
+            .into_iter()
+            .map(|table| {
+                let mut statement = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            })
+            .collect()
+        }
+
+        fn metadata(conn: &Connection, id: &AssignmentId) -> (String, String) {
+            conn.query_row(
+                "SELECT created_at, updated_at FROM assignments WHERE id = ?1",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        fn age_updated_at(conn: &Connection, id: &AssignmentId) {
+            conn.execute(
+                "UPDATE assignments SET updated_at = ?1 WHERE id = ?2",
+                params!["2000-01-01T00:00:00.000000001Z", id.as_str()],
+            )
+            .unwrap();
+        }
+
+        fn utc(value: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .with_timezone(&Utc)
+        }
+
+        fn assert_safe(error: MoodleSyncError, db: &TestDatabase) {
+            assert_secret_free(&error);
+            let rendered = format!("{error} {error:?}");
+            for forbidden in [
+                PRIVATE,
+                SCOPE,
+                "1001@cms.example.edu",
+                "2002@cms.example.edu",
+                "2003@cms.example.edu",
+                "課題（DFS/BFS）",
+                "演習課題01",
+                "BEGIN:VCALENDAR",
+                "authtoken",
+                "calendar/export",
+                "127.0.0.1",
+                "SELECT",
+                "RAISE",
+                "assignment_sources",
+            ] {
+                assert!(!rendered.contains(forbidden));
+            }
+            assert!(!rendered.contains(db.path().to_str().unwrap()));
+        }
+
+        #[test]
+        fn sync_imports_then_resyncs_same_feed_and_preserves_local_completion() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap(),
+                AssignmentImportSummary {
+                    created: 2,
+                    ..Default::default()
+                }
+            );
+            let end = stored(&store, "2002@cms.example.edu");
+            let deadline = stored(&store, "2003@cms.example.edu");
+            assert_eq!(end.title, "課題（DFS/BFS）");
+            assert_eq!(
+                end.deadline,
+                Some(Deadline::DateTime(utc("2026-10-08T01:50:00Z")))
+            );
+            assert_eq!(deadline.title, "CF-L01課題");
+            assert_eq!(
+                deadline.deadline,
+                Some(Deadline::DateTime(utc("2026-10-04T14:59:00Z")))
+            );
+            for assignment in [&end, &deadline] {
+                assert!(assignment.id.as_str().starts_with("a_"));
+                assert_eq!(assignment.course_id, None);
+                assert_eq!(assignment.submission, SubmissionTarget::Unknown);
+                assert_eq!(assignment.submission_url, None);
+                assert_eq!(assignment.completion, CompletionState::Incomplete);
+                let (created, updated) = metadata(&observer, &assignment.id);
+                assert_eq!(created, updated);
+            }
+            assert_eq!(
+                store
+                    .find_assignment_by_external_key(&key("2001@cms.example.edu"))
+                    .unwrap(),
+                None
+            );
+            let initial = snapshot(&observer);
+            assert!(initial[2].is_empty());
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap(),
+                AssignmentImportSummary {
+                    unchanged: 2,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(snapshot(&observer), initial);
+
+            store
+                .set_completion(&deadline.id, CompletionState::Completed)
+                .unwrap();
+            let completed = snapshot(&observer);
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap(),
+                AssignmentImportSummary {
+                    unchanged: 2,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(snapshot(&observer), completed);
+            let resynced = stored(&store, "2003@cms.example.edu");
+            assert_eq!(resynced.id, deadline.id);
+            assert_eq!(resynced.completion, CompletionState::Completed);
+        }
+
+        #[test]
+        fn sync_updates_source_fields_preserving_id_completion_and_created_at() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            mock.sync(&client, &mut store, "200 OK", BASIC).unwrap();
+            let original = stored(&store, "1001@cms.example.edu");
+            store
+                .set_completion(&original.id, CompletionState::Completed)
+                .unwrap();
+            age_updated_at(&observer, &original.id);
+            let previous = metadata(&observer, &original.id);
+            let changed = BASIC
+                .replace("演習課題01", PRIVATE)
+                .replace("20260927T145900Z", "20261010T090000Z");
+            let before = Utc::now();
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", &changed).unwrap(),
+                AssignmentImportSummary {
+                    updated: 1,
+                    ..Default::default()
+                }
+            );
+            let after = Utc::now();
+            let updated = stored(&store, "1001@cms.example.edu");
+            assert_eq!(updated.id, original.id);
+            assert_eq!(updated.title, PRIVATE);
+            assert_eq!(
+                updated.deadline,
+                Some(Deadline::DateTime(utc("2026-10-10T09:00:00Z")))
+            );
+            assert_eq!(updated.completion, CompletionState::Completed);
+            let current = metadata(&observer, &updated.id);
+            assert_eq!(current.0, previous.0);
+            assert_ne!(current.1, previous.1);
+            assert!(before <= utc(&current.1) && utc(&current.1) <= after);
+            assert_eq!(snapshot(&observer)[0].len(), 1);
+        }
+
+        #[test]
+        fn sync_candidate_absence_preserves_all_existing_rows() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap();
+            let absent = stored(&store, "2003@cms.example.edu");
+            store
+                .set_completion(&absent.id, CompletionState::Completed)
+                .unwrap();
+            let before = snapshot(&observer);
+            let (prefix, _) = MULTIPLE.rsplit_once("BEGIN:VEVENT").unwrap();
+            let reduced = format!("{prefix}END:VCALENDAR\n");
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", &reduced).unwrap(),
+                AssignmentImportSummary {
+                    unchanged: 1,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(snapshot(&observer), before);
+            assert_eq!(stored(&store, "2003@cms.example.edu").id, absent.id);
+        }
+
+        #[test]
+        fn sync_empty_and_fully_filtered_calendars_return_zero_counts_without_changes() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            mock.sync(&client, &mut store, "200 OK", BASIC).unwrap();
+            let before = snapshot(&observer);
+            let filtered = BASIC.replace("の提出期限", " の受験可能期間の開始");
+            for body in [EMPTY, filtered.as_str()] {
+                assert_eq!(
+                    mock.sync(&client, &mut store, "200 OK", body).unwrap(),
+                    AssignmentImportSummary::default()
+                );
+                assert_eq!(snapshot(&observer), before);
+            }
+        }
+
+        #[test]
+        fn sync_fetch_parse_and_validation_failures_leave_database_unchanged() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap();
+            let existing = stored(&store, "2002@cms.example.edu");
+            store
+                .set_completion(&existing.id, CompletionState::Completed)
+                .unwrap();
+            let before = snapshot(&observer);
+            let changed = MULTIPLE.replace("課題（DFS/BFS）", PRIVATE);
+            // A later malformed event must prevent an earlier valid update.
+            let malformed = changed
+                .replace("DTSTART:20261004T145900Z\n", "")
+                .replace("DESCRIPTION:", &format!("DESCRIPTION:{PRIVATE}"));
+            let duplicate = changed
+                .replace("2002@cms.example.edu", PRIVATE)
+                .replace("2003@cms.example.edu", PRIVATE);
+            for (status, body, expected) in [
+                ("500 Internal Server Error", PRIVATE, MoodleSyncError::Fetch),
+                ("200 OK", malformed.as_str(), MoodleSyncError::Parse),
+                ("200 OK", duplicate.as_str(), MoodleSyncError::Validation),
+            ] {
+                let error = mock.sync(&client, &mut store, status, body).unwrap_err();
+                assert_eq!(error, expected);
+                assert_safe(error, &db);
+                assert_eq!(snapshot(&observer), before);
+            }
+        }
+
+        #[test]
+        fn sync_persistence_failure_rolls_back_prior_update_insert_and_binding() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            let (prefix, _) = MULTIPLE.rsplit_once("BEGIN:VEVENT").unwrap();
+            let initial = format!("{prefix}END:VCALENDAR\n");
+            mock.sync(&client, &mut store, "200 OK", &initial).unwrap();
+            let existing = stored(&store, "2002@cms.example.edu");
+            store
+                .set_completion(&existing.id, CompletionState::Completed)
+                .unwrap();
+            age_updated_at(&observer, &existing.id);
+            // An ordinary SQLite trigger rejects the later binding with a raw
+            // synthetic identity in its cause, after the earlier source update.
+            observer
+                .execute_batch(
+                    "CREATE TRIGGER reject_sync_binding BEFORE INSERT ON assignment_sources
+                 BEGIN SELECT RAISE(ABORT, NEW.scope || NEW.external_id); END;",
+                )
+                .unwrap();
+            let before = snapshot(&observer);
+            let changed = MULTIPLE
+                .replace("課題（DFS/BFS）", PRIVATE)
+                .replace("2003@cms.example.edu", PRIVATE);
+            let error = mock
+                .sync(&client, &mut store, "200 OK", &changed)
+                .unwrap_err();
+            assert_eq!(error, MoodleSyncError::Persistence);
+            assert_safe(error, &db);
+            assert_eq!(snapshot(&observer), before);
+            assert_eq!(
+                store
+                    .find_assignment_by_external_key(&key(PRIVATE))
+                    .unwrap(),
+                None
+            );
+
+            observer
+                .execute_batch("DROP TRIGGER reject_sync_binding")
+                .unwrap();
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", &changed).unwrap(),
+                AssignmentImportSummary {
+                    created: 1,
+                    updated: 1,
+                    unchanged: 0
+                }
+            );
+            assert_eq!(stored(&store, "2002@cms.example.edu").id, existing.id);
+            assert_eq!(
+                stored(&store, "2002@cms.example.edu").completion,
+                CompletionState::Completed
+            );
+        }
+
+        #[test]
+        fn sync_does_not_hold_a_sqlite_transaction_while_waiting_for_http() {
+            let db = TestDatabase::new();
+            let (mut store, _observer) = db.open();
+            let path = db.path();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let feed = local_feed(listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request_headers(&mut stream);
+                let writer = Connection::open(path).unwrap();
+                writer.busy_timeout(Duration::ZERO).unwrap();
+                // The fetch is still waiting for this response. A write lock
+                // must be immediately available from another SQLite connection.
+                writer.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    BASIC.len()
+                );
+                stream.write_all(headers.as_bytes()).unwrap();
+                stream.write_all(BASIC.as_bytes()).unwrap();
+                (request, listener)
+            });
+            assert_eq!(
+                sync_moodle_once(&MoodleClient::new().unwrap(), &feed, &mut store).unwrap(),
+                AssignmentImportSummary {
+                    created: 1,
+                    ..Default::default()
+                }
+            );
+            finish(server);
+        }
+    }
 }
