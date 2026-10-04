@@ -1079,6 +1079,42 @@ mod tests {
         }
 
         #[test]
+        fn sync_then_toggle_then_resync_keeps_completion_and_can_toggle_back() {
+            use crate::actions::toggle_assignment_completion;
+
+            let db = TestDatabase::new();
+            let (mut store, _) = db.open();
+            let mock = SyncMock::new();
+            assert_eq!(
+                mock.sync_json(&mut store, GROUP, CONTENTS).unwrap().created,
+                3
+            );
+            let assignment = stored(&store, GROUP, "fixture-content-001");
+            assert_eq!(
+                toggle_assignment_completion(&mut store, &assignment.id).unwrap(),
+                CompletionState::Completed
+            );
+            assert_eq!(
+                mock.sync_json(&mut store, GROUP, CONTENTS)
+                    .unwrap()
+                    .unchanged,
+                3
+            );
+            assert_eq!(
+                stored(&store, GROUP, "fixture-content-001").completion,
+                CompletionState::Completed
+            );
+            assert_eq!(
+                toggle_assignment_completion(&mut store, &assignment.id).unwrap(),
+                CompletionState::Incomplete
+            );
+            assert_eq!(
+                store.get_assignment(&assignment.id).unwrap(),
+                Some(assignment)
+            );
+        }
+
+        #[test]
         fn sync_updates_title_and_deadline_preserving_identity_completion_and_created_at() {
             let db = TestDatabase::new();
             let (mut store, observer) = db.open();

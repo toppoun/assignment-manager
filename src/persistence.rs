@@ -636,23 +636,56 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         let assignment = get_assignment_tx(&tx, id)?.ok_or(PersistenceError::NotFound)?;
-        if assignment.completion != completion {
-            let timestamp = encode_timestamp(&Utc::now());
-            let changed = tx
-                .execute(
-                    "UPDATE assignments SET completion = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![encode_completion(completion), timestamp, id.as_str()],
-                )
-                .map_err(database_error)?;
-            if changed != 1 {
-                return Err(PersistenceError::InvalidStoredData);
-            }
-        }
+        set_completion_tx(&tx, &assignment, completion)?;
         tx.commit().map_err(database_error)
+    }
+
+    /// Application convenience action; the immediate transaction prevents a
+    /// competing writer from changing completion between this read and update.
+    pub(crate) fn toggle_completion(
+        &mut self,
+        id: &AssignmentId,
+    ) -> Result<CompletionState, PersistenceError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let assignment = get_assignment_tx(&tx, id)?.ok_or(PersistenceError::NotFound)?;
+        let completion = match assignment.completion {
+            CompletionState::Incomplete => CompletionState::Completed,
+            CompletionState::Completed => CompletionState::Incomplete,
+        };
+        set_completion_tx(&tx, &assignment, completion)?;
+        tx.commit().map_err(database_error)?;
+        Ok(completion)
     }
 }
 
 // These helpers reuse the caller's connection/transaction without starting one.
+fn set_completion_tx(
+    conn: &Connection,
+    assignment: &Assignment,
+    completion: CompletionState,
+) -> Result<(), PersistenceError> {
+    if assignment.completion != completion {
+        let timestamp = encode_timestamp(&Utc::now());
+        let changed = conn
+            .execute(
+                "UPDATE assignments SET completion = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    encode_completion(completion),
+                    timestamp,
+                    assignment.id.as_str()
+                ],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(PersistenceError::InvalidStoredData);
+        }
+    }
+    Ok(())
+}
+
 fn import_assignment_batch_tx(
     conn: &Connection,
     batch: &AssignmentCandidateBatch,
@@ -3675,6 +3708,229 @@ mod tests {
                 params!["2000-01-01T00:00:00.000000001Z", id.as_str()],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn completion_toggle_changes_only_local_state_and_updated_at_and_survives_reopen() {
+        let temp = TempDb::new();
+        let mut store = SqliteStore::open(&temp.path).unwrap();
+        let course = store
+            .create_course("Course label", vec![ScheduleEntry::OnDemand])
+            .unwrap();
+        let mut input = manual_input();
+        input.course_id = Some(course.id);
+        let mut expected = store.create_manual_assignment(input).unwrap();
+        for state in [CompletionState::Completed, CompletionState::Incomplete] {
+            age_updated_at(&store, &expected.id);
+            let metadata = assignment_metadata(&store, &expected.id);
+            let before = Utc::now();
+            assert_eq!(
+                crate::actions::toggle_assignment_completion(&mut store, &expected.id).unwrap(),
+                state
+            );
+            let after = Utc::now();
+            expected.completion = state;
+            assert_eq!(
+                store.get_assignment(&expected.id).unwrap(),
+                Some(expected.clone())
+            );
+            let updated = assignment_metadata(&store, &expected.id);
+            assert_eq!(updated.0, metadata.0);
+            assert_ne!(updated.1, metadata.1);
+            let timestamp = decode_timestamp(&updated.1).unwrap();
+            assert!(before <= timestamp && timestamp <= after);
+            let reopened = SqliteStore::open(&temp.path).unwrap();
+            assert_eq!(
+                reopened.get_assignment(&expected.id).unwrap(),
+                Some(expected.clone())
+            );
+            assert_eq!(assignment_metadata(&reopened, &expected.id), updated);
+        }
+    }
+
+    #[test]
+    fn toggled_completion_survives_changed_source_import_and_observation_for_both_origins() {
+        for (origin, scope) in [
+            (OriginKind::Moodle, SyncScope::MoodleFeed("feed".into())),
+            (
+                OriginKind::WebClass,
+                SyncScope::WebClassContents("group".into()),
+            ),
+        ] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let mut candidate = import_candidate(
+                origin,
+                if origin == OriginKind::Moodle {
+                    "feed"
+                } else {
+                    "group"
+                },
+                "record",
+            );
+            let observation =
+                AssignmentObservation::try_new(scope.clone(), vec![candidate.external_key.clone()])
+                    .unwrap();
+            let observed_at = decode_timestamp(STAMP).unwrap();
+            store
+                .import_assignment_batch_with_observation(
+                    &batch(vec![candidate.clone()]),
+                    &observation,
+                    observed_at,
+                )
+                .unwrap();
+            let assignment = store
+                .find_assignment_by_external_key(&candidate.external_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::actions::toggle_assignment_completion(&mut store, &assignment.id).unwrap(),
+                CompletionState::Completed
+            );
+            assert_eq!(
+                store
+                    .get_assignment_last_seen_at(&candidate.external_key)
+                    .unwrap(),
+                Some(observed_at)
+            );
+            assert_eq!(store.get_last_synced_at(&scope).unwrap(), Some(observed_at));
+            candidate.title = "Updated source title".into();
+            let next_observation = observed_at + chrono::Duration::seconds(1);
+            assert_eq!(
+                store
+                    .import_assignment_batch_with_observation(
+                        &batch(vec![candidate.clone()]),
+                        &observation,
+                        next_observation
+                    )
+                    .unwrap()
+                    .updated,
+                1
+            );
+            let updated = store.get_assignment(&assignment.id).unwrap().unwrap();
+            assert_eq!(updated.title, candidate.title);
+            assert_eq!(updated.completion, CompletionState::Completed);
+            assert_eq!(
+                crate::actions::toggle_assignment_completion(&mut store, &assignment.id).unwrap(),
+                CompletionState::Incomplete
+            );
+            assert_eq!(
+                store
+                    .get_assignment_last_seen_at(&candidate.external_key)
+                    .unwrap(),
+                Some(next_observation)
+            );
+            assert_eq!(
+                store.get_last_synced_at(&scope).unwrap(),
+                Some(next_observation)
+            );
+        }
+    }
+
+    #[test]
+    fn completion_toggle_missing_corrupt_and_failed_updates_use_safe_errors_and_rollback() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let error =
+            crate::actions::toggle_assignment_completion(&mut store, &AssignmentId::new(PRIVATE))
+                .unwrap_err();
+        assert_eq!(error, PersistenceError::NotFound);
+        assert_safe(error);
+        let mut input = manual_input();
+        input.title = PRIVATE.into();
+        input.submission_url = Some(format!("https://submit.example.invalid/{PRIVATE}"));
+        let assignment = store.create_manual_assignment(input).unwrap();
+        let metadata = assignment_metadata(&store, &assignment.id);
+        store.conn.execute_batch("CREATE TRIGGER reject_toggle AFTER UPDATE ON assignments BEGIN SELECT RAISE(ABORT, NEW.title || NEW.submission_url); END;").unwrap();
+        let error =
+            crate::actions::toggle_assignment_completion(&mut store, &assignment.id).unwrap_err();
+        assert_eq!(error, PersistenceError::Constraint);
+        assert_safe(error);
+        assert_eq!(
+            store.get_assignment(&assignment.id).unwrap(),
+            Some(assignment.clone())
+        );
+        assert_eq!(assignment_metadata(&store, &assignment.id), metadata);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_toggle; PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE assignments SET completion = ?1", [PRIVATE])
+            .unwrap();
+        let changes = store.conn.total_changes();
+        let error =
+            crate::actions::toggle_assignment_completion(&mut store, &assignment.id).unwrap_err();
+        assert_eq!(error, PersistenceError::InvalidStoredData);
+        assert_safe(error);
+        assert_eq!(store.conn.total_changes(), changes);
+        assert_eq!(assignment_metadata(&store, &assignment.id), metadata);
+    }
+
+    #[test]
+    fn competing_completion_toggles_do_not_lose_an_update() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let temp = TempDb::new();
+        let mut observer = SqliteStore::open(&temp.path).unwrap();
+        let assignment = observer.create_manual_assignment(manual_input()).unwrap();
+        let workers = [
+            SqliteStore::open(&temp.path).unwrap(),
+            SqliteStore::open(&temp.path).unwrap(),
+        ];
+        let barrier = Arc::new(Barrier::new(workers.len()));
+        let handles: Vec<_> = workers
+            .into_iter()
+            .map(|mut store| {
+                let barrier = Arc::clone(&barrier);
+                let id = assignment.id.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    crate::actions::toggle_assignment_completion(&mut store, &id).unwrap()
+                })
+            })
+            .collect();
+        let states: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(states.contains(&CompletionState::Completed));
+        assert!(states.contains(&CompletionState::Incomplete));
+        assert_eq!(
+            observer.get_assignment(&assignment.id).unwrap(),
+            Some(assignment)
+        );
+    }
+
+    #[test]
+    fn query_filter_does_not_hide_invalid_excluded_rows() {
+        use crate::query::{
+            AssignmentListOptions, CompletionFilter, QueryTimeContext, query_assignments,
+        };
+        use chrono::FixedOffset;
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.create_manual_assignment(manual_input()).unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE assignments SET submission = ?1", [PRIVATE])
+            .unwrap();
+        let options = AssignmentListOptions {
+            completion: CompletionFilter::State(CompletionState::Completed),
+            ..Default::default()
+        };
+        let time = QueryTimeContext {
+            now: decode_timestamp(STAMP).unwrap(),
+            local_date: NaiveDate::from_ymd_opt(2026, 10, 4).unwrap(),
+            utc_offset: FixedOffset::east_opt(9 * 3600).unwrap(),
+        };
+        let error = query_assignments(&store, &options, time).unwrap_err();
+        assert_eq!(error, PersistenceError::InvalidStoredData);
+        assert_safe(error);
     }
 
     #[test]

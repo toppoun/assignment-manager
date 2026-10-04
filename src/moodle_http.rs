@@ -1412,6 +1412,45 @@ mod tests {
         }
 
         #[test]
+        fn sync_then_toggle_then_resync_keeps_completion_and_can_toggle_back() {
+            use crate::actions::toggle_assignment_completion;
+
+            let db = TestDatabase::new();
+            let (mut store, _) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", MULTIPLE)
+                    .unwrap()
+                    .created,
+                2
+            );
+            let assignment = stored(&store, "2003@cms.example.edu");
+            assert_eq!(
+                toggle_assignment_completion(&mut store, &assignment.id).unwrap(),
+                CompletionState::Completed
+            );
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", MULTIPLE)
+                    .unwrap()
+                    .unchanged,
+                2
+            );
+            assert_eq!(
+                stored(&store, "2003@cms.example.edu").completion,
+                CompletionState::Completed
+            );
+            assert_eq!(
+                toggle_assignment_completion(&mut store, &assignment.id).unwrap(),
+                CompletionState::Incomplete
+            );
+            assert_eq!(
+                store.get_assignment(&assignment.id).unwrap(),
+                Some(assignment)
+            );
+        }
+
+        #[test]
         fn sync_updates_source_fields_preserving_id_completion_and_created_at() {
             let db = TestDatabase::new();
             let (mut store, observer) = db.open();
