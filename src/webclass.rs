@@ -47,22 +47,50 @@ pub struct WebClassContent {
     pub hidden_content: Option<bool>,
 }
 
+/// Safe JSON diagnostics only; no payload, serde message or underlying cause is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebClassParseError {
+    pub category: serde_json::error::Category,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl From<serde_json::Error> for WebClassParseError {
+    fn from(error: serde_json::Error) -> Self {
+        Self {
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+        }
+    }
+}
+
+impl fmt::Display for WebClassParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid WebClass JSON ({:?}) at line {}, column {}",
+            self.category, self.line, self.column
+        )
+    }
+}
+
+impl Error for WebClassParseError {}
+
 /// Unknown fields are ignored, while malformed JSON and missing required fields fail parsing.
-pub fn parse_courses(json: &str) -> Result<Vec<WebClassCourse>, serde_json::Error> {
-    serde_json::from_str(json)
+pub fn parse_courses(json: &str) -> Result<Vec<WebClassCourse>, WebClassParseError> {
+    serde_json::from_str(json).map_err(WebClassParseError::from)
 }
 
 /// Unknown contents kinds are retained so classification can make an explicit decision.
-pub fn parse_contents(json: &str) -> Result<Vec<WebClassContent>, serde_json::Error> {
-    serde_json::from_str(json)
+pub fn parse_contents(json: &str) -> Result<Vec<WebClassContent>, WebClassParseError> {
+    serde_json::from_str(json).map_err(WebClassParseError::from)
 }
 
+/// Fixed classifications only; no content identity, field value or underlying cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebClassMapError {
-    InvalidEndDate {
-        contents_id: String,
-        value: String,
-    },
+    InvalidEndDate,
     /// Import validation carries a fixed classification only, with no source data.
     Validation(ImportValidationError),
 }
@@ -70,12 +98,7 @@ pub enum WebClassMapError {
 impl fmt::Display for WebClassMapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidEndDate { contents_id, value } => {
-                write!(
-                    f,
-                    "WebClass content {contents_id}: invalid end_date: {value}"
-                )
-            }
+            Self::InvalidEndDate => write!(f, "WebClass content has invalid end_date"),
             Self::Validation(error) => error.fmt(f),
         }
     }
@@ -91,12 +114,8 @@ fn deadline(content: &WebClassContent) -> Result<Option<Deadline>, WebClassMapEr
     else {
         return Ok(None);
     };
-    let parsed = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").map_err(|_| {
-        WebClassMapError::InvalidEndDate {
-            contents_id: content.contents_id.clone(),
-            value: value.to_owned(),
-        }
-    })?;
+    let parsed = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .map_err(|_| WebClassMapError::InvalidEndDate)?;
     let jst = FixedOffset::east_opt(9 * 60 * 60).expect("+09:00 is a valid fixed offset");
     let datetime = jst
         .from_local_datetime(&parsed)
@@ -196,6 +215,13 @@ mod tests {
     const CONTENTS_BASIC: &str = include_str!("../fixtures/webclass/contents_basic.json");
     const CONTENTS_STATES: &str = include_str!("../fixtures/webclass/contents_states.json");
     const CONTENTS_EMPTY: &str = include_str!("../fixtures/webclass/contents_empty.json");
+    const PRIVATE_MARKER: &str = "VERY_PRIVATE_MARKER_5_5B";
+
+    fn assert_private_marker_absent(error: &dyn Error) {
+        assert!(!format!("{error}").contains(PRIVATE_MARKER));
+        assert!(!format!("{error:?}").contains(PRIVATE_MARKER));
+        assert!(error.source().is_none());
+    }
 
     fn utc(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -332,15 +358,71 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_errors_keep_only_category_and_position() {
+        use serde_json::error::Category;
+
+        let course_json = format!(
+            r#"[{{"group_id":"{PRIVATE_MARKER}","group_name":"{PRIVATE_MARKER}","year":"{PRIVATE_MARKER}"}}]"#
+        );
+        let content_json = format!(
+            r#"[{{"contents_id":"{PRIVATE_MARKER}","contents_kind":"Question","contents_name":"{PRIVATE_MARKER}","group_id":"{PRIVATE_MARKER}","scores":[{{"max_score":"{PRIVATE_MARKER}"}}]}}]"#
+        );
+        let missing_field_json = format!(r#"[{{"{PRIVATE_MARKER}":true}}]"#);
+        for error in [
+            parse_courses(&course_json).unwrap_err(),
+            parse_contents(&content_json).unwrap_err(),
+            parse_courses(&missing_field_json).unwrap_err(),
+            parse_contents(&missing_field_json).unwrap_err(),
+        ] {
+            assert_eq!(error.category, Category::Data);
+            assert_eq!(error.line, 1);
+            assert!(error.column > 0);
+            assert_private_marker_absent(&error);
+        }
+    }
+
+    #[test]
+    fn json_syntax_and_eof_errors_do_not_retain_payloads() {
+        use serde_json::error::Category;
+
+        for (json, category) in [
+            (format!("[{{\"{PRIVATE_MARKER}\":]"), Category::Syntax),
+            (format!("[{{\"{PRIVATE_MARKER}\":"), Category::Eof),
+        ] {
+            for error in [
+                parse_courses(&json).unwrap_err(),
+                parse_contents(&json).unwrap_err(),
+            ] {
+                assert_eq!(error.category, category);
+                assert_private_marker_absent(&error);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_end_date_errors_do_not_retain_field_values_or_identities() {
+        let mut content = parse_contents(CONTENTS_BASIC).unwrap().remove(0);
+        content.contents_id = PRIVATE_MARKER.into();
+        content.contents_name = PRIVATE_MARKER.into();
+        content.group_id = PRIVATE_MARKER.into();
+        content.end_date = Some(PRIVATE_MARKER.into());
+        for error in [
+            map_content(&content).unwrap_err(),
+            map_contents(std::slice::from_ref(&content)).unwrap_err(),
+            map_contents_for_group(std::slice::from_ref(&content), PRIVATE_MARKER).unwrap_err(),
+        ] {
+            assert_eq!(error, WebClassMapError::InvalidEndDate);
+            assert_private_marker_absent(&error);
+        }
+    }
+
+    #[test]
     fn malformed_nonempty_end_date_fails_mapping() {
         let json = r#"[{"contents_id":"c-1","contents_kind":"Question","contents_name":"課題","group_id":"group-1","end_date":"2026-13-06 09:00:59"}]"#;
         let contents = parse_contents(json).unwrap();
         assert_eq!(
             map_contents(&contents),
-            Err(WebClassMapError::InvalidEndDate {
-                contents_id: "c-1".into(),
-                value: "2026-13-06 09:00:59".into(),
-            })
+            Err(WebClassMapError::InvalidEndDate)
         );
     }
 

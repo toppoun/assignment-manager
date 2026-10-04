@@ -30,9 +30,10 @@ pub enum MoodleEventKind {
     Unknown,
 }
 
+/// Only fixed reasons, known property names and event indices; no source values or causes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MoodleParseError {
-    InvalidIcs(String),
+    InvalidIcs(&'static str),
     MissingUid {
         event_index: usize,
     },
@@ -45,12 +46,10 @@ pub enum MoodleParseError {
     InvalidDateTime {
         event_index: usize,
         property: &'static str,
-        value: String,
     },
     UnsupportedDateTime {
         event_index: usize,
         property: &'static str,
-        value: String,
     },
 }
 
@@ -68,19 +67,11 @@ impl fmt::Display for MoodleParseError {
             Self::InvalidDateTime {
                 event_index,
                 property,
-                value,
-            } => write!(
-                f,
-                "VEVENT {event_index}: invalid {property} datetime: {value}"
-            ),
+            } => write!(f, "VEVENT {event_index}: invalid {property} datetime"),
             Self::UnsupportedDateTime {
                 event_index,
                 property,
-                value,
-            } => write!(
-                f,
-                "VEVENT {event_index}: unsupported {property} datetime: {value}"
-            ),
+            } => write!(f, "VEVENT {event_index}: unsupported {property} datetime"),
         }
     }
 }
@@ -92,10 +83,10 @@ pub fn parse_calendar(ics: &str) -> Result<Vec<MoodleEvent>, MoodleParseError> {
     validate_component_boundaries(ics)?;
     let calendars = IcalParser::new(ics.as_bytes())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| MoodleParseError::InvalidIcs(error.to_string()))?;
+        .map_err(|_| MoodleParseError::InvalidIcs("invalid component or property"))?;
     let [calendar] = calendars.as_slice() else {
         return Err(MoodleParseError::InvalidIcs(
-            "expected exactly one VCALENDAR".into(),
+            "expected exactly one VCALENDAR",
         ));
     };
 
@@ -117,9 +108,7 @@ fn validate_component_boundaries(ics: &str) -> Result<(), MoodleParseError> {
             if name.eq_ignore_ascii_case("BEGIN") {
                 if stack.is_empty() {
                     if calendar_seen || !value.eq_ignore_ascii_case("VCALENDAR") {
-                        return Err(MoodleParseError::InvalidIcs(
-                            "expected one VCALENDAR root".into(),
-                        ));
+                        return Err(MoodleParseError::InvalidIcs("expected one VCALENDAR root"));
                     }
                     calendar_seen = true;
                 }
@@ -131,22 +120,18 @@ fn validate_component_boundaries(ics: &str) -> Result<(), MoodleParseError> {
                     .pop()
                     .is_some_and(|open| open.eq_ignore_ascii_case(value))
                 {
-                    return Err(MoodleParseError::InvalidIcs(
-                        "mismatched component END".into(),
-                    ));
+                    return Err(MoodleParseError::InvalidIcs("mismatched component END"));
                 }
                 continue;
             }
         }
         if stack.is_empty() && !line.is_empty() {
-            return Err(MoodleParseError::InvalidIcs(
-                "content outside VCALENDAR".into(),
-            ));
+            return Err(MoodleParseError::InvalidIcs("content outside VCALENDAR"));
         }
     }
     if !calendar_seen || !stack.is_empty() {
         return Err(MoodleParseError::InvalidIcs(
-            "unclosed or missing VCALENDAR".into(),
+            "unclosed or missing VCALENDAR",
         ));
     }
     Ok(())
@@ -202,9 +187,7 @@ fn property<'a>(
     let mut matches = properties.iter().filter(|value| value.name == name);
     let first = matches.next();
     if matches.next().is_some() {
-        return Err(MoodleParseError::InvalidIcs(format!(
-            "duplicate {name} property in VEVENT"
-        )));
+        return Err(MoodleParseError::InvalidIcs("duplicate property in VEVENT"));
     }
     Ok(first)
 }
@@ -225,7 +208,7 @@ fn decode_text(value: &str) -> Result<String, MoodleParseError> {
             Some(';') => decoded.push(';'),
             _ => {
                 return Err(MoodleParseError::InvalidIcs(
-                    "invalid iCalendar TEXT escape".into(),
+                    "invalid iCalendar TEXT escape",
                 ));
             }
         }
@@ -255,7 +238,6 @@ fn parse_datetime(
         return Err(MoodleParseError::UnsupportedDateTime {
             event_index,
             property: name,
-            value: value.into(),
         });
     }
     NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%SZ")
@@ -263,7 +245,6 @@ fn parse_datetime(
         .map_err(|_| MoodleParseError::InvalidDateTime {
             event_index,
             property: name,
-            value: value.into(),
         })
 }
 
@@ -332,6 +313,19 @@ mod tests {
     const MULTIPLE: &str = include_str!("../fixtures/moodle/calendar_multiple.ics");
     const EMPTY: &str = include_str!("../fixtures/moodle/calendar_empty.ics");
     const EDGE_CASES: &str = include_str!("../fixtures/moodle/calendar_edge_cases.ics");
+    const PRIVATE_MARKER: &str = "VERY_PRIVATE_MARKER_5_5B";
+
+    fn assert_private_marker_absent(error: &dyn Error) {
+        assert!(!format!("{error}").contains(PRIVATE_MARKER));
+        assert!(!format!("{error:?}").contains(PRIVATE_MARKER));
+        assert!(error.source().is_none());
+    }
+
+    fn private_calendar(properties: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:{PRIVATE_MARKER}\nSUMMARY:{PRIVATE_MARKER}の提出期限\n{properties}\nEND:VEVENT\nEND:VCALENDAR\n"
+        )
+    }
 
     fn utc(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -526,6 +520,105 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn datetime_errors_keep_only_event_index_and_known_property_name() {
+        for property in ["DTSTART", "DTEND", "LAST-MODIFIED"] {
+            let properties = if property == "DTSTART" {
+                format!("DTSTART:{PRIVATE_MARKER}")
+            } else {
+                format!("DTSTART:20261004T000000Z\n{property}:{PRIVATE_MARKER}")
+            };
+            let error = parse_calendar(&private_calendar(&properties)).unwrap_err();
+            assert_eq!(
+                error,
+                MoodleParseError::UnsupportedDateTime {
+                    event_index: 1,
+                    property,
+                }
+            );
+            assert_private_marker_absent(&error);
+
+            let invalid_date = "20261304T000000Z";
+            let properties = properties.replace(PRIVATE_MARKER, invalid_date);
+            let error = parse_calendar(&private_calendar(&properties)).unwrap_err();
+            assert_eq!(
+                error,
+                MoodleParseError::InvalidDateTime {
+                    event_index: 1,
+                    property,
+                }
+            );
+            assert_private_marker_absent(&error);
+            assert!(!format!("{error} {error:?}").contains(invalid_date));
+        }
+    }
+
+    #[test]
+    fn structure_text_and_missing_field_errors_do_not_retain_payloads() {
+        for ics in [
+            // Reaches the external property parser after component boundary validation.
+            private_calendar(&format!("{PRIVATE_MARKER}\nDTSTART:20261004T000000Z")),
+            private_calendar("DTSTART:20261004T000000Z")
+                .replace("END:VEVENT", &format!("END:{PRIVATE_MARKER}")),
+            private_calendar("DTSTART:20261004T000000Z")
+                .replace("BEGIN:VEVENT", &format!("BEGIN:{PRIVATE_MARKER}"))
+                .replace("END:VEVENT", &format!("END:{PRIVATE_MARKER}")),
+            private_calendar("DTSTART:20261004T000000Z").replace(
+                &format!("SUMMARY:{PRIVATE_MARKER}"),
+                &format!("SUMMARY:{PRIVATE_MARKER}\\x"),
+            ),
+            private_calendar(&format!("DTSTART:20261004T000000Z\nUID:{PRIVATE_MARKER}")),
+        ] {
+            let error = parse_calendar(&ics).unwrap_err();
+            assert!(matches!(error, MoodleParseError::InvalidIcs(_)));
+            assert_private_marker_absent(&error);
+        }
+
+        for (line, expected) in [
+            (
+                format!("UID:{PRIVATE_MARKER}\n"),
+                MoodleParseError::MissingUid { event_index: 1 },
+            ),
+            (
+                format!("SUMMARY:{PRIVATE_MARKER}の提出期限\n"),
+                MoodleParseError::MissingSummary { event_index: 1 },
+            ),
+            (
+                "DTSTART:20261004T000000Z\n".into(),
+                MoodleParseError::MissingDtstart { event_index: 1 },
+            ),
+        ] {
+            let ics = private_calendar("DTSTART:20261004T000000Z").replace(&line, "");
+            let error = parse_calendar(&ics).unwrap_err();
+            assert_eq!(error, expected);
+            assert_private_marker_absent(&error);
+        }
+    }
+
+    #[test]
+    fn mapped_events_use_secret_free_shared_validation_errors() {
+        use crate::import::{AssignmentCandidateBatch, ImportValidationError};
+
+        // The Moodle mapper has no error type; validation remains at the batch boundary.
+        let events = parse_calendar(&private_calendar("DTSTART:20261004T000000Z")).unwrap();
+        let duplicate = vec![events[0].clone(), events[0].clone()];
+        let error =
+            AssignmentCandidateBatch::try_new(map_events(&duplicate, PRIVATE_MARKER)).unwrap_err();
+        assert_eq!(error, ImportValidationError::DuplicateExternalIdentity);
+        assert_private_marker_absent(&error);
+
+        let error = AssignmentCandidateBatch::try_new(map_events(&events, " ")).unwrap_err();
+        assert_eq!(error, ImportValidationError::EmptyExternalScope);
+        assert_private_marker_absent(&error);
+
+        let mut blank_uid = events;
+        blank_uid[0].uid = " ".into();
+        let error =
+            AssignmentCandidateBatch::try_new(map_events(&blank_uid, PRIVATE_MARKER)).unwrap_err();
+        assert_eq!(error, ImportValidationError::EmptyExternalId);
+        assert_private_marker_absent(&error);
     }
 
     #[test]
