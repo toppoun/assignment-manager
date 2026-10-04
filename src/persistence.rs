@@ -703,7 +703,7 @@ fn configure(conn: &Connection) -> Result<(), PersistenceError> {
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), PersistenceError> {
-    // Lock before inspecting the version/tables so two first opens cannot race.
+    // Lock before inspecting the version/schema so two first opens cannot race.
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| PersistenceError::Migration)?;
@@ -712,17 +712,19 @@ fn migrate(conn: &mut Connection) -> Result<(), PersistenceError> {
         .map_err(|_| PersistenceError::Migration)?;
     match version {
         0 => {
-            let has_tables: bool = tx
+            // sqlite_schema includes tables, views, indexes and triggers;
+            // the sqlite_ prefix is reserved for SQLite's internal objects.
+            let has_user_objects: bool = tx
                 .query_row(
                     "SELECT EXISTS (
                         SELECT 1 FROM sqlite_schema
-                        WHERE type = 'table' AND name NOT GLOB 'sqlite_*'
+                        WHERE name NOT GLOB 'sqlite_*'
                     )",
                     [],
                     |row| row.get(0),
                 )
                 .map_err(|_| PersistenceError::Migration)?;
-            if has_tables {
+            if has_user_objects {
                 return Err(PersistenceError::Migration);
             }
             tx.execute_batch(SCHEMA_V1)
@@ -1244,13 +1246,103 @@ mod tests {
     }
 
     #[test]
+    fn version_zero_with_only_an_unknown_view_is_rejected_without_changes() {
+        let temp = TempDb::new();
+        {
+            let conn = Connection::open(&temp.path).unwrap();
+            // The underscore in sqlite_* is literal, so sqlitex_ is user-defined.
+            conn.execute_batch(
+                "CREATE VIEW sqlitex_view AS SELECT 'SYNTHETIC_PRIVATE_VALUE_6B1' AS value",
+            )
+            .unwrap();
+            assert_eq!(pragma_number(&conn, "user_version"), 0);
+        }
+        let error = SqliteStore::open(&temp.path).err().unwrap();
+        assert_eq!(error, PersistenceError::Migration);
+        assert_safe(error);
+        assert_eq!(error.to_string(), "could not initialize SQLite schema");
+        assert_eq!(format!("{error:?}"), "Migration");
+        let conn = Connection::open(&temp.path).unwrap();
+        assert_eq!(pragma_number(&conn, "user_version"), 0);
+        let objects: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(objects, 1);
+        let value: String = conn
+            .query_row("SELECT value FROM sqlitex_view", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, PRIVATE);
+    }
+
+    #[test]
+    fn version_zero_with_user_defined_indexes_or_triggers_is_rejected_without_changes() {
+        // Indexes require a table; triggers require a table or view.
+        for sql in [
+            "CREATE TABLE unknown_table (value TEXT);
+             CREATE INDEX unknown_index ON unknown_table(value)",
+            "CREATE VIEW unknown_view AS SELECT 1 AS value;
+             CREATE TRIGGER unknown_trigger INSTEAD OF INSERT ON unknown_view
+             BEGIN SELECT 1; END",
+        ] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(sql).unwrap();
+            let schema: String = conn
+                .query_row(
+                    "SELECT group_concat(sql, ';') FROM sqlite_schema",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(migrate(&mut conn), Err(PersistenceError::Migration));
+            assert!(conn.is_autocommit());
+            assert_eq!(pragma_number(&conn, "user_version"), 0);
+            let unchanged_schema: String = conn
+                .query_row(
+                    "SELECT group_concat(sql, ';') FROM sqlite_schema",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unchanged_schema, schema);
+        }
+    }
+
+    #[test]
+    fn version_zero_with_only_internal_objects_migrates() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE discarded (id INTEGER PRIMARY KEY AUTOINCREMENT);
+             DROP TABLE discarded",
+        )
+        .unwrap();
+        let remaining_object: String = conn
+            .query_one("SELECT name FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_object, "sqlite_sequence");
+        assert_eq!(pragma_number(&conn, "user_version"), 0);
+        migrate(&mut conn).unwrap();
+        assert_eq!(pragma_number(&conn, "user_version"), 1);
+        for table in TABLES {
+            assert_eq!(count(&conn, table), 0);
+        }
+        let sequence_rows: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_sequence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sequence_rows, 0);
+    }
+
+    #[test]
     fn failed_migration_rolls_back_earlier_ddl_and_version() {
         let mut conn = Connection::open_in_memory().unwrap();
         configure(&conn).unwrap();
-        // A view is not a user table. Its name causes the second CREATE TABLE to
-        // fail after courses was created, exercising real transaction rollback.
-        conn.execute_batch("CREATE VIEW assignments AS SELECT 1 AS synthetic")
-            .unwrap();
+        // Allow courses and its primary-key index, but exhaust pages on later DDL.
+        conn.execute_batch("PRAGMA max_page_count = 3").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1.split_once(';').unwrap().0)
+                .unwrap();
+            tx.rollback().unwrap();
+        }
         assert_eq!(migrate(&mut conn), Err(PersistenceError::Migration));
         assert!(conn.is_autocommit());
         assert_eq!(pragma_number(&conn, "user_version"), 0);
@@ -1262,7 +1354,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 0);
-        conn.execute_batch("DROP VIEW assignments").unwrap();
+        conn.execute_batch("PRAGMA max_page_count = 100").unwrap();
         migrate(&mut conn).unwrap();
         assert_eq!(pragma_number(&conn, "user_version"), 1);
     }
