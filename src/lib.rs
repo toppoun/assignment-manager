@@ -4,6 +4,7 @@ pub mod moodle;
 pub mod moodle_http;
 pub mod observation;
 pub mod persistence;
+pub mod query;
 pub mod sync;
 pub mod webclass;
 pub mod webclass_auth;

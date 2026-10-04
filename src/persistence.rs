@@ -19,6 +19,7 @@ use crate::domain::{
 };
 use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
 use crate::observation::{AssignmentObservation, SyncScope, WebClassCourseListObservation};
+use crate::query::{AssignmentListItem, CourseListInfo};
 
 const SCHEMA_VERSION: i64 = 3;
 /// WebClass course identities use the existing single-profile namespace.
@@ -255,6 +256,49 @@ impl SqliteStore {
         id: &AssignmentId,
     ) -> Result<Option<Assignment>, PersistenceError> {
         get_assignment_tx(&self.conn, id)
+    }
+
+    /// Display projection for the application query. One SELECT provides a
+    /// consistent snapshot without per-assignment lookups or source identities
+    /// escaping persistence. Schedules and sync metadata are not projected.
+    pub(crate) fn list_assignments_with_courses(
+        &self,
+    ) -> Result<Vec<AssignmentListItem>, PersistenceError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id, a.course_id, a.title, a.deadline_kind, a.deadline_value,
+                    a.submission, a.submission_url, a.completion, a.created_at, a.updated_at,
+                    c.id, c.name, c.created_at, c.updated_at,
+                    s.course_id, s.origin, s.scope, s.external_id
+                 FROM assignments a
+                 LEFT JOIN courses c ON c.id = a.course_id
+                 LEFT JOIN course_sources s ON s.course_id = c.id
+                 ORDER BY a.id COLLATE BINARY ASC",
+            )
+            .map_err(database_error)?;
+        let mut rows = stmt.query([]).map_err(database_error)?;
+        let mut items: Vec<AssignmentListItem> = Vec::new();
+        while let Some(row) = rows.next().map_err(database_error)? {
+            let assignment = StoredAssignment::from_row(row)
+                .map_err(database_error)?
+                .decode()?;
+            // A damaged schema must not multiply assignments through duplicate bindings.
+            if items.last().is_some_and(|item| item.id == assignment.id) {
+                return Err(PersistenceError::InvalidStoredData);
+            }
+            let course = decode_course_list_info(row, assignment.course_id.as_ref())?;
+            items.push(AssignmentListItem {
+                id: assignment.id,
+                title: assignment.title,
+                deadline: assignment.deadline,
+                completion: assignment.completion,
+                submission: assignment.submission,
+                submission_url: assignment.submission_url,
+                course,
+            });
+        }
+        Ok(items)
     }
 
     /// Read a course and its ordered schedule from one consistent database snapshot.
@@ -1119,6 +1163,47 @@ fn database_error(error: rusqlite::Error) -> PersistenceError {
     }
 }
 
+// Columns 10..18 of the assignment display SELECT, after StoredAssignment's
+// columns. Read required columns when the relation/binding exists so damaged
+// LEFT JOIN relations cannot silently become unassigned/unbound display values.
+fn decode_course_list_info(
+    row: &Row<'_>,
+    course_id: Option<&CourseId>,
+) -> Result<Option<CourseListInfo>, PersistenceError> {
+    let Some(course_id) = course_id else {
+        return Ok(None);
+    };
+    let id: String = row.get(10).map_err(database_error)?;
+    if id != course_id.as_str() {
+        return Err(PersistenceError::InvalidStoredData);
+    }
+    let name: String = row.get(11).map_err(database_error)?;
+    let created_at: String = row.get(12).map_err(database_error)?;
+    let updated_at: String = row.get(13).map_err(database_error)?;
+    validate_metadata(&created_at, &updated_at)?;
+    let source_course_id: Option<String> = row.get(14).map_err(database_error)?;
+    let origin = match source_course_id {
+        None => None,
+        Some(source_course_id) => {
+            if source_course_id != id {
+                return Err(PersistenceError::InvalidStoredData);
+            }
+            let origin: String = row.get(15).map_err(database_error)?;
+            let scope: String = row.get(16).map_err(database_error)?;
+            let external_id: String = row.get(17).map_err(database_error)?;
+            validate_external_identity(&scope)
+                .and_then(|()| validate_external_identity(&external_id))
+                .map_err(|_| PersistenceError::InvalidStoredData)?;
+            Some(decode_origin(&origin)?)
+        }
+    };
+    Ok(Some(CourseListInfo {
+        id: CourseId::new(id),
+        name,
+        origin,
+    }))
+}
+
 struct StoredAssignment {
     id: String,
     course_id: Option<String>,
@@ -1339,6 +1424,15 @@ fn encode_origin(origin: OriginKind) -> &'static str {
     }
 }
 
+fn decode_origin(value: &str) -> Result<OriginKind, PersistenceError> {
+    match value {
+        "moodle" => Ok(OriginKind::Moodle),
+        "webclass" => Ok(OriginKind::WebClass),
+        "manual" => Ok(OriginKind::Manual),
+        _ => Err(PersistenceError::InvalidStoredData),
+    }
+}
+
 fn decode_schedule(
     kind: &str,
     day: Option<&str>,
@@ -1381,16 +1475,6 @@ mod tests {
             insert_course_row(&tx, course, &timestamp).map_err(database_error)?;
             insert_course_schedule(&tx, course)?;
             tx.commit().map_err(database_error)
-        }
-    }
-
-    // Binding readers filter by the production encoder; no public raw source reader.
-    fn decode_origin(value: &str) -> Result<OriginKind, PersistenceError> {
-        match value {
-            "moodle" => Ok(OriginKind::Moodle),
-            "webclass" => Ok(OriginKind::WebClass),
-            "manual" => Ok(OriginKind::Manual),
-            _ => Err(PersistenceError::InvalidStoredData),
         }
     }
 
@@ -1490,6 +1574,202 @@ mod tests {
         assert!(!error.to_string().contains(PRIVATE));
         assert!(!format!("{error:?}").contains(PRIVATE));
         assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn assignment_list_is_read_only_and_survives_file_reopen() {
+        let temp = TempDb::new();
+        let expected;
+        {
+            let mut store = SqliteStore::open(&temp.path).unwrap();
+            let bound = store
+                .create_course_with_source("2026-DB", vec![], OriginKind::Moodle, "feed", "2026-DB")
+                .unwrap();
+            let unbound = store.create_course("Manual label", vec![]).unwrap();
+            for course_id in [Some(bound.id), Some(unbound.id), None] {
+                let mut input = manual_input();
+                input.course_id = course_id;
+                let assignment = store.create_manual_assignment(input).unwrap();
+                store
+                    .set_completion(&assignment.id, CompletionState::Completed)
+                    .unwrap();
+            }
+            let changes = store.conn.total_changes();
+            // Enforced by SQLite: the new query must work without any DB writes.
+            store.conn.pragma_update(None, "query_only", "ON").unwrap();
+            expected = crate::query::load_assignment_list(&store).unwrap();
+            assert_eq!(expected.len(), 3);
+            assert_eq!(store.conn.total_changes(), changes);
+        }
+        let reopened = SqliteStore::open(&temp.path).unwrap();
+        assert_eq!(
+            crate::query::load_assignment_list(&reopened).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn assignment_list_binary_id_order_is_independent_of_insertion_order() {
+        let ids = ["a_z", "a_2", "a_a", "a_10", "a_A", "a_é"];
+        let mut first = SqliteStore::open_in_memory().unwrap();
+        let mut second = SqliteStore::open_in_memory().unwrap();
+        for (index, store) in [&mut first, &mut second].into_iter().enumerate() {
+            let first_course = course("c_1", vec![]);
+            let second_course = course("c_2", vec![]);
+            if index == 0 {
+                // Course insertion order is irrelevant to assignment ordering.
+                store.insert_course(&second_course).unwrap();
+                store.insert_course(&first_course).unwrap();
+            } else {
+                store.insert_course(&first_course).unwrap();
+                store.insert_course(&second_course).unwrap();
+            }
+        }
+        for (store, insert_ids) in [
+            (&first, ids.to_vec()),
+            (&second, ids.into_iter().rev().collect()),
+        ] {
+            for id in insert_ids {
+                let mut value = assignment(id);
+                value.course_id = match id {
+                    "a_A" | "a_a" => Some(CourseId::new("c_1")),
+                    "a_z" => Some(CourseId::new("c_2")),
+                    _ => None,
+                };
+                store.insert_assignment(&value).unwrap();
+            }
+            store
+                .conn
+                .pragma_update(None, "reverse_unordered_selects", "ON")
+                .unwrap();
+        }
+        let items = crate::query::load_assignment_list(&first).unwrap();
+        assert_eq!(items, crate::query::load_assignment_list(&second).unwrap());
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a_10", "a_2", "a_A", "a_a", "a_z", "a_é"]
+        );
+    }
+
+    #[test]
+    fn assignment_list_rejects_missing_course_instead_of_hiding_the_relation() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.insert_assignment(&assignment("a_valid")).unwrap();
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        let mut orphan = assignment("z_orphan");
+        orphan.course_id = Some(CourseId::new(PRIVATE));
+        store.insert_assignment(&orphan).unwrap();
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        let error = crate::query::load_assignment_list(&store).unwrap_err();
+        assert_eq!(error, PersistenceError::InvalidStoredData);
+        assert_safe(error);
+    }
+
+    #[test]
+    fn assignment_list_validates_displayed_values_and_course_source_metadata() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_course_with_source(PRIVATE, vec![], OriginKind::Moodle, "feed", PRIVATE)
+            .unwrap();
+        let course_id = store
+            .find_moodle_course_id("feed", PRIVATE)
+            .unwrap()
+            .unwrap();
+        let mut input = manual_input();
+        input.title = PRIVATE.into();
+        input.course_id = Some(course_id);
+        input.submission_url = Some(format!("https://submit.example.invalid/{PRIVATE}"));
+        store.create_manual_assignment(input).unwrap();
+        store
+            .conn
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        for (table, column) in [
+            ("assignments", "deadline_kind"),
+            ("assignments", "deadline_value"),
+            ("assignments", "completion"),
+            ("assignments", "submission"),
+            ("assignments", "created_at"),
+            ("assignments", "updated_at"),
+            ("courses", "created_at"),
+            ("courses", "updated_at"),
+            ("course_sources", "origin"),
+            ("course_sources", "scope"),
+            ("course_sources", "external_id"),
+        ] {
+            // SQL identifiers here are exclusively the fixed test-owned values above.
+            let original: String = store
+                .conn
+                .query_row(&format!("SELECT {column} FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let invalid = match column {
+                "scope" | "external_id" => " \t\n",
+                _ => PRIVATE,
+            };
+            store
+                .conn
+                .execute(&format!("UPDATE {table} SET {column} = ?1"), [invalid])
+                .unwrap();
+            let error = crate::query::load_assignment_list(&store).unwrap_err();
+            assert_eq!(error, PersistenceError::InvalidStoredData);
+            assert_safe(error);
+            store
+                .conn
+                .execute(&format!("UPDATE {table} SET {column} = ?1"), [original])
+                .unwrap();
+        }
+        assert_eq!(crate::query::load_assignment_list(&store).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn assignment_list_rejects_duplicate_and_null_course_source_rows() {
+        for origin in [Some("moodle"), None] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let course = course("c_list", vec![]);
+            store.insert_course(&course).unwrap();
+            let mut value = assignment("a_list");
+            value.course_id = Some(course.id.clone());
+            store.insert_assignment(&value).unwrap();
+            // Emulate external schema corruption; production retains strict constraints.
+            store.conn.execute_batch("DROP TABLE course_sources; CREATE TABLE course_sources (course_id TEXT, origin TEXT, scope TEXT, external_id TEXT)").unwrap();
+            for _ in 0..2 {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO course_sources VALUES (?1, ?2, 'feed', ?3)",
+                        params![course.id.as_str(), origin, PRIVATE],
+                    )
+                    .unwrap();
+            }
+            let error = crate::query::load_assignment_list(&store).unwrap_err();
+            assert_eq!(error, PersistenceError::InvalidStoredData);
+            assert_safe(error);
+        }
+    }
+
+    #[test]
+    fn assignment_list_database_failures_discard_sql_and_driver_causes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE course_sources")
+            .unwrap();
+        let error = crate::query::load_assignment_list(&store).unwrap_err();
+        assert_eq!(error, PersistenceError::Database);
+        assert_eq!(error.to_string(), "SQLite operation failed");
+        assert_eq!(format!("{error:?}"), "Database");
+        assert_safe(error);
     }
 
     #[test]
