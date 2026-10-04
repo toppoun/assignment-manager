@@ -458,6 +458,7 @@ mod tests {
             Assignment, AssignmentId, CompletionState, Deadline, SubmissionTarget,
         };
         use crate::import::ExternalRecordKey;
+        use crate::observation::SyncScope;
         use crate::persistence::{AssignmentImportSummary, SqliteStore};
         use crate::sync::{MoodleSyncError, sync_moodle_once};
 
@@ -556,7 +557,7 @@ mod tests {
                 .unwrap()
         }
 
-        // Compare all persisted rows, including timestamps, bindings and courses.
+        // Include observation metadata when checking failure/rollback invariants.
         fn snapshot(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
             [
                 "assignments",
@@ -564,6 +565,7 @@ mod tests {
                 "courses",
                 "course_sources",
                 "course_schedule",
+                "sync_scopes",
             ]
             .into_iter()
             .map(|table| {
@@ -578,6 +580,17 @@ mod tests {
                     .unwrap()
             })
             .collect()
+        }
+
+        // Successful resync changes positive metadata while preserving the Phase 6
+        // domain/binding contract. Failure tests keep using the complete snapshot.
+        fn domain_snapshot(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
+            let mut rows = snapshot(conn);
+            rows.truncate(5);
+            for binding in &mut rows[1] {
+                binding.pop();
+            }
+            rows
         }
 
         fn metadata(conn: &Connection, id: &AssignmentId) -> (String, String) {
@@ -628,6 +641,140 @@ mod tests {
         }
 
         #[test]
+        fn sync_observes_filtered_events_and_empty_responses_without_domain_updates() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            let scope = SyncScope::MoodleFeed(SCOPE.into());
+            let before = Utc::now();
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", BASIC)
+                    .unwrap()
+                    .created,
+                1
+            );
+            let seen = store
+                .get_assignment_last_seen_at(&key("1001@cms.example.edu"))
+                .unwrap()
+                .unwrap();
+            assert!(before <= seen && seen <= Utc::now());
+            assert_eq!(store.get_last_synced_at(&scope).unwrap(), Some(seen));
+            let original = stored(&store, "1001@cms.example.edu");
+            store
+                .set_completion(&original.id, CompletionState::Completed)
+                .unwrap();
+            let domain = domain_snapshot(&observer);
+            for suffix in [" テスト予定", " の受験可能期間の開始"] {
+                // Force an old observation rather than relying on timer resolution.
+                observer.execute_batch("UPDATE assignment_sources SET last_seen_at = '2000-01-01T00:00:00.000000001Z'; UPDATE sync_scopes SET last_synced_at = '2000-01-01T00:00:00.000000001Z'").unwrap();
+                let body = BASIC.replace("の提出期限", suffix);
+                let before = Utc::now();
+                assert_eq!(
+                    mock.sync(&client, &mut store, "200 OK", &body).unwrap(),
+                    AssignmentImportSummary::default()
+                );
+                let seen = store
+                    .get_assignment_last_seen_at(&key("1001@cms.example.edu"))
+                    .unwrap()
+                    .unwrap();
+                assert!(before <= seen && seen <= Utc::now());
+                assert_eq!(store.get_last_synced_at(&scope).unwrap(), Some(seen));
+                assert_eq!(domain_snapshot(&observer), domain);
+            }
+            let unbound = BASIC
+                .replace("1001@cms.example.edu", "never-imported")
+                .replace("の提出期限", " テスト予定");
+            mock.sync(&client, &mut store, "200 OK", &unbound).unwrap();
+            assert_eq!(
+                store
+                    .find_assignment_by_external_key(&key("never-imported"))
+                    .unwrap(),
+                None
+            );
+            let last_seen = store
+                .get_assignment_last_seen_at(&key("1001@cms.example.edu"))
+                .unwrap();
+            let before = Utc::now();
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", EMPTY).unwrap(),
+                AssignmentImportSummary::default()
+            );
+            assert_eq!(
+                store
+                    .get_assignment_last_seen_at(&key("1001@cms.example.edu"))
+                    .unwrap(),
+                last_seen
+            );
+            assert!(store.get_last_synced_at(&scope).unwrap().unwrap() >= before);
+            assert_eq!(domain_snapshot(&observer), domain);
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", BASIC)
+                    .unwrap()
+                    .unchanged,
+                1
+            );
+            let reappeared = stored(&store, "1001@cms.example.edu");
+            assert_eq!(reappeared.id, original.id);
+            assert_eq!(reappeared.completion, CompletionState::Completed);
+            assert_eq!(domain_snapshot(&observer), domain);
+        }
+
+        #[test]
+        fn sync_rejects_invalid_or_duplicate_filtered_uids_without_changing_metadata() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            mock.sync(&client, &mut store, "200 OK", BASIC).unwrap();
+            let before = snapshot(&observer);
+            let unknown = BASIC.replace("の提出期限", " テスト予定");
+            let event = unknown
+                .split_once("BEGIN:VEVENT")
+                .unwrap()
+                .1
+                .split_once("END:VEVENT")
+                .unwrap()
+                .0;
+            let duplicate = format!(
+                "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT{event}END:VEVENT\nBEGIN:VEVENT{event}END:VEVENT\nEND:VCALENDAR\n"
+            );
+            let whitespace = unknown.replace("UID:1001@cms.example.edu", "UID:   ");
+            let missing = unknown.replace("UID:1001@cms.example.edu", "UID:");
+            for (body, category) in [
+                (duplicate, MoodleSyncError::Validation),
+                // ICS parsing removes trailing whitespace, so both blank forms
+                // already fail the unchanged parser. Parsed blank identities are
+                // separately rejected by the checked observation constructor.
+                (whitespace, MoodleSyncError::Parse),
+                (missing, MoodleSyncError::Parse),
+            ] {
+                let error = mock.sync(&client, &mut store, "200 OK", &body).unwrap_err();
+                assert_eq!(error, category);
+                assert_safe(error, &db);
+                assert_eq!(snapshot(&observer), before);
+            }
+        }
+
+        #[test]
+        fn sync_scope_metadata_failure_rolls_back_assignment_and_seen_updates() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            mock.sync(&client, &mut store, "200 OK", BASIC).unwrap();
+            observer.execute_batch("CREATE TRIGGER reject_moodle_scope BEFORE UPDATE ON sync_scopes BEGIN SELECT RAISE(ABORT, NEW.scope); END").unwrap();
+            let before = snapshot(&observer);
+            let changed = BASIC.replace("演習課題01", PRIVATE);
+            let error = mock
+                .sync(&client, &mut store, "200 OK", &changed)
+                .unwrap_err();
+            assert_eq!(error, MoodleSyncError::Persistence);
+            assert_safe(error, &db);
+            assert_eq!(snapshot(&observer), before);
+        }
+
+        #[test]
         fn sync_imports_then_resyncs_same_feed_and_preserves_local_completion() {
             let db = TestDatabase::new();
             let (mut store, observer) = db.open();
@@ -667,7 +814,7 @@ mod tests {
                     .unwrap(),
                 None
             );
-            let initial = snapshot(&observer);
+            let initial = domain_snapshot(&observer);
             assert!(initial[2].is_empty());
             assert_eq!(
                 mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap(),
@@ -676,12 +823,12 @@ mod tests {
                     ..Default::default()
                 }
             );
-            assert_eq!(snapshot(&observer), initial);
+            assert_eq!(domain_snapshot(&observer), initial);
 
             store
                 .set_completion(&deadline.id, CompletionState::Completed)
                 .unwrap();
-            let completed = snapshot(&observer);
+            let completed = domain_snapshot(&observer);
             assert_eq!(
                 mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap(),
                 AssignmentImportSummary {
@@ -689,7 +836,7 @@ mod tests {
                     ..Default::default()
                 }
             );
-            assert_eq!(snapshot(&observer), completed);
+            assert_eq!(domain_snapshot(&observer), completed);
             let resynced = stored(&store, "2003@cms.example.edu");
             assert_eq!(resynced.id, deadline.id);
             assert_eq!(resynced.completion, CompletionState::Completed);
@@ -746,7 +893,7 @@ mod tests {
             store
                 .set_completion(&absent.id, CompletionState::Completed)
                 .unwrap();
-            let before = snapshot(&observer);
+            let before = domain_snapshot(&observer);
             let (prefix, _) = MULTIPLE.rsplit_once("BEGIN:VEVENT").unwrap();
             let reduced = format!("{prefix}END:VCALENDAR\n");
             assert_eq!(
@@ -756,7 +903,7 @@ mod tests {
                     ..Default::default()
                 }
             );
-            assert_eq!(snapshot(&observer), before);
+            assert_eq!(domain_snapshot(&observer), before);
             assert_eq!(stored(&store, "2003@cms.example.edu").id, absent.id);
         }
 
@@ -767,14 +914,14 @@ mod tests {
             let mock = SyncMock::new();
             let client = MoodleClient::new().unwrap();
             mock.sync(&client, &mut store, "200 OK", BASIC).unwrap();
-            let before = snapshot(&observer);
+            let before = domain_snapshot(&observer);
             let filtered = BASIC.replace("の提出期限", " の受験可能期間の開始");
             for body in [EMPTY, filtered.as_str()] {
                 assert_eq!(
                     mock.sync(&client, &mut store, "200 OK", body).unwrap(),
                     AssignmentImportSummary::default()
                 );
-                assert_eq!(snapshot(&observer), before);
+                assert_eq!(domain_snapshot(&observer), before);
             }
         }
 

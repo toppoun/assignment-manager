@@ -601,6 +601,7 @@ mod tests {
             Assignment, AssignmentId, CompletionState, Deadline, SubmissionTarget,
         };
         use crate::import::{ExternalRecordKey, OriginKind};
+        use crate::observation::SyncScope;
         use crate::persistence::{AssignmentImportSummary, SqliteStore};
         use crate::sync::{WebClassSyncError, sync_webclass_group_once};
 
@@ -736,7 +737,7 @@ mod tests {
                 .unwrap()
         }
 
-        // Includes all rows, bindings, metadata and courses, not just domain fields.
+        // Includes observation metadata for failure/rollback comparisons.
         fn snapshot(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
             [
                 "assignments",
@@ -744,6 +745,7 @@ mod tests {
                 "courses",
                 "course_sources",
                 "course_schedule",
+                "sync_scopes",
             ]
             .into_iter()
             .map(|table| {
@@ -758,6 +760,17 @@ mod tests {
                     .unwrap()
             })
             .collect()
+        }
+
+        // Successful observations change source metadata, independently of the
+        // domain invariants verified by the pre-observation integration tests.
+        fn domain_snapshot(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
+            let mut rows = snapshot(conn);
+            rows.truncate(5);
+            for binding in &mut rows[1] {
+                binding.pop();
+            }
+            rows
         }
 
         fn metadata(conn: &Connection, id: &AssignmentId) -> (String, String) {
@@ -812,6 +825,157 @@ mod tests {
         }
 
         #[test]
+        fn sync_observes_hidden_unsupported_and_empty_contents_without_domain_updates() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let scope = SyncScope::WebClassContents(GROUP.into());
+            let before = Utc::now();
+            assert_eq!(
+                mock.sync_json(&mut store, GROUP, CONTENTS).unwrap().created,
+                3
+            );
+            let synced = store.get_last_synced_at(&scope).unwrap().unwrap();
+            assert!(before <= synced && synced <= Utc::now());
+            let original = stored(&store, GROUP, "fixture-content-001");
+            store
+                .set_completion(&original.id, CompletionState::Completed)
+                .unwrap();
+            let domain = domain_snapshot(&observer);
+            for hidden in [true, false] {
+                observer.execute_batch("UPDATE assignment_sources SET last_seen_at = '2000-01-01T00:00:00.000000001Z'; UPDATE sync_scopes SET last_synced_at = '2000-01-01T00:00:00.000000001Z'").unwrap();
+                let mut contents = records();
+                for content in &mut contents {
+                    if hidden {
+                        content["hidden_content"] = json!(true);
+                    } else {
+                        content["contents_kind"] = json!("Unsupported");
+                    }
+                }
+                let mut unbound = contents[0].clone();
+                unbound["contents_id"] = json!("never-imported");
+                contents.push(unbound);
+                let before = Utc::now();
+                assert_eq!(
+                    mock.sync_json(
+                        &mut store,
+                        GROUP,
+                        &serde_json::to_string(&contents).unwrap()
+                    )
+                    .unwrap(),
+                    AssignmentImportSummary::default()
+                );
+                let synced = store.get_last_synced_at(&scope).unwrap().unwrap();
+                assert!(before <= synced && synced <= Utc::now());
+                for content in records() {
+                    let id = content["contents_id"].as_str().unwrap();
+                    assert_eq!(
+                        store.get_assignment_last_seen_at(&key(GROUP, id)).unwrap(),
+                        Some(synced)
+                    );
+                }
+                assert_eq!(
+                    store
+                        .get_assignment_last_seen_at(&key(GROUP, "never-imported"))
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    store
+                        .find_assignment_by_external_key(&key(GROUP, "never-imported"))
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(domain_snapshot(&observer), domain);
+            }
+            let seen = store
+                .get_assignment_last_seen_at(&key(GROUP, "fixture-content-001"))
+                .unwrap();
+            let before = Utc::now();
+            assert_eq!(
+                mock.sync_json(&mut store, GROUP, "[]").unwrap(),
+                AssignmentImportSummary::default()
+            );
+            assert!(store.get_last_synced_at(&scope).unwrap().unwrap() >= before);
+            assert_eq!(
+                store
+                    .get_assignment_last_seen_at(&key(GROUP, "fixture-content-001"))
+                    .unwrap(),
+                seen
+            );
+            assert_eq!(
+                store
+                    .get_last_synced_at(&SyncScope::WebClassCourses)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(domain_snapshot(&observer), domain);
+            assert_eq!(
+                mock.sync_json(&mut store, GROUP, CONTENTS)
+                    .unwrap()
+                    .unchanged,
+                3
+            );
+            assert_eq!(stored(&store, GROUP, "fixture-content-001").id, original.id);
+            assert_eq!(
+                stored(&store, GROUP, "fixture-content-001").completion,
+                CompletionState::Completed
+            );
+            assert_eq!(domain_snapshot(&observer), domain);
+        }
+
+        #[test]
+        fn sync_rejects_invalid_filtered_identities_and_map_failures_without_metadata_changes() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+            let before = snapshot(&observer);
+            for hidden in [true, false] {
+                for invalid in ["empty", "whitespace", "duplicate", "group", "date"] {
+                    let mut contents = records();
+                    if hidden {
+                        contents[1]["hidden_content"] = json!(true);
+                    } else {
+                        contents[1]["contents_kind"] = json!("Unsupported");
+                    }
+                    match invalid {
+                        "empty" => contents[1]["contents_id"] = json!(""),
+                        "whitespace" => contents[1]["contents_id"] = json!(" \t"),
+                        "duplicate" => {
+                            contents[1]["contents_id"] = contents[0]["contents_id"].clone()
+                        }
+                        "group" => contents[1]["group_id"] = json!(PRIVATE),
+                        "date" => contents[1]["end_date"] = json!(PRIVATE),
+                        _ => unreachable!(),
+                    }
+                    let error = mock
+                        .sync_json(
+                            &mut store,
+                            GROUP,
+                            &serde_json::to_string(&contents).unwrap(),
+                        )
+                        .unwrap_err();
+                    assert_eq!(
+                        error,
+                        if invalid == "date" {
+                            WebClassSyncError::Map
+                        } else {
+                            WebClassSyncError::Validation
+                        }
+                    );
+                    assert_safe(error, &db);
+                    assert_eq!(snapshot(&observer), before);
+                }
+            }
+            assert_eq!(
+                mock.sync_json(&mut store, " \t", "[]").unwrap_err(),
+                WebClassSyncError::Validation
+            );
+            assert_eq!(snapshot(&observer), before);
+        }
+
+        #[test]
         fn sync_imports_and_resyncs_with_and_without_course_binding() {
             for bound in [false, true] {
                 let db = TestDatabase::new();
@@ -859,7 +1023,7 @@ mod tests {
                     let (created, updated) = metadata(&observer, &assignment.id);
                     assert_eq!(created, updated);
                 }
-                let initial = snapshot(&observer);
+                let initial = domain_snapshot(&observer);
                 assert_eq!(initial[0].len(), 3);
                 assert_eq!(initial[1].len(), 3);
                 assert_eq!(initial[2].len(), usize::from(bound));
@@ -871,12 +1035,12 @@ mod tests {
                         ..Default::default()
                     }
                 );
-                assert_eq!(snapshot(&observer), initial);
+                assert_eq!(domain_snapshot(&observer), initial);
 
                 store
                     .set_completion(&first.id, CompletionState::Completed)
                     .unwrap();
-                let completed = snapshot(&observer);
+                let completed = domain_snapshot(&observer);
                 assert_eq!(
                     mock.sync_json(&mut store, GROUP, CONTENTS).unwrap(),
                     AssignmentImportSummary {
@@ -884,7 +1048,7 @@ mod tests {
                         ..Default::default()
                     }
                 );
-                assert_eq!(snapshot(&observer), completed);
+                assert_eq!(domain_snapshot(&observer), completed);
                 let mut answered = records();
                 for record in &mut answered {
                     record["scores"] =
@@ -902,7 +1066,7 @@ mod tests {
                         ..Default::default()
                     }
                 );
-                assert_eq!(snapshot(&observer), completed);
+                assert_eq!(domain_snapshot(&observer), completed);
                 let resynced = stored(&store, GROUP, "fixture-content-001");
                 assert_eq!(resynced.id, first.id);
                 assert_eq!(resynced.completion, CompletionState::Completed);
@@ -977,7 +1141,7 @@ mod tests {
                 stored(&store, GROUP, "fixture-content-001").id,
                 stored(&store, other_group, "fixture-content-001").id
             );
-            let before = snapshot(&observer);
+            let before = domain_snapshot(&observer);
             assert_eq!(
                 mock.sync_json(&mut store, other_group, &body).unwrap(),
                 AssignmentImportSummary {
@@ -985,7 +1149,7 @@ mod tests {
                     ..Default::default()
                 }
             );
-            assert_eq!(snapshot(&observer), before);
+            assert_eq!(domain_snapshot(&observer), before);
             assert!(before[2].is_empty());
         }
 
@@ -999,7 +1163,7 @@ mod tests {
             store
                 .set_completion(&first.id, CompletionState::Completed)
                 .unwrap();
-            let before = snapshot(&observer);
+            let before = domain_snapshot(&observer);
             let mut filtered = records();
             filtered[0]["hidden_content"] = json!(true);
             filtered[1]["contents_kind"] = json!("Other");
@@ -1009,7 +1173,7 @@ mod tests {
                     mock.sync_json(&mut store, GROUP, &body).unwrap(),
                     AssignmentImportSummary::default()
                 );
-                assert_eq!(snapshot(&observer), before);
+                assert_eq!(domain_snapshot(&observer), before);
             }
             filtered[0]["hidden_content"] = json!(false);
             assert_eq!(
@@ -1024,7 +1188,7 @@ mod tests {
                     ..Default::default()
                 }
             );
-            assert_eq!(snapshot(&observer), before);
+            assert_eq!(domain_snapshot(&observer), before);
         }
 
         #[test]
@@ -1421,7 +1585,7 @@ mod tests {
                         assert_eq!(stored(&store, group, id).course_id, Some(course.id.clone()));
                     }
                 }
-                let rows = snapshot(&observer);
+                let rows = domain_snapshot(&observer);
                 assert_eq!(rows[0].len(), 9);
                 assert_eq!(rows[1].len(), 9);
                 assert_eq!(rows[2].len(), 3);
@@ -1431,7 +1595,7 @@ mod tests {
                 store
                     .set_completion(&first.id, CompletionState::Completed)
                     .unwrap();
-                let before = snapshot(&observer);
+                let before = domain_snapshot(&observer);
                 assert_eq!(
                     mock.sync_all(&mut store, &db, success_responses(&courses))
                         .unwrap(),
@@ -1442,7 +1606,7 @@ mod tests {
                         ..Default::default()
                     }
                 );
-                assert_eq!(snapshot(&observer), before);
+                assert_eq!(domain_snapshot(&observer), before);
 
                 // Aggregate both updates and unchanged outcomes across groups.
                 let mut responses = success_responses(&courses);
@@ -1468,7 +1632,7 @@ mod tests {
                     stored(&store, " fixture-course-001 ", "fixture-content-001").deadline,
                     Some(Deadline::DateTime(utc("2026-11-10T00:00:00Z")))
                 );
-                assert_eq!(snapshot(&observer)[2..], before[2..]);
+                assert_eq!(domain_snapshot(&observer)[2..], before[2..]);
             }
 
             #[test]
@@ -1536,13 +1700,13 @@ mod tests {
                 store
                     .set_completion(&first.id, CompletionState::Completed)
                     .unwrap();
-                let before = snapshot(&observer);
+                let before = domain_snapshot(&observer);
                 assert_eq!(
                     mock.sync_all(&mut store, &db, vec![Response::courses("[]")])
                         .unwrap(),
                     WebClassSyncSummary::default()
                 );
-                assert_eq!(snapshot(&observer), before);
+                assert_eq!(domain_snapshot(&observer), before);
                 assert_eq!(
                     mock.sync_all(
                         &mut store,
@@ -1559,7 +1723,7 @@ mod tests {
                         ..Default::default()
                     }
                 );
-                assert_eq!(snapshot(&observer), before);
+                assert_eq!(domain_snapshot(&observer), before);
             }
 
             #[test]
@@ -1715,7 +1879,21 @@ mod tests {
                         .set_completion(&completed.id, CompletionState::Completed)
                         .unwrap();
                     completed.completion = CompletionState::Completed;
-                    let before = snapshot(&observer);
+                    let before = domain_snapshot(&observer);
+                    let b_scope = SyncScope::WebClassContents(GROUP.into());
+                    let b_synced = store.get_last_synced_at(&b_scope).unwrap();
+                    let b_seen: Vec<_> = records()
+                        .iter()
+                        .map(|record| {
+                            store
+                                .get_assignment_last_seen_at(&key(
+                                    GROUP,
+                                    record["contents_id"].as_str().unwrap(),
+                                ))
+                                .unwrap()
+                        })
+                        .collect();
+                    let started_at = Utc::now();
                     if expected == WebClassSyncError::Persistence {
                         observer
                             .execute_batch(&format!(
@@ -1741,6 +1919,50 @@ mod tests {
                         .unwrap_err();
                     assert_eq!(error, expected);
                     assert_full_safe(error, &db);
+                    assert!(
+                        store
+                            .get_last_synced_at(&SyncScope::WebClassCourses)
+                            .unwrap()
+                            .unwrap()
+                            >= started_at
+                    );
+                    let a_synced = store
+                        .get_last_synced_at(&SyncScope::WebClassContents(
+                            "fixture-course-001".into(),
+                        ))
+                        .unwrap()
+                        .unwrap();
+                    assert!(a_synced >= started_at);
+                    assert_eq!(
+                        store
+                            .get_assignment_last_seen_at(&key(
+                                "fixture-course-001",
+                                "fixture-content-001"
+                            ))
+                            .unwrap(),
+                        Some(a_synced)
+                    );
+                    assert_eq!(store.get_last_synced_at(&b_scope).unwrap(), b_synced);
+                    let b_seen_after: Vec<_> = records()
+                        .iter()
+                        .map(|record| {
+                            store
+                                .get_assignment_last_seen_at(&key(
+                                    GROUP,
+                                    record["contents_id"].as_str().unwrap(),
+                                ))
+                                .unwrap()
+                        })
+                        .collect();
+                    assert_eq!(b_seen_after, b_seen);
+                    assert_eq!(
+                        store
+                            .get_last_synced_at(&SyncScope::WebClassContents(
+                                "fixture-course-003".into()
+                            ))
+                            .unwrap(),
+                        None
+                    );
                     let a = discovered(&store, "fixture-course-001");
                     let b = discovered(&store, GROUP);
                     assert_eq!(
@@ -1754,7 +1976,7 @@ mod tests {
                             .unwrap(),
                         None
                     );
-                    let partial = snapshot(&observer);
+                    let partial = domain_snapshot(&observer);
                     assert_eq!(partial[0].len(), 6);
                     assert_eq!(partial[1].len(), 6);
                     assert_eq!(partial[2].len(), 2);
@@ -1791,7 +2013,7 @@ mod tests {
                     assert_eq!(recovered.id, completed.id);
                     assert_eq!(recovered.course_id, Some(b.id));
                     assert_eq!(recovered.completion, CompletionState::Completed);
-                    let recovered_rows = snapshot(&observer);
+                    let recovered_rows = domain_snapshot(&observer);
                     assert_eq!(
                         mock.sync_all(&mut store, &db, success_responses(&courses))
                             .unwrap(),
@@ -1802,8 +2024,39 @@ mod tests {
                             ..Default::default()
                         }
                     );
-                    assert_eq!(snapshot(&observer), recovered_rows);
+                    assert_eq!(domain_snapshot(&observer), recovered_rows);
                 }
+            }
+
+            #[test]
+            fn full_sync_course_list_metadata_commits_before_discovery_and_empty_list_is_success() {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::new();
+                observer.execute_batch("CREATE TRIGGER reject_course_observation BEFORE INSERT ON sync_scopes WHEN NEW.kind = 'webclass_courses' BEGIN SELECT RAISE(ABORT, NEW.scope); END").unwrap();
+                let before = snapshot(&observer);
+                let error = mock
+                    .sync_all(&mut store, &db, vec![Response::courses(COURSES)])
+                    .unwrap_err();
+                assert_eq!(error, WebClassSyncError::CoursePersistence);
+                assert_full_safe(error, &db);
+                assert_eq!(snapshot(&observer), before);
+                observer
+                    .execute_batch("DROP TRIGGER reject_course_observation")
+                    .unwrap();
+                let before = Utc::now();
+                assert_eq!(
+                    mock.sync_all(&mut store, &db, vec![Response::courses("[]")])
+                        .unwrap(),
+                    WebClassSyncSummary::default()
+                );
+                let synced = store
+                    .get_last_synced_at(&SyncScope::WebClassCourses)
+                    .unwrap()
+                    .unwrap();
+                assert!(before <= synced && synced <= Utc::now());
+                assert!(domain_snapshot(&observer).iter().all(Vec::is_empty));
+                assert_eq!(snapshot(&observer)[5].len(), 1);
             }
 
             #[test]
@@ -1833,6 +2086,29 @@ mod tests {
                     .unwrap_err();
                 assert_eq!(error, WebClassSyncError::CoursePersistence);
                 assert_full_safe(error, &db);
+                assert!(
+                    store
+                        .get_last_synced_at(&SyncScope::WebClassCourses)
+                        .unwrap()
+                        .is_some()
+                );
+                let a_scope = SyncScope::WebClassContents("fixture-course-001".into());
+                let a_synced = store.get_last_synced_at(&a_scope).unwrap().unwrap();
+                assert_eq!(
+                    store
+                        .get_assignment_last_seen_at(&key(
+                            "fixture-course-001",
+                            "fixture-content-001"
+                        ))
+                        .unwrap(),
+                    Some(a_synced)
+                );
+                assert_eq!(
+                    store
+                        .get_last_synced_at(&SyncScope::WebClassContents(GROUP.into()))
+                        .unwrap(),
+                    None
+                );
                 let a = discovered(&store, "fixture-course-001");
                 for group in [GROUP, "fixture-course-003"] {
                     assert_eq!(

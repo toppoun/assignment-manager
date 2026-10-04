@@ -3,17 +3,17 @@
 //! Fetching, parsing, mapping and validation finish before the store starts its
 //! import transaction. Candidate absence has no deletion or presence semantics.
 
-use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
-use crate::import::{AssignmentCandidateBatch, OriginKind};
+use chrono::Utc;
+
+use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
 use crate::moodle::{map_events, parse_calendar};
 use crate::moodle_http::{MoodleClient, MoodleFeed};
+use crate::observation::{AssignmentObservation, SyncScope, WebClassCourseListObservation};
 use crate::persistence::{AssignmentImportSummary, SqliteStore};
-use crate::webclass::{
-    WebClassCourse, WebClassMapError, map_contents_for_group, parse_contents, parse_courses,
-};
+use crate::webclass::{WebClassMapError, map_contents_for_group, parse_contents, parse_courses};
 use crate::webclass_auth::{HoseiAuthenticator, HoseiCredentials};
 use crate::webclass_http::{WebClassClient, WebClassHttpError};
 
@@ -46,7 +46,9 @@ impl Error for MoodleSyncError {}
 /// scope reaches the mapper; feed labels do not resolve courses. Pre-import
 /// failures leave the database untouched. Import failures roll back the store's
 /// batch transaction and never return a partial summary. An empty validated batch
-/// returns zero counts without changing existing assignments.
+/// returns zero counts without changing existing assignments. All parsed events,
+/// including unclassified/start events, supply identities before mapping. Positive
+/// observations and scope freshness commit with import; absence never means missing.
 pub fn sync_moodle_once(
     client: &MoodleClient,
     feed: &MoodleFeed,
@@ -56,11 +58,27 @@ pub fn sync_moodle_once(
         .fetch_calendar(feed)
         .map_err(|_| MoodleSyncError::Fetch)?;
     let events = parse_calendar(&raw).map_err(|_| MoodleSyncError::Parse)?;
+    let observation = AssignmentObservation::try_new(
+        SyncScope::MoodleFeed(feed.scope().to_owned()),
+        events
+            .iter()
+            .map(|event| ExternalRecordKey {
+                origin: OriginKind::Moodle,
+                scope: feed.scope().to_owned(),
+                id: event.uid.clone(),
+            })
+            .collect(),
+    )
+    .map_err(|_| MoodleSyncError::Validation)?;
     let candidates = map_events(&events, feed.scope());
     let batch =
         AssignmentCandidateBatch::try_new(candidates).map_err(|_| MoodleSyncError::Validation)?;
+    observation
+        .validate_candidates(&batch)
+        .map_err(|_| MoodleSyncError::Validation)?;
+    let observed_at = Utc::now();
     store
-        .import_assignment_batch(&batch)
+        .import_assignment_batch_with_observation(&batch, &observation, observed_at)
         .map_err(|_| MoodleSyncError::Persistence)
 }
 
@@ -105,7 +123,10 @@ impl Error for WebClassSyncError {}
 /// course bindings. Missing courses are not created. Pre-import failures leave
 /// the database untouched; import failures roll back the entire batch. Existing
 /// assignments absent from the batch are preserved, including filtered records.
-/// Empty batches return zero counts.
+/// All parsed records (including hidden/unsupported) are observed before mapping,
+/// with exact requested-group identity validation. Import, positive seen metadata
+/// and this contents scope's freshness commit together. Empty batches return zero
+/// counts while committing freshness; they never imply disappearance.
 pub fn sync_webclass_group_once(
     client: &WebClassClient,
     group_id: &str,
@@ -118,12 +139,30 @@ pub fn sync_webclass_group_once(
             _ => WebClassSyncError::Fetch,
         })?;
     let contents = parse_contents(&raw).map_err(|_| WebClassSyncError::Parse)?;
+    let observation = AssignmentObservation::try_new(
+        SyncScope::WebClassContents(group_id.to_owned()),
+        contents
+            .iter()
+            .map(|content| ExternalRecordKey {
+                origin: OriginKind::WebClass,
+                // Keep the response group so observation validation checks every
+                // record, including those later excluded from assignment mapping.
+                scope: content.group_id.clone(),
+                id: content.contents_id.clone(),
+            })
+            .collect(),
+    )
+    .map_err(|_| WebClassSyncError::Validation)?;
     let batch = map_contents_for_group(&contents, group_id).map_err(|error| match error {
         WebClassMapError::InvalidEndDate => WebClassSyncError::Map,
         WebClassMapError::Validation(_) => WebClassSyncError::Validation,
     })?;
+    observation
+        .validate_candidates(&batch)
+        .map_err(|_| WebClassSyncError::Validation)?;
+    let observed_at = Utc::now();
     store
-        .import_assignment_batch(&batch)
+        .import_assignment_batch_with_observation(&batch, &observation, observed_at)
         .map_err(|_| WebClassSyncError::Persistence)
 }
 
@@ -150,6 +189,11 @@ pub struct WebClassSyncSummary {
 /// schedules are preserved; source metadata and children are not interpreted.
 /// Each group uses [`sync_webclass_group_once`] and its existing batch transaction.
 /// No SQLite transaction spans an HTTP request or the entire operation.
+/// Before discovery, a short transaction records validated course-list freshness.
+/// This timestamp means only successful list fetch/parse/identity validation and
+/// metadata commit, not completion of course binding creation or all contents.
+/// Later discovery/group failures preserve it. Each contents scope commits only
+/// on its own successful import/observation; no global WebClass timestamp exists.
 ///
 /// Stops at the first failure. Previously committed courses and group imports
 /// remain; a course discovered for the failing contents request also remains.
@@ -167,7 +211,17 @@ pub fn sync_webclass_all_once(
         _ => WebClassSyncError::Fetch,
     })?;
     let courses = parse_courses(&raw).map_err(|_| WebClassSyncError::Parse)?;
-    validate_webclass_courses(&courses)?;
+    let observation = WebClassCourseListObservation::try_new(
+        courses
+            .iter()
+            .map(|course| course.group_id.clone())
+            .collect(),
+    )
+    .map_err(|_| WebClassSyncError::CourseValidation)?;
+    let observed_at = Utc::now();
+    store
+        .record_webclass_course_list_observation(&observation, observed_at)
+        .map_err(|_| WebClassSyncError::CoursePersistence)?;
     let mut summary = WebClassSyncSummary {
         courses_discovered: courses.len(),
         ..Default::default()
@@ -195,16 +249,6 @@ pub fn sync_webclass_all_once(
         summary.assignments_unchanged += imported.unchanged;
     }
     Ok(summary)
-}
-
-fn validate_webclass_courses(courses: &[WebClassCourse]) -> Result<(), WebClassSyncError> {
-    let mut groups = HashSet::with_capacity(courses.len());
-    for course in courses {
-        if course.group_id.trim().is_empty() || !groups.insert(course.group_id.as_str()) {
-            return Err(WebClassSyncError::CourseValidation);
-        }
-    }
-    Ok(())
 }
 
 /// Obtain credentials only when requested and lend them to one login attempt.

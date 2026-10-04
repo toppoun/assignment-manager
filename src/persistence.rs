@@ -1,4 +1,4 @@
-//! SQLite schema v1, entity creation/binding, validated import and local completion.
+//! SQLite schema v2, validated import, positive observation and local completion.
 //!
 //! Bindings accept non-secret logical identifiers only. Authentication values and
 //! feed URLs must never be passed as identities. Import batches are not source
@@ -17,15 +17,17 @@ use crate::domain::{
     ScheduleEntry, SubmissionTarget,
 };
 use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
+use crate::observation::{AssignmentObservation, SyncScope, WebClassCourseListObservation};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const ID_INSERT_ATTEMPTS: usize = 4;
-const TABLES: [&str; 5] = [
+const TABLES: [&str; 6] = [
     "courses",
     "assignments",
     "assignment_sources",
     "course_sources",
     "course_schedule",
+    "sync_scopes",
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -95,6 +97,22 @@ CREATE TABLE course_schedule (
 ) STRICT;
 "#;
 
+// Applied after v1 creation/migration in the same transaction. Existing bindings
+// retain NULL observations; historical entity timestamps never supply them.
+const SCHEMA_V2_UPGRADE: &str = r#"
+ALTER TABLE assignment_sources ADD COLUMN last_seen_at TEXT
+    CHECK (last_seen_at IS NULL OR substr(last_seen_at, -1) = 'Z');
+
+CREATE TABLE sync_scopes (
+    kind TEXT COLLATE BINARY NOT NULL
+        CHECK (kind IN ('moodle_feed', 'webclass_courses', 'webclass_contents')),
+    scope TEXT COLLATE BINARY NOT NULL CHECK (scope <> ''),
+    last_synced_at TEXT NOT NULL CHECK (substr(last_synced_at, -1) = 'Z'),
+    PRIMARY KEY (kind, scope),
+    CHECK (kind <> 'webclass_courses' OR scope = 'default')
+) STRICT;
+"#;
+
 /// Fixed classifications only. Paths, SQL, row values and driver causes are discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceError {
@@ -107,6 +125,7 @@ pub enum PersistenceError {
     Constraint,
     IdGenerationFailed,
     InvalidExternalIdentity,
+    ObservationValidation,
     EntityAlreadyBound,
     ExternalIdentityAlreadyBound,
     NotFound,
@@ -124,6 +143,7 @@ impl fmt::Display for PersistenceError {
             Self::Constraint => "SQLite constraint violation",
             Self::IdGenerationFailed => "could not allocate an internal ID",
             Self::InvalidExternalIdentity => "external identity is empty or whitespace-only",
+            Self::ObservationValidation => "invalid source observation or candidate subset",
             Self::EntityAlreadyBound => "entity already has a source binding",
             Self::ExternalIdentityAlreadyBound => "external identity already has a binding",
             Self::NotFound => "binding target does not exist",
@@ -230,7 +250,7 @@ impl SqliteStore {
             submission_url: input.submission_url,
             completion: CompletionState::Incomplete,
         };
-        insert_new_assignment_tx(&tx, &mut assignment, source, &timestamp)?;
+        insert_new_assignment_tx(&tx, &mut assignment, source, &timestamp, None)?;
         tx.commit().map_err(database_error)?;
         Ok(assignment)
     }
@@ -300,7 +320,7 @@ impl SqliteStore {
     ) -> Result<(), PersistenceError> {
         validate_external_key(key)?;
         let tx = self.conn.transaction().map_err(database_error)?;
-        insert_assignment_binding(&tx, id, key)?;
+        insert_assignment_binding(&tx, id, key, None)?;
         tx.commit().map_err(database_error)
     }
 
@@ -377,40 +397,88 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         let timestamp = encode_timestamp(&Utc::now());
-        let mut summary = AssignmentImportSummary::default();
-        for candidate in batch.as_slice() {
-            let resolved_course_id = match candidate.external_key.origin {
-                OriginKind::WebClass => {
-                    find_webclass_course_id_tx(&tx, &candidate.external_key.scope)?
-                }
-                OriginKind::Moodle | OriginKind::Manual => None,
-            };
-            if let Some(mut assignment) =
-                find_assignment_by_external_key_tx(&tx, &candidate.external_key)?
-            {
-                let before = assignment.clone();
-                candidate.apply_source_update(&mut assignment, resolved_course_id);
-                if assignment == before {
-                    summary.unchanged += 1;
-                } else {
-                    update_assignment_source_fields_tx(&tx, &assignment, &timestamp)?;
-                    summary.updated += 1;
-                }
-            } else {
-                let mut assignment = candidate
-                    .clone()
-                    .into_assignment(AssignmentId::new(""), resolved_course_id);
-                insert_new_assignment_tx(
-                    &tx,
-                    &mut assignment,
-                    Some(&candidate.external_key),
-                    &timestamp,
-                )?;
-                summary.created += 1;
-            }
-        }
+        let summary = import_assignment_batch_tx(&tx, batch, &timestamp, None)?;
         tx.commit().map_err(database_error)?;
         Ok(summary)
+    }
+
+    /// Commit import, positive binding observations and scope freshness atomically.
+    /// The caller builds observations from every parsed source record before
+    /// filtering and completes mapping/validation before calling this method.
+    /// Candidates must be a subset. Unbound observed identities create no rows.
+    /// Empty batches still commit freshness; unobserved bindings are untouched.
+    /// Metadata alone never changes domain timestamps, completion or counts.
+    /// `observed_at` is one local UTC representative time, not a source timestamp
+    /// or a completeness/absence signal. No HTTP operation belongs in this boundary.
+    pub fn import_assignment_batch_with_observation(
+        &mut self,
+        batch: &AssignmentCandidateBatch,
+        observation: &AssignmentObservation,
+        observed_at: DateTime<Utc>,
+    ) -> Result<AssignmentImportSummary, PersistenceError> {
+        observation
+            .validate_candidates(batch)
+            .map_err(|_| PersistenceError::ObservationValidation)?;
+        let timestamp = encode_timestamp(&observed_at);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let summary = import_assignment_batch_tx(&tx, batch, &timestamp, Some(&timestamp))?;
+        for key in observation.keys() {
+            // Validate old metadata before overwriting it; LEFT JOIN also detects
+            // orphan bindings. Zero matches are valid for never-imported records.
+            assignment_last_seen_at_tx(&tx, key)?;
+            let changed = tx
+                .execute(
+                    "UPDATE assignment_sources SET last_seen_at = ?1
+                 WHERE origin = ?2 AND scope = ?3 AND external_id = ?4",
+                    params![timestamp, encode_origin(key.origin), key.scope, key.id],
+                )
+                .map_err(database_error)?;
+            if changed > 1 {
+                return Err(PersistenceError::InvalidStoredData);
+            }
+        }
+        upsert_sync_scope_tx(&tx, observation.scope(), &timestamp)?;
+        tx.commit().map_err(database_error)?;
+        Ok(summary)
+    }
+
+    /// Record only successful course-list observation, before course discovery.
+    /// Does not assert that all bindings or contents imports succeeded. Later
+    /// course/group failures preserve this already committed scope timestamp.
+    pub fn record_webclass_course_list_observation(
+        &mut self,
+        _observation: &WebClassCourseListObservation,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), PersistenceError> {
+        let timestamp = encode_timestamp(&observed_at);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        upsert_sync_scope_tx(&tx, &SyncScope::WebClassCourses, &timestamp)?;
+        tx.commit().map_err(database_error)
+    }
+
+    /// Last positive observation of an existing binding. `None` means untracked
+    /// (including migrated bindings), or no binding; it never means missing.
+    pub fn get_assignment_last_seen_at(
+        &self,
+        key: &ExternalRecordKey,
+    ) -> Result<Option<DateTime<Utc>>, PersistenceError> {
+        validate_external_key(key)?;
+        assignment_last_seen_at_tx(&self.conn, key)
+    }
+
+    /// The last committed success of exactly this scope; no row means no recorded
+    /// success. Course-list freshness does not describe the whole WebClass sync.
+    pub fn get_last_synced_at(
+        &self,
+        scope: &SyncScope,
+    ) -> Result<Option<DateTime<Utc>>, PersistenceError> {
+        sync_scope_timestamp_tx(&self.conn, scope)
     }
 
     /// Change local completion independently of source import. Identical state is
@@ -442,6 +510,111 @@ impl SqliteStore {
 }
 
 // These helpers reuse the caller's connection/transaction without starting one.
+fn import_assignment_batch_tx(
+    conn: &Connection,
+    batch: &AssignmentCandidateBatch,
+    timestamp: &str,
+    last_seen_at: Option<&str>,
+) -> Result<AssignmentImportSummary, PersistenceError> {
+    let mut summary = AssignmentImportSummary::default();
+    for candidate in batch.as_slice() {
+        let resolved_course_id = match candidate.external_key.origin {
+            OriginKind::WebClass => {
+                find_webclass_course_id_tx(conn, &candidate.external_key.scope)?
+            }
+            OriginKind::Moodle | OriginKind::Manual => None,
+        };
+        if let Some(mut assignment) =
+            find_assignment_by_external_key_tx(conn, &candidate.external_key)?
+        {
+            let before = assignment.clone();
+            candidate.apply_source_update(&mut assignment, resolved_course_id);
+            if assignment == before {
+                summary.unchanged += 1;
+            } else {
+                update_assignment_source_fields_tx(conn, &assignment, timestamp)?;
+                summary.updated += 1;
+            }
+        } else {
+            let mut assignment = candidate
+                .clone()
+                .into_assignment(AssignmentId::new(""), resolved_course_id);
+            insert_new_assignment_tx(
+                conn,
+                &mut assignment,
+                Some(&candidate.external_key),
+                timestamp,
+                last_seen_at,
+            )?;
+            summary.created += 1;
+        }
+    }
+    Ok(summary)
+}
+
+fn assignment_last_seen_at_tx(
+    conn: &Connection,
+    key: &ExternalRecordKey,
+) -> Result<Option<DateTime<Utc>>, PersistenceError> {
+    let stored: Option<Option<String>> = conn
+        .query_one(
+            "SELECT s.last_seen_at, a.id FROM assignment_sources s
+         LEFT JOIN assignments a ON a.id = s.assignment_id
+         WHERE s.origin = ?1 AND s.scope = ?2 AND s.external_id = ?3",
+            params![encode_origin(key.origin), key.scope, key.id],
+            |row| {
+                let _: String = row.get(1)?;
+                row.get(0)
+            },
+        )
+        .optional()
+        .map_err(database_error)?;
+    stored
+        .flatten()
+        .map(|value| decode_timestamp(&value))
+        .transpose()
+}
+
+fn sync_scope_timestamp_tx(
+    conn: &Connection,
+    scope: &SyncScope,
+) -> Result<Option<DateTime<Utc>>, PersistenceError> {
+    let (kind, scope) = scope
+        .storage_key()
+        .map_err(|_| PersistenceError::ObservationValidation)?;
+    let stored: Option<String> = conn
+        .query_one(
+            "SELECT last_synced_at FROM sync_scopes WHERE kind = ?1 AND scope = ?2",
+            params![kind, scope],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    stored.map(|value| decode_timestamp(&value)).transpose()
+}
+
+fn upsert_sync_scope_tx(
+    conn: &Connection,
+    scope: &SyncScope,
+    timestamp: &str,
+) -> Result<(), PersistenceError> {
+    sync_scope_timestamp_tx(conn, scope)?;
+    let (kind, scope) = scope
+        .storage_key()
+        .map_err(|_| PersistenceError::ObservationValidation)?;
+    let changed = conn
+        .execute(
+            "INSERT INTO sync_scopes (kind, scope, last_synced_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT (kind, scope) DO UPDATE SET last_synced_at = excluded.last_synced_at",
+            params![kind, scope, timestamp],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(PersistenceError::InvalidStoredData);
+    }
+    Ok(())
+}
+
 fn get_assignment_tx(
     conn: &Connection,
     id: &AssignmentId,
@@ -509,6 +682,7 @@ fn insert_new_assignment_tx(
     assignment: &mut Assignment,
     source: Option<&ExternalRecordKey>,
     timestamp: &str,
+    last_seen_at: Option<&str>,
 ) -> Result<(), PersistenceError> {
     insert_with_generated_id(
         || generate_internal_id(conn, "a_"),
@@ -518,7 +692,7 @@ fn insert_new_assignment_tx(
         },
     )?;
     if let Some(key) = source {
-        insert_assignment_binding(conn, &assignment.id, key)?;
+        insert_assignment_binding(conn, &assignment.id, key, last_seen_at)?;
     }
     Ok(())
 }
@@ -646,11 +820,18 @@ fn insert_assignment_binding(
     conn: &Connection,
     id: &AssignmentId,
     key: &ExternalRecordKey,
+    last_seen_at: Option<&str>,
 ) -> Result<(), PersistenceError> {
     conn.execute(
-        "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![id.as_str(), encode_origin(key.origin), key.scope, key.id],
+        "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id, last_seen_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            id.as_str(),
+            encode_origin(key.origin),
+            key.scope,
+            key.id,
+            last_seen_at
+        ],
     )
     .map_err(binding_error)?;
     Ok(())
@@ -729,29 +910,46 @@ fn migrate(conn: &mut Connection) -> Result<(), PersistenceError> {
             }
             tx.execute_batch(SCHEMA_V1)
                 .map_err(|_| PersistenceError::Migration)?;
+            tx.execute_batch(SCHEMA_V2_UPGRADE)
+                .map_err(|_| PersistenceError::Migration)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|_| PersistenceError::Migration)?;
+        }
+        1 => {
+            validate_schema_tables(&tx, &TABLES[..5])?;
+            tx.execute_batch(SCHEMA_V2_UPGRADE)
+                .map_err(|_| PersistenceError::Migration)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|_| PersistenceError::Migration)?;
         }
         SCHEMA_VERSION => {
-            for table in TABLES {
-                let exists: bool = tx
-                    .query_row(
-                        "SELECT EXISTS (
-                            SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
-                        )",
-                        [table],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| PersistenceError::Migration)?;
-                if !exists {
-                    return Err(PersistenceError::Migration);
-                }
-            }
+            validate_schema_tables(&tx, &TABLES)?;
         }
         v if v > SCHEMA_VERSION => return Err(PersistenceError::UnsupportedSchemaVersion),
         _ => return Err(PersistenceError::Migration),
     }
+    // Reject a v2 marker with missing metadata columns without mutating the DB.
+    tx.prepare("SELECT last_seen_at FROM assignment_sources LIMIT 0")
+        .map_err(|_| PersistenceError::Migration)?;
+    tx.prepare("SELECT kind, scope, last_synced_at FROM sync_scopes LIMIT 0")
+        .map_err(|_| PersistenceError::Migration)?;
     tx.commit().map_err(|_| PersistenceError::Migration)
+}
+
+fn validate_schema_tables(conn: &Connection, tables: &[&str]) -> Result<(), PersistenceError> {
+    for table in tables {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|_| PersistenceError::Migration)?;
+        if !exists {
+            return Err(PersistenceError::Migration);
+        }
+    }
+    Ok(())
 }
 
 fn database_error(error: rusqlite::Error) -> PersistenceError {
@@ -1142,14 +1340,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_database_migrates_to_five_strict_tables_and_index() {
+    fn empty_database_migrates_to_six_strict_tables_and_index() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert_eq!(pragma_number(&store.conn, "user_version"), 1);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
         let table_count: i64 = store.conn.query_row(
             "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*'",
             [], |row| row.get(0),
         ).unwrap();
-        assert_eq!(table_count, 5);
+        assert_eq!(table_count, 6);
         for table in TABLES {
             let strict: i64 = store
                 .conn
@@ -1206,7 +1404,7 @@ mod tests {
         let temp = TempDb::new();
         {
             let conn = Connection::open(&temp.path).unwrap();
-            conn.execute_batch("CREATE TABLE future_data (value TEXT); PRAGMA user_version = 2")
+            conn.execute_batch("CREATE TABLE future_data (value TEXT); PRAGMA user_version = 3")
                 .unwrap();
             conn.execute("INSERT INTO future_data VALUES (?1)", [PRIVATE])
                 .unwrap();
@@ -1215,7 +1413,7 @@ mod tests {
         assert_eq!(error, PersistenceError::UnsupportedSchemaVersion);
         assert_safe(error);
         let conn = Connection::open(&temp.path).unwrap();
-        assert_eq!(pragma_number(&conn, "user_version"), 2);
+        assert_eq!(pragma_number(&conn, "user_version"), 3);
         let value: String = conn
             .query_row("SELECT value FROM future_data", [], |row| row.get(0))
             .unwrap();
@@ -1321,7 +1519,7 @@ mod tests {
         assert_eq!(remaining_object, "sqlite_sequence");
         assert_eq!(pragma_number(&conn, "user_version"), 0);
         migrate(&mut conn).unwrap();
-        assert_eq!(pragma_number(&conn, "user_version"), 1);
+        assert_eq!(pragma_number(&conn, "user_version"), 2);
         for table in TABLES {
             assert_eq!(count(&conn, table), 0);
         }
@@ -1356,18 +1554,18 @@ mod tests {
         assert_eq!(tables, 0);
         conn.execute_batch("PRAGMA max_page_count = 100").unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(pragma_number(&conn, "user_version"), 1);
+        assert_eq!(pragma_number(&conn, "user_version"), 2);
     }
 
     #[test]
-    fn version_one_with_a_missing_required_table_is_rejected() {
+    fn current_version_with_a_missing_required_table_is_rejected() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         store
             .conn
             .execute_batch("DROP TABLE course_sources")
             .unwrap();
         assert_eq!(migrate(&mut store.conn), Err(PersistenceError::Migration));
-        assert_eq!(pragma_number(&store.conn, "user_version"), 1);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
     }
 
     #[test]
@@ -1589,7 +1787,7 @@ mod tests {
                 .unwrap();
         }
         let store = SqliteStore::open(&temp.path).unwrap();
-        assert_eq!(pragma_number(&store.conn, "user_version"), 1);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
         assert_eq!(
             store.get_course(&expected_course.id).unwrap(),
             Some(expected_course)
@@ -2028,7 +2226,7 @@ mod tests {
     fn all_child_tables_enforce_foreign_keys() {
         let store = SqliteStore::open_in_memory().unwrap();
         for sql in [
-            "INSERT INTO assignment_sources VALUES ('missing', 'manual', 'scope', 'id')",
+            "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES ('missing', 'manual', 'scope', 'id')",
             "INSERT INTO course_sources VALUES ('missing', 'manual', 'id')",
             "INSERT INTO course_schedule VALUES ('missing', 0, 'on_demand', NULL, NULL)",
             "INSERT INTO assignments VALUES ('a', 'missing', '', NULL, NULL, 'unknown', NULL, 'incomplete', '2026-10-04T00:00:00.000000000Z', '2026-10-04T00:00:00.000000000Z')",
@@ -2054,7 +2252,7 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO assignment_sources VALUES (?1, 'manual', 'scope', 'id')",
+                "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES (?1, 'manual', 'scope', 'id')",
                 [expected.id.as_str()],
             )
             .unwrap();
@@ -2097,7 +2295,7 @@ mod tests {
         store
             .insert_course(&course("c_check", vec![ScheduleEntry::OnDemand]))
             .unwrap();
-        store.conn.execute_batch("INSERT INTO assignment_sources VALUES ('a_check', 'manual', 'scope', 'id'); INSERT INTO course_sources VALUES ('c_check', 'manual', 'id');").unwrap();
+        store.conn.execute_batch("INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES ('a_check', 'manual', 'scope', 'id'); INSERT INTO course_sources VALUES ('c_check', 'manual', 'id');").unwrap();
         for sql in [
             "UPDATE assignments SET submission = ?1",
             "UPDATE assignments SET completion = ?1",
@@ -2867,7 +3065,7 @@ mod tests {
             store
                 .conn
                 .execute(
-                    "INSERT INTO assignment_sources VALUES (?1, 'manual', 'scope', 'id')",
+                    "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES (?1, 'manual', 'scope', 'id')",
                     [entity.id.as_str()],
                 )
                 .unwrap();
@@ -3476,7 +3674,7 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO assignment_sources VALUES ('absent', 'manual', ?1, 'orphan')",
+                "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES ('absent', 'manual', ?1, 'orphan')",
                 [PRIVATE],
             )
             .unwrap();
@@ -3757,7 +3955,502 @@ mod tests {
             Some(expected.clone())
         );
         assert_eq!(assignment_metadata(&store, &expected.id), metadata);
-        assert_eq!(pragma_number(&store.conn, "user_version"), 1);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
+    }
+
+    mod observation_tests {
+        use super::*;
+        use rusqlite::types::Value;
+
+        fn rows(conn: &Connection, tables: &[&str], legacy: bool) -> Vec<Vec<Vec<Value>>> {
+            tables
+                .iter()
+                .map(|table| {
+                    let columns = if legacy && *table == "assignment_sources" {
+                        "assignment_id, origin, scope, external_id"
+                    } else {
+                        "*"
+                    };
+                    let mut statement = conn
+                        .prepare(&format!("SELECT {columns} FROM {table} ORDER BY 1, 2"))
+                        .unwrap();
+                    let columns = statement.column_count();
+                    statement
+                        .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn observed(scope: SyncScope, keys: Vec<ExternalRecordKey>) -> AssignmentObservation {
+            AssignmentObservation::try_new(scope, keys).unwrap()
+        }
+
+        #[test]
+        fn populated_v1_migrates_without_inventing_observations_and_reopens_as_v2() {
+            let temp = TempDb::new();
+            let before;
+            let expected_assignment;
+            let expected_course;
+            let key = external_key(OriginKind::Moodle, "legacy-feed", "legacy-uid");
+            {
+                let conn = Connection::open(&temp.path).unwrap();
+                configure(&conn).unwrap();
+                conn.execute_batch(SCHEMA_V1).unwrap();
+                conn.pragma_update(None, "user_version", 1).unwrap();
+                let mut legacy = SqliteStore { conn };
+                expected_course = legacy
+                    .create_course_with_source(
+                        "Existing course",
+                        vec![ScheduleEntry::OnDemand, slot(DayOfWeek::Friday, 2)],
+                        OriginKind::WebClass,
+                        "group",
+                    )
+                    .unwrap();
+                let mut input = manual_input();
+                input.course_id = Some(expected_course.id.clone());
+                let assignment = legacy.create_manual_assignment(input).unwrap();
+                legacy
+                    .set_completion(&assignment.id, CompletionState::Completed)
+                    .unwrap();
+                expected_assignment = legacy.get_assignment(&assignment.id).unwrap().unwrap();
+                legacy.conn.execute("INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES (?1, 'moodle', ?2, ?3)", params![assignment.id.as_str(), key.scope, key.id]).unwrap();
+                before = rows(&legacy.conn, &TABLES[..5], true);
+            }
+            let after;
+            {
+                let store = SqliteStore::open(&temp.path).unwrap();
+                assert_eq!(pragma_number(&store.conn, "user_version"), 2);
+                assert_eq!(rows(&store.conn, &TABLES[..5], true), before);
+                assert_eq!(
+                    store.get_assignment(&expected_assignment.id).unwrap(),
+                    Some(expected_assignment.clone())
+                );
+                assert_eq!(
+                    store.get_course(&expected_course.id).unwrap(),
+                    Some(expected_course.clone())
+                );
+                assert_eq!(store.get_assignment_last_seen_at(&key).unwrap(), None);
+                assert_eq!(count(&store.conn, "sync_scopes"), 0);
+                let fresh = SqliteStore::open_in_memory().unwrap();
+                let schema = |conn: &Connection| -> String {
+                    conn.query_row("SELECT group_concat(sql, ';') FROM (SELECT sql FROM sqlite_schema ORDER BY name)", [], |row| row.get(0)).unwrap()
+                };
+                assert_eq!(schema(&store.conn), schema(&fresh.conn));
+                after = rows(&store.conn, &TABLES, false);
+            }
+            let reopened = SqliteStore::open(&temp.path).unwrap();
+            assert_eq!(rows(&reopened.conn, &TABLES, false), after);
+            assert_eq!(
+                reopened.get_assignment(&expected_assignment.id).unwrap(),
+                Some(expected_assignment)
+            );
+            assert_eq!(
+                reopened.get_course(&expected_course.id).unwrap(),
+                Some(expected_course)
+            );
+        }
+
+        #[test]
+        fn v1_upgrade_failure_rolls_back_column_table_and_version_changes() {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1; CREATE TABLE sync_scopes (value TEXT); INSERT INTO sync_scopes VALUES ('SYNTHETIC_PRIVATE_VALUE_6B1');").unwrap();
+            let schema = |conn: &Connection| -> String {
+                conn.query_row("SELECT group_concat(sql, ';') FROM (SELECT sql FROM sqlite_schema ORDER BY name)", [], |row| row.get(0)).unwrap()
+            };
+            let before = schema(&conn);
+            assert_eq!(migrate(&mut conn), Err(PersistenceError::Migration));
+            assert!(conn.is_autocommit());
+            assert_eq!(pragma_number(&conn, "user_version"), 1);
+            assert_eq!(schema(&conn), before);
+            assert!(
+                conn.prepare("SELECT last_seen_at FROM assignment_sources")
+                    .is_err()
+            );
+            let value: String = conn
+                .query_row("SELECT value FROM sync_scopes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, PRIVATE);
+            conn.execute_batch("DROP TABLE sync_scopes").unwrap();
+            migrate(&mut conn).unwrap();
+            assert_eq!(pragma_number(&conn, "user_version"), 2);
+        }
+
+        #[test]
+        fn v2_marker_without_metadata_columns_is_rejected_without_repair() {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2; CREATE TABLE sync_scopes (kind TEXT, scope TEXT, last_synced_at TEXT)").unwrap();
+            assert_eq!(migrate(&mut conn), Err(PersistenceError::Migration));
+            assert_eq!(pragma_number(&conn, "user_version"), 2);
+            assert!(
+                conn.prepare("SELECT last_seen_at FROM assignment_sources")
+                    .is_err()
+            );
+            assert!(conn.is_autocommit());
+        }
+
+        #[test]
+        fn positive_observation_empty_absence_and_reappearance_preserve_domain_state() {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let scope = SyncScope::WebClassContents("group".into());
+            let a = import_candidate(OriginKind::WebClass, "group", "a");
+            let b = import_candidate(OriginKind::WebClass, "group", "b");
+            let first = decode_timestamp(STAMP).unwrap();
+            let initial = observed(
+                scope.clone(),
+                vec![a.external_key.clone(), b.external_key.clone()],
+            );
+            assert_eq!(
+                store
+                    .import_assignment_batch_with_observation(
+                        &batch(vec![a.clone(), b.clone()]),
+                        &initial,
+                        first
+                    )
+                    .unwrap()
+                    .created,
+                2
+            );
+            let stored = store
+                .find_assignment_by_external_key(&b.external_key)
+                .unwrap()
+                .unwrap();
+            store
+                .set_completion(&stored.id, CompletionState::Completed)
+                .unwrap();
+            let domain_before = rows(&store.conn, &TABLES[..5], true);
+            let metadata = assignment_metadata(&store, &stored.id);
+            let filtered_at = first + chrono::Duration::seconds(1);
+            let unknown = external_key(OriginKind::WebClass, "group", "never-imported");
+            let filtered = observed(scope.clone(), vec![a.external_key.clone(), unknown.clone()]);
+            assert_eq!(
+                store
+                    .import_assignment_batch_with_observation(
+                        &batch(vec![]),
+                        &filtered,
+                        filtered_at
+                    )
+                    .unwrap(),
+                AssignmentImportSummary::default()
+            );
+            assert_eq!(
+                store.get_assignment_last_seen_at(&a.external_key).unwrap(),
+                Some(filtered_at)
+            );
+            assert_eq!(
+                store.get_assignment_last_seen_at(&b.external_key).unwrap(),
+                Some(first)
+            );
+            assert_eq!(store.get_assignment_last_seen_at(&unknown).unwrap(), None);
+            assert_eq!(
+                store.find_assignment_by_external_key(&unknown).unwrap(),
+                None
+            );
+            assert_eq!(rows(&store.conn, &TABLES[..5], true), domain_before);
+            let empty_at = filtered_at + chrono::Duration::seconds(1);
+            let empty = observed(scope.clone(), vec![]);
+            store
+                .import_assignment_batch_with_observation(&batch(vec![]), &empty, empty_at)
+                .unwrap();
+            assert_eq!(store.get_last_synced_at(&scope).unwrap(), Some(empty_at));
+            assert_eq!(
+                store.get_assignment_last_seen_at(&a.external_key).unwrap(),
+                Some(filtered_at)
+            );
+            let before_replay = rows(&store.conn, &TABLES, false);
+            store
+                .import_assignment_batch_with_observation(&batch(vec![]), &empty, empty_at)
+                .unwrap();
+            assert_eq!(rows(&store.conn, &TABLES, false), before_replay);
+            let reappear = observed(scope, vec![b.external_key.clone()]);
+            let reappear_at = empty_at + chrono::Duration::seconds(1);
+            assert_eq!(
+                store
+                    .import_assignment_batch_with_observation(
+                        &batch(vec![b.clone()]),
+                        &reappear,
+                        reappear_at
+                    )
+                    .unwrap()
+                    .unchanged,
+                1
+            );
+            let recovered = store
+                .find_assignment_by_external_key(&b.external_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.id, stored.id);
+            assert_eq!(recovered.completion, CompletionState::Completed);
+            assert_eq!(assignment_metadata(&store, &stored.id), metadata);
+            assert_eq!(
+                store.get_assignment_last_seen_at(&b.external_key).unwrap(),
+                Some(reappear_at)
+            );
+            assert_eq!(count(&store.conn, "assignments"), 2);
+            assert_eq!(count(&store.conn, "assignment_sources"), 2);
+        }
+
+        #[test]
+        fn scope_and_origin_isolation_and_legacy_import_leave_metadata_contracts_separate() {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let at = decode_timestamp(STAMP).unwrap();
+            let mut keys = Vec::new();
+            for (scope, origin, namespace) in [
+                (
+                    SyncScope::MoodleFeed("default".into()),
+                    OriginKind::Moodle,
+                    "default",
+                ),
+                (
+                    SyncScope::MoodleFeed("other".into()),
+                    OriginKind::Moodle,
+                    "other",
+                ),
+                (
+                    SyncScope::WebClassContents("default".into()),
+                    OriginKind::WebClass,
+                    "default",
+                ),
+                (
+                    SyncScope::WebClassContents("other".into()),
+                    OriginKind::WebClass,
+                    "other",
+                ),
+            ] {
+                let candidate = import_candidate(origin, namespace, "same-id");
+                let observation = observed(scope.clone(), vec![candidate.external_key.clone()]);
+                store
+                    .import_assignment_batch_with_observation(
+                        &batch(vec![candidate.clone()]),
+                        &observation,
+                        at,
+                    )
+                    .unwrap();
+                keys.push((scope, candidate.external_key));
+            }
+            let later = at + chrono::Duration::seconds(1);
+            let courses = WebClassCourseListObservation::try_new(vec!["default".into()]).unwrap();
+            store
+                .record_webclass_course_list_observation(&courses, later)
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_last_synced_at(&SyncScope::WebClassCourses)
+                    .unwrap(),
+                Some(later)
+            );
+            assert_eq!(count(&store.conn, "courses"), 0);
+            assert_eq!(count(&store.conn, "course_sources"), 0);
+            assert_eq!(count(&store.conn, "sync_scopes"), 5);
+            for (scope, key) in &keys {
+                assert_eq!(store.get_last_synced_at(scope).unwrap(), Some(at));
+                assert_eq!(store.get_assignment_last_seen_at(key).unwrap(), Some(at));
+            }
+            let before = rows(&store.conn, &TABLES, false);
+            store.import_assignment_batch(&batch(vec![])).unwrap();
+            assert_eq!(rows(&store.conn, &TABLES, false), before);
+            let manual = import_candidate(OriginKind::Manual, "manual", "id");
+            store
+                .import_assignment_batch(&batch(vec![manual.clone()]))
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_assignment_last_seen_at(&manual.external_key)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                store
+                    .get_last_synced_at(&SyncScope::MoodleFeed("never-synced".into()))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                store.get_last_synced_at(&SyncScope::WebClassContents(" \t".into())),
+                Err(PersistenceError::ObservationValidation)
+            );
+        }
+
+        #[test]
+        fn subset_failure_is_rejected_before_any_persistence_change() {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let candidate = import_candidate(OriginKind::Moodle, PRIVATE, PRIVATE);
+            let observation = observed(SyncScope::MoodleFeed(PRIVATE.into()), vec![]);
+            let before = rows(&store.conn, &TABLES, false);
+            let error = store
+                .import_assignment_batch_with_observation(
+                    &batch(vec![candidate]),
+                    &observation,
+                    decode_timestamp(STAMP).unwrap(),
+                )
+                .unwrap_err();
+            assert_eq!(error, PersistenceError::ObservationValidation);
+            assert_safe(error);
+            assert_eq!(rows(&store.conn, &TABLES, false), before);
+            assert!(store.conn.is_autocommit());
+        }
+
+        #[test]
+        fn import_binding_scope_and_commit_failures_roll_back_all_observed_changes() {
+            for stage in ["import", "seen", "scope-insert", "scope-update", "commit"] {
+                let mut store = SqliteStore::open_in_memory().unwrap();
+                let old = import_candidate(OriginKind::Moodle, PRIVATE, "old");
+                let filtered = import_candidate(OriginKind::Moodle, PRIVATE, "filtered");
+                let scope = SyncScope::MoodleFeed(PRIVATE.into());
+                let original = observed(
+                    scope.clone(),
+                    vec![old.external_key.clone(), filtered.external_key.clone()],
+                );
+                let at = decode_timestamp(STAMP).unwrap();
+                store
+                    .import_assignment_batch_with_observation(
+                        &batch(vec![old.clone(), filtered.clone()]),
+                        &original,
+                        at,
+                    )
+                    .unwrap();
+                let mut updated = old.clone();
+                updated.title = PRIVATE.into();
+                let new = import_candidate(OriginKind::Moodle, PRIVATE, "new");
+                let observation = observed(
+                    scope,
+                    vec![
+                        filtered.external_key.clone(),
+                        old.external_key.clone(),
+                        new.external_key.clone(),
+                    ],
+                );
+                let trigger = match stage {
+                    "import" => {
+                        "CREATE TRIGGER fail_observation BEFORE INSERT ON assignment_sources WHEN NEW.external_id = 'new' BEGIN SELECT RAISE(ABORT, NEW.scope); END;"
+                    }
+                    "seen" => {
+                        "CREATE TRIGGER fail_observation BEFORE UPDATE ON assignment_sources WHEN NEW.external_id = 'old' BEGIN SELECT RAISE(ABORT, NEW.scope); END;"
+                    }
+                    "scope-insert" => {
+                        store.conn.execute("DELETE FROM sync_scopes", []).unwrap();
+                        "CREATE TRIGGER fail_observation BEFORE INSERT ON sync_scopes BEGIN SELECT RAISE(ABORT, NEW.scope); END;"
+                    }
+                    "scope-update" => {
+                        "CREATE TRIGGER fail_observation BEFORE UPDATE ON sync_scopes BEGIN SELECT RAISE(ABORT, NEW.scope); END;"
+                    }
+                    "commit" => {
+                        store
+                            .conn
+                            .execute_batch("PRAGMA defer_foreign_keys = ON")
+                            .unwrap();
+                        "CREATE TRIGGER fail_observation AFTER UPDATE ON sync_scopes BEGIN INSERT INTO course_sources VALUES ('absent', 'webclass', 'deferred'); END;"
+                    }
+                    _ => unreachable!(),
+                };
+                store.conn.execute_batch(trigger).unwrap();
+                let before = rows(&store.conn, &TABLES, false);
+                let error = store
+                    .import_assignment_batch_with_observation(
+                        &batch(vec![updated, new]),
+                        &observation,
+                        at + chrono::Duration::seconds(1),
+                    )
+                    .unwrap_err();
+                assert_eq!(error, PersistenceError::Constraint, "{stage}");
+                assert_safe(error);
+                assert_eq!(rows(&store.conn, &TABLES, false), before, "{stage}");
+                assert!(store.conn.is_autocommit());
+            }
+        }
+
+        #[test]
+        fn course_list_metadata_failure_rolls_back_its_own_scope_transaction() {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let observation = WebClassCourseListObservation::try_new(vec![]).unwrap();
+            let at = decode_timestamp(STAMP).unwrap();
+            store
+                .record_webclass_course_list_observation(&observation, at)
+                .unwrap();
+            store.conn.execute_batch("CREATE TRIGGER fail_courses BEFORE UPDATE ON sync_scopes BEGIN SELECT RAISE(ABORT, NEW.scope); END").unwrap();
+            let before = rows(&store.conn, &TABLES, false);
+            assert_eq!(
+                store.record_webclass_course_list_observation(
+                    &observation,
+                    at + chrono::Duration::seconds(1)
+                ),
+                Err(PersistenceError::Constraint)
+            );
+            assert_eq!(rows(&store.conn, &TABLES, false), before);
+        }
+
+        #[test]
+        fn metadata_sql_constraints_and_canonical_codec_reject_invalid_values_safely() {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let candidate = import_candidate(OriginKind::Moodle, "feed", "uid");
+            let observation = observed(
+                SyncScope::MoodleFeed("feed".into()),
+                vec![candidate.external_key.clone()],
+            );
+            let at = decode_timestamp(STAMP).unwrap();
+            store
+                .import_assignment_batch_with_observation(
+                    &batch(vec![candidate.clone()]),
+                    &observation,
+                    at,
+                )
+                .unwrap();
+            for (kind, scope, timestamp) in [
+                ("unknown", "feed", STAMP),
+                ("moodle_feed", "", STAMP),
+                ("webclass_courses", "not-default", STAMP),
+                ("webclass_contents", "group", "not-utc"),
+            ] {
+                assert_constraint(
+                    store.conn.execute(
+                        "INSERT INTO sync_scopes VALUES (?1, ?2, ?3)",
+                        params![kind, scope, timestamp],
+                    ),
+                    ffi::SQLITE_CONSTRAINT_CHECK,
+                );
+            }
+            assert_constraint(
+                store
+                    .conn
+                    .execute("UPDATE assignment_sources SET last_seen_at = 'not-utc'", []),
+                ffi::SQLITE_CONSTRAINT_CHECK,
+            );
+            for column in ["seen", "synced"] {
+                let sql = if column == "seen" {
+                    "UPDATE assignment_sources SET last_seen_at = ?1"
+                } else {
+                    "UPDATE sync_scopes SET last_synced_at = ?1"
+                };
+                for invalid in ["PRIVATE_BAD_TIMESTAMP_Z", "2026-10-04T00:00:00Z"] {
+                    store.conn.execute(sql, [invalid]).unwrap();
+                    let result = if column == "seen" {
+                        store.get_assignment_last_seen_at(&candidate.external_key)
+                    } else {
+                        store.get_last_synced_at(observation.scope())
+                    };
+                    assert_eq!(result, Err(PersistenceError::InvalidStoredData));
+                    let before = rows(&store.conn, &TABLES, false);
+                    let mut changed = candidate.clone();
+                    changed.title = PRIVATE.into();
+                    assert_eq!(
+                        store.import_assignment_batch_with_observation(
+                            &batch(vec![changed]),
+                            &observation,
+                            at + chrono::Duration::seconds(1)
+                        ),
+                        Err(PersistenceError::InvalidStoredData)
+                    );
+                    assert_eq!(rows(&store.conn, &TABLES, false), before);
+                }
+                store.conn.execute(sql, [STAMP]).unwrap();
+            }
+        }
     }
 
     #[test]

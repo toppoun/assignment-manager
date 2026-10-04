@@ -3,8 +3,8 @@
 //! Persistence must accept an [`AssignmentCandidateBatch`] rather than unchecked
 //! candidates. A batch contains assignment candidates, not a source snapshot:
 //! candidate absence does not imply source disappearance and must never trigger
-//! deletion. Future presence / last_seen tracking must use identities observed in
-//! source models before classification or visibility filtering.
+//! deletion. Positive last_seen tracking uses the separate observation contract,
+//! with identities from source models before classification or visibility filtering.
 
 use std::collections::HashSet;
 use std::error::Error;

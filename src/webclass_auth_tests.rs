@@ -1624,6 +1624,8 @@ mod reauth_sync_tests {
     use rusqlite::{Connection, types::Value as SqlValue};
 
     use super::*;
+    use crate::import::{ExternalRecordKey, OriginKind};
+    use crate::observation::SyncScope;
     use crate::persistence::SqliteStore;
     use crate::sync::{
         WebClassCredentialProvider, WebClassReauthSyncError, WebClassSyncError,
@@ -1640,6 +1642,7 @@ mod reauth_sync_tests {
         "fixture-course-003",
     ];
     type Snapshot = [Vec<Vec<SqlValue>>; 5];
+    type ObservationSnapshot = [Vec<Vec<SqlValue>>; 2];
 
     struct TempDatabase {
         directory: PathBuf,
@@ -1710,6 +1713,54 @@ mod reauth_sync_tests {
         }
     }
 
+    fn observation_snapshot(connection: &Connection) -> ObservationSnapshot {
+        [
+            "SELECT origin, scope, external_id, last_seen_at FROM assignment_sources ORDER BY 1, 2, 3",
+            "SELECT kind, scope, last_synced_at FROM sync_scopes ORDER BY 1, 2",
+        ].map(|sql| {
+            let mut statement = connection.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement.query_map([], |row| (0..columns).map(|column| row.get(column)).collect())
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        })
+    }
+
+    fn assert_full_observation(store: &SqliteStore, observer: &Connection) {
+        let state = observation_snapshot(observer);
+        assert_eq!(state.each_ref().map(Vec::len), [9, 4]);
+        assert!(
+            store
+                .get_last_synced_at(&SyncScope::WebClassCourses)
+                .unwrap()
+                .is_some()
+        );
+        for group in GROUPS {
+            let synced = store
+                .get_last_synced_at(&SyncScope::WebClassContents(group.into()))
+                .unwrap()
+                .unwrap();
+            for id in [
+                "fixture-content-001",
+                "fixture-content-002",
+                "fixture-content-003",
+            ] {
+                let key = ExternalRecordKey {
+                    origin: OriginKind::WebClass,
+                    scope: group.into(),
+                    id: id.into(),
+                };
+                assert_eq!(
+                    store.get_assignment_last_seen_at(&key).unwrap(),
+                    Some(synced)
+                );
+            }
+        }
+        let rendered = format!("{state:?}");
+        for secret in SECRETS.iter().copied().chain([OLD_COOKIE]) {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
     fn assert_safe_error(error: WebClassReauthSyncError) {
         let rendered = format!("{error} {error:?} {error:#?}");
         for secret in SECRETS.iter().copied().chain([
@@ -1752,6 +1803,7 @@ mod reauth_sync_tests {
         calls: usize,
         released: bool,
         before_login: Option<Snapshot>,
+        before_login_metadata: Option<ObservationSnapshot>,
     }
 
     impl<'a> SyntheticProvider<'a> {
@@ -1762,6 +1814,7 @@ mod reauth_sync_tests {
                 calls: 0,
                 released: false,
                 before_login: None,
+                before_login_metadata: None,
             }
         }
     }
@@ -1773,6 +1826,7 @@ mod reauth_sync_tests {
         ) -> Option<R> {
             self.calls += 1;
             self.before_login = Some(snapshot(self.observer));
+            self.before_login_metadata = Some(observation_snapshot(self.observer));
             if !self.available {
                 return None;
             }
@@ -1948,6 +2002,7 @@ mod reauth_sync_tests {
         assert!(provider.before_login.is_none());
         assert_eq!(client.fetch_courses_json().unwrap(), "[]");
         assert_full_database(&observer);
+        assert_full_observation(&store, &observer);
         finish(server);
         finish_auth(auth_servers);
     }
@@ -1977,9 +2032,19 @@ mod reauth_sync_tests {
         assert_eq!(provider.calls, 1);
         assert!(provider.released);
         assert_eq!(provider.before_login.as_ref().unwrap(), &before);
+        assert_eq!(
+            provider
+                .before_login_metadata
+                .as_ref()
+                .unwrap()
+                .each_ref()
+                .map(Vec::len),
+            [0, 0]
+        );
         // Different origin and cookie confirm replacement, independently of sync success.
         assert_eq!(client.fetch_courses_json().unwrap(), "[]");
         assert_full_database(&observer);
+        assert_full_observation(&store, &observer);
         finish(server);
         finish_auth(auth_servers);
     }
@@ -2013,13 +2078,38 @@ mod reauth_sync_tests {
         let partial = provider.before_login.as_ref().unwrap();
         assert_eq!(partial.each_ref().map(Vec::len), [3, 3, 2, 2, 0]);
         let final_state = assert_full_database(&observer);
-        for (before, after) in partial.iter().zip(&final_state) {
+        for (table, (before, after)) in partial.iter().zip(&final_state).enumerate() {
             for row in before {
                 // Includes internal IDs, completion and both assignment timestamps.
-                assert!(after.contains(row));
+                if table == 1 {
+                    // Seen timestamps advance, while exact source bindings persist.
+                    assert!(after.iter().any(|current| current[..4] == row[..4]));
+                } else {
+                    assert!(after.contains(row));
+                }
             }
         }
+        assert_full_observation(&store, &observer);
+        let partial_metadata = provider.before_login_metadata.as_ref().unwrap();
+        assert_eq!(partial_metadata.each_ref().map(Vec::len), [3, 2]);
+        let final_metadata = observation_snapshot(&observer);
+        for row in &partial_metadata[0] {
+            let current = final_metadata[0]
+                .iter()
+                .find(|current| current[..3] == row[..3])
+                .unwrap();
+            let (SqlValue::Text(previous), SqlValue::Text(now)) = (&row[3], &current[3]) else {
+                panic!("canonical seen timestamps");
+            };
+            assert!(
+                previous.parse::<chrono::DateTime<chrono::Utc>>().unwrap()
+                    <= now.parse::<chrono::DateTime<chrono::Utc>>().unwrap()
+            );
+        }
+        let committed = observation_snapshot(&observer);
         assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+        // A raw HTTP fetch, including the login verification probe, is not an observation.
+        assert_eq!(observation_snapshot(&observer), committed);
         finish(server);
         finish_auth(auth_servers);
     }
@@ -2052,6 +2142,12 @@ mod reauth_sync_tests {
         assert_eq!(provider.calls, 1);
         assert!(provider.released);
         assert_eq!(snapshot(&observer), before);
+        assert_eq!(
+            store
+                .get_last_synced_at(&SyncScope::WebClassCourses)
+                .unwrap(),
+            None
+        );
         assert_eq!(client.fetch_courses_json().unwrap(), "[]");
         finish(server);
         finish_auth(auth_servers);
@@ -2134,6 +2230,15 @@ mod reauth_sync_tests {
             [0, 0, course_count, course_count, 0]
         );
         assert_no_auth_data(&state);
+        let metadata = observation_snapshot(observer);
+        let observed_courses = usize::from(matches!(
+            category,
+            WebClassSyncError::CoursePersistence
+                | WebClassSyncError::Map
+                | WebClassSyncError::Validation
+                | WebClassSyncError::Persistence
+        ));
+        assert_eq!(metadata.each_ref().map(Vec::len), [0, observed_courses]);
     }
 
     #[test]
@@ -2196,6 +2301,10 @@ mod reauth_sync_tests {
             let state = snapshot(&observer);
             assert_eq!(&state, provider.before_login.as_ref().unwrap());
             assert_eq!(
+                &observation_snapshot(&observer),
+                provider.before_login_metadata.as_ref().unwrap()
+            );
+            assert_eq!(
                 state.each_ref().map(Vec::len),
                 if partial { [3, 3, 2, 2, 0] } else { [0; 5] }
             );
@@ -2242,6 +2351,10 @@ mod reauth_sync_tests {
             assert!(provider.released);
             let state = snapshot(&observer);
             assert_eq!(&state, provider.before_login.as_ref().unwrap());
+            assert_eq!(
+                &observation_snapshot(&observer),
+                provider.before_login_metadata.as_ref().unwrap()
+            );
             assert_eq!(state.each_ref().map(Vec::len), [3, 3, 2, 2, 0]);
             assert_no_auth_data(&state);
             assert_eq!(client.fetch_courses_json().unwrap(), "[]");
