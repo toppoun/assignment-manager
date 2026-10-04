@@ -240,6 +240,37 @@ fn every_public_authentication_error_contains_only_safe_categories() {
     ] {
         assert_safe(error);
     }
+    for step in [
+        AuthStep::HoppiiAcs,
+        AuthStep::HoppiiPostAcs,
+        AuthStep::HoppiiPortalLoginStart,
+        AuthStep::HoppiiPortalLoginRedirect,
+        AuthStep::HoppiiPortalVerify,
+    ] {
+        for error in [
+            HoseiAuthError::Timeout(step),
+            HoseiAuthError::Request(step),
+            HoseiAuthError::HttpStatus(step, StatusCode::FORBIDDEN),
+            HoseiAuthError::ProtocolChanged(step),
+            HoseiAuthError::RedirectLimit(step),
+        ] {
+            assert_safe(error);
+        }
+    }
+    for reason in [
+        ProtocolReason::UnexpectedSuccessStatus,
+        ProtocolReason::MissingLocation,
+        ProtocolReason::BodyDecode,
+        ProtocolReason::InvalidJsRedirect,
+        ProtocolReason::InvalidTarget,
+        ProtocolReason::UnexpectedOrigin,
+        ProtocolReason::UserInfo,
+    ] {
+        assert_safe(HoseiAuthError::ProtocolChangedWithReason(
+            AuthStep::WebClassRedirect,
+            reason,
+        ));
+    }
 }
 
 struct RecordedRequest {
@@ -295,11 +326,13 @@ struct Exchange {
     headers: Vec<(&'static str, String)>,
     cookies: Vec<(&'static str, &'static str)>,
     forbid_cookies: bool,
+    forbid_referer: bool,
     json: Option<Value>,
     form: Option<Vec<(String, String)>>,
     status: u16,
     response_headers: Vec<(&'static str, String)>,
     body: String,
+    response_bytes: Option<Vec<u8>>,
 }
 
 impl Exchange {
@@ -310,11 +343,13 @@ impl Exchange {
             headers: Vec::new(),
             cookies: Vec::new(),
             forbid_cookies: false,
+            forbid_referer: false,
             json: None,
             form: None,
             status,
             response_headers: vec![("Content-Type", "text/html".to_owned())],
             body: body.to_owned(),
+            response_bytes: None,
         }
     }
     fn redirect(method: &'static str, target: &str, location: &str) -> Self {
@@ -334,6 +369,10 @@ impl Exchange {
     }
     fn without_cookies(mut self) -> Self {
         self.forbid_cookies = true;
+        self
+    }
+    fn without_referer(mut self) -> Self {
+        self.forbid_referer = true;
         self
     }
     fn request_json(mut self, value: Value) -> Self {
@@ -361,6 +400,9 @@ impl Exchange {
         assert_eq!(request.headers["user-agent"], USER_AGENT);
         if self.forbid_cookies {
             assert!(!request.headers.contains_key("cookie"));
+        }
+        if self.forbid_referer {
+            assert!(!request.headers.contains_key("referer"));
         }
         if !request.headers["host"].starts_with("localhost:") {
             assert!(
@@ -432,17 +474,21 @@ fn script(listener: TcpListener, exchanges: Vec<Exchange>) -> JoinHandle<TcpList
                 }
             };
             exchange.assert_request(&read_request(&mut stream));
+            let body = exchange
+                .response_bytes
+                .as_deref()
+                .unwrap_or(exchange.body.as_bytes());
             let mut headers = format!(
                 "HTTP/1.1 {} Mock\r\nContent-Length: {}\r\nConnection: close\r\n",
                 exchange.status,
-                exchange.body.len()
+                body.len()
             );
             for (name, value) in exchange.response_headers {
                 headers.push_str(&format!("{name}: {value}\r\n"));
             }
             headers.push_str("\r\n");
             stream.write_all(headers.as_bytes()).unwrap();
-            stream.write_all(exchange.body.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
         }
         listener
     })
@@ -567,8 +613,10 @@ impl FullFlow {
                 "/portal/index.php?next=",
             )
             .request_form(&saml)
+            .without_referer()
             .response_header("Set-Cookie", "hop_test=synthetic-cookie; Path=/portal"),
             Exchange::new("GET", PORTAL_PUBLIC, 200, "synthetic portal")
+                .without_referer()
                 .cookie("hop_test", "synthetic-cookie"),
             Exchange::redirect("GET", PORTAL_LOGIN, USER_PAGE)
                 .header(
@@ -578,6 +626,10 @@ impl FullFlow {
                 .cookie("hop_test", "synthetic-cookie")
                 .response_header("Set-Cookie", "app_test=synthetic-cookie; Path=/portal"),
             Exchange::new("GET", USER_PAGE, 200, "synthetic user page")
+                .header(
+                    "referer",
+                    endpoint(&endpoints.hoppii, PORTAL_PUBLIC).as_str(),
+                )
                 .cookie("app_test", "synthetic-cookie"),
             Exchange::new("GET", USER_PAGE, 200, "synthetic user page")
                 .header(
@@ -596,10 +648,22 @@ impl FullFlow {
                 .request_form(&csso)
                 .response_header("Set-Cookie", "wc_test=synthetic-cookie; Path=/webclass"),
             Exchange::new("GET", "/webclass/after-sso", 200, JS)
+                .header(
+                    "referer",
+                    endpoint(&endpoints.webclass, "/webclass/singlesignon.php").as_str(),
+                )
                 .cookie("wc_test", "synthetic-cookie"),
             Exchange::new("GET", "/webclass/login.php", 200, JS_ESCAPED)
+                .header(
+                    "referer",
+                    endpoint(&endpoints.webclass, "/webclass/after-sso").as_str(),
+                )
                 .cookie("wc_test", "synthetic-cookie"),
             Exchange::new("GET", "/webclass/", 200, "synthetic dashboard")
+                .header(
+                    "referer",
+                    endpoint(&endpoints.webclass, "/webclass/login.php").as_str(),
+                )
                 .cookie("wc_test", "synthetic-cookie"),
             // Deliberately incompatible with WebClassCourse: schema is not an auth criterion.
             Exchange::new("GET", COURSES, 200, r#"[{"futureSchema":true},null,42]"#)
@@ -671,6 +735,41 @@ fn full_flow_with_consent_forwards_attribute_names_and_reaches_courses() {
     FullFlow::new(true)
         .run(&HoseiAuthenticator::new(), true)
         .expect("consent mock flow");
+}
+
+#[test]
+fn portal_login_redirects_keep_initial_referer_and_shared_cookies() {
+    for status in [301, 302, 303] {
+        let mut flow = FullFlow::new(false);
+        let referer = endpoint(&flow.endpoints.hoppii, PORTAL_PUBLIC);
+        let first_target = "/portal/login/first-hop";
+        let second_target = "/portal/login/second-hop";
+
+        // The existing initial GET checks the same Referer and the HOPPII cookie.
+        flow.exchanges[0][3].status = status;
+        flow.exchanges[0][3].response_headers[1].1 = first_target.to_owned();
+        let mut first_redirect = Exchange::redirect("GET", first_target, second_target)
+            .header("referer", referer.as_str())
+            .cookie("hop_test", "synthetic-cookie")
+            .cookie("app_test", "synthetic-cookie")
+            .response_header("Set-Cookie", "redirect_test=synthetic-cookie; Path=/portal");
+        first_redirect.status = status;
+        flow.exchanges[0][4] = first_redirect;
+        flow.exchanges[0].insert(
+            5,
+            Exchange::new("GET", second_target, 200, "synthetic user page")
+                .header("referer", referer.as_str())
+                .cookie("hop_test", "synthetic-cookie")
+                .cookie("app_test", "synthetic-cookie")
+                .cookie("redirect_test", "synthetic-cookie"),
+        );
+        // Verification keeps its own Referer and receives the redirect's cookie.
+        flow.exchanges[0][6]
+            .cookies
+            .push(("redirect_test", "synthetic-cookie"));
+        flow.run(&HoseiAuthenticator::new(), true)
+            .expect("portal redirects must preserve the fixed Referer and session");
+    }
 }
 
 #[test]
@@ -798,6 +897,336 @@ fn consent_invalid_attributes_and_http_failure_are_secret_safe() {
 }
 
 #[test]
+fn webclass_redirect_response_failures_report_safe_reasons() {
+    let cases: &[(u16, Option<&str>, &[u8], ProtocolReason)] = &[
+        (
+            201,
+            None,
+            b"synthetic-private-body",
+            ProtocolReason::UnexpectedSuccessStatus,
+        ),
+        (204, None, b"", ProtocolReason::UnexpectedSuccessStatus),
+        (
+            299,
+            None,
+            b"synthetic-private-body",
+            ProtocolReason::UnexpectedSuccessStatus,
+        ),
+        (
+            301,
+            None,
+            b"synthetic-private-body",
+            ProtocolReason::MissingLocation,
+        ),
+        (
+            302,
+            Some(""),
+            b"synthetic-private-body",
+            ProtocolReason::MissingLocation,
+        ),
+        (
+            303,
+            Some(" \t "),
+            b"synthetic-private-body",
+            ProtocolReason::MissingLocation,
+        ),
+        (
+            307,
+            Some("\u{e9}"),
+            b"synthetic-private-body",
+            ProtocolReason::MissingLocation,
+        ),
+        (
+            308,
+            None,
+            b"synthetic-private-body",
+            ProtocolReason::MissingLocation,
+        ),
+        (200, None, &[0xff, 0xfe], ProtocolReason::BodyDecode),
+    ];
+    for &(status, location, body, reason) in cases {
+        // Exercise both the SSO POST response and a subsequent redirect GET response.
+        for index in [0, 1] {
+            let mut flow = FullFlow::new(false);
+            let response = &mut flow.exchanges[2][index];
+            response.status = status;
+            response.response_bytes = Some(body.to_vec());
+            response
+                .response_headers
+                .retain(|(name, _)| *name != "Location");
+            if let Some(location) = location {
+                response
+                    .response_headers
+                    .push(("Location", location.to_owned()));
+            }
+            assert_webclass_protocol_failure(flow, index, reason);
+        }
+    }
+}
+
+fn assert_webclass_protocol_failure(mut flow: FullFlow, index: usize, reason: ProtocolReason) {
+    flow.exchanges[2].truncate(index + 1);
+    let error = flow
+        .run(&HoseiAuthenticator::new(), false)
+        .err()
+        .expect("WebClass protocol failure must stop the flow");
+    assert_eq!(
+        error,
+        HoseiAuthError::ProtocolChangedWithReason(AuthStep::WebClassRedirect, reason)
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("unexpected Hosei authentication protocol at WebClassRedirect: {reason:?}")
+    );
+    assert_eq!(
+        format!("{error:?}"),
+        format!("ProtocolChangedWithReason(WebClassRedirect, {reason:?})")
+    );
+    assert_safe(error);
+}
+
+#[test]
+fn webclass_redirect_target_failures_report_reasons_without_following_the_target() {
+    let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+    trap.set_nonblocking(true).unwrap();
+    for reason in [
+        ProtocolReason::InvalidTarget,
+        ProtocolReason::UnexpectedOrigin,
+        ProtocolReason::UserInfo,
+    ] {
+        for js_redirect in [false, true] {
+            for index in [0, 1] {
+                let mut flow = FullFlow::new(false);
+                let target = match reason {
+                    ProtocolReason::InvalidTarget => {
+                        "http://[broken?secret=synthetic-private-body".to_owned()
+                    }
+                    ProtocolReason::UnexpectedOrigin => format!(
+                        "http://{}/?secret=synthetic-private-body",
+                        trap.local_addr().unwrap()
+                    ),
+                    ProtocolReason::UserInfo => {
+                        let mut target = endpoint(&flow.endpoints.webclass, "/webclass/");
+                        target.set_username(STUDENT).unwrap();
+                        target.set_password(Some(PASSWORD)).unwrap();
+                        target.query_pairs_mut().append_pair("token", TOKEN);
+                        target.to_string()
+                    }
+                    _ => unreachable!(),
+                };
+                let response = &mut flow.exchanges[2][index];
+                response
+                    .response_headers
+                    .retain(|(name, _)| *name != "Location");
+                if js_redirect {
+                    response.status = 200;
+                    response.body = format!("<script>location='{target}';</script>");
+                } else {
+                    response.status = 302;
+                    response.body = SECRETS.join(" ");
+                    response.response_headers.push(("Location", target));
+                }
+                assert_webclass_protocol_failure(flow, index, reason);
+                assert_eq!(
+                    trap.accept().err().unwrap().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn webclass_200_with_known_js_redirect_still_follows_the_target() {
+    let mut flow = FullFlow::new(false);
+    let response = &mut flow.exchanges[2][0];
+    response.status = 200;
+    response.body = "<script>location='/webclass/after-sso';</script>".to_owned();
+    response
+        .response_headers
+        .retain(|(name, _)| *name != "Location");
+    flow.run(&HoseiAuthenticator::new(), true)
+        .expect("known JS redirects must still be followed before API verification");
+}
+
+#[test]
+fn webclass_invalid_js_ends_navigation_but_login_requires_an_api_array() {
+    for body in [
+        "<script>location=syntheticValue;</script>",
+        "<script>location='synthetic-private-body';</script><script>location='synthetic-cookie';</script>",
+        "<script>location='/webclass/not-followed'; extraFunction();</script>",
+    ] {
+        // Phase 5B remains strict; only the consumer's handling of this error changes.
+        assert_eq!(
+            parse_webclass_js_redirect(body),
+            Err(WebClassAuthParseError::InvalidRedirect)
+        );
+        for index in [0, 1] {
+            for (status, api_body, location, expected_error) in [
+                (200, "[]", None, None),
+                (
+                    302,
+                    "",
+                    Some("/webclass/login.php?token=synthetic-openam-token"),
+                    Some(HoseiAuthError::ApiVerificationFailed),
+                ),
+                (
+                    200,
+                    r#"{"private":"synthetic-private-body"}"#,
+                    None,
+                    Some(HoseiAuthError::ApiVerificationFailed),
+                ),
+                (
+                    200,
+                    "synthetic-private-body",
+                    None,
+                    Some(HoseiAuthError::ApiVerificationFailed),
+                ),
+            ] {
+                let mut flow = FullFlow::new(false);
+                let mut courses = flow.exchanges[2].pop().unwrap();
+                courses.status = status;
+                courses.body = api_body.to_owned();
+                if let Some(location) = location {
+                    courses.response_headers[0].1 = "text/html".to_owned();
+                    courses
+                        .response_headers
+                        .push(("Location", location.to_owned()));
+                }
+                flow.exchanges[2].truncate(index + 1);
+                let response = &mut flow.exchanges[2][index];
+                response.status = 200;
+                response.body = body.to_owned();
+                response
+                    .response_headers
+                    .retain(|(name, _)| *name != "Location");
+                // The next permitted request is the fixed courses API, not a guessed target.
+                flow.exchanges[2].push(courses);
+                let result = flow.run(&HoseiAuthenticator::new(), expected_error.is_none());
+                if let Some(expected) = expected_error {
+                    let error = result
+                        .err()
+                        .expect("API verification must reject this response");
+                    assert_eq!(error, expected);
+                    assert_safe(error);
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn webclass_redirect_http_errors_still_stop_before_api_verification() {
+    for status in [403, 500] {
+        for index in [0, 1] {
+            let mut flow = FullFlow::new(false);
+            flow.exchanges[2].truncate(index + 1);
+            let response = &mut flow.exchanges[2][index];
+            response.status = status;
+            response.body = SECRETS.join(" ");
+            let error = flow
+                .run(&HoseiAuthenticator::new(), false)
+                .err()
+                .expect("HTTP errors must stop navigation without API verification");
+            assert_eq!(
+                error,
+                HoseiAuthError::HttpStatus(
+                    AuthStep::WebClassRedirect,
+                    StatusCode::from_u16(status).unwrap(),
+                )
+            );
+            assert_safe(error);
+        }
+    }
+}
+
+#[test]
+fn webclass_200_without_js_redirect_still_reaches_api_verification() {
+    for content_type in ["text/html", "application/json", "application/octet-stream"] {
+        let mut flow = FullFlow::new(false);
+        let courses = flow.exchanges[2].pop().unwrap();
+        flow.exchanges[2].truncate(1);
+        let response = &mut flow.exchanges[2][0];
+        response.status = 200;
+        response.body = "<p>synthetic-private-body</p>".to_owned();
+        response
+            .response_headers
+            .retain(|(name, _)| *name != "Location" && *name != "Content-Type");
+        response
+            .response_headers
+            .push(("Content-Type", content_type.to_owned()));
+        flow.exchanges[2].push(courses);
+        flow.run(&HoseiAuthenticator::new(), true)
+            .expect("no JS redirect must proceed to API verification");
+    }
+}
+
+#[test]
+fn hoppii_http_failures_identify_the_request_step_without_exposing_secrets() {
+    let location = "/portal/diagnostic?token=synthetic-openam-token&uid=synthetic-uid";
+    for (index, step, after_redirect) in [
+        (1, AuthStep::HoppiiAcs, false),
+        (2, AuthStep::HoppiiPostAcs, false),
+        (2, AuthStep::HoppiiPostAcs, true),
+        (3, AuthStep::HoppiiPortalLoginStart, false),
+        (4, AuthStep::HoppiiPortalLoginRedirect, false),
+        (4, AuthStep::HoppiiPortalLoginRedirect, true),
+        (5, AuthStep::HoppiiPortalVerify, false),
+        (5, AuthStep::HoppiiPortalVerify, true),
+    ] {
+        let mut flow = FullFlow::new(false);
+        flow.exchanges[0].truncate(index + 1);
+        flow.exchanges[2].clear();
+        if after_redirect {
+            flow.exchanges[0][index].status = 302;
+            flow.exchanges[0][index]
+                .response_headers
+                .push(("Location", location.to_owned()));
+            let failure = Exchange::new("GET", location, 403, "");
+            let failure = if step == AuthStep::HoppiiPortalLoginRedirect {
+                failure.header(
+                    "referer",
+                    endpoint(&flow.endpoints.hoppii, PORTAL_PUBLIC).as_str(),
+                )
+            } else {
+                failure.without_referer()
+            };
+            flow.exchanges[0].push(failure);
+        } else {
+            flow.exchanges[0][index].status = 403;
+        }
+        let failure = flow.exchanges[0].last_mut().unwrap();
+        failure.body = SECRETS.join(" ");
+        failure
+            .response_headers
+            .retain(|(name, _)| *name != "Location");
+        failure
+            .response_headers
+            .push(("Location", location.to_owned()));
+        failure.response_headers.push((
+            "Set-Cookie",
+            "private_session=synthetic-cookie; Path=/".to_owned(),
+        ));
+
+        let error = flow
+            .run(&HoseiAuthenticator::new(), false)
+            .err()
+            .expect("HTTP failure must stop the flow");
+        assert_eq!(
+            error,
+            HoseiAuthError::HttpStatus(step, StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("Hosei authentication returned HTTP 403 Forbidden at {step:?}")
+        );
+        assert_safe(error);
+    }
+}
+
+#[test]
 fn hoppii_final_user_page_is_required_before_csso() {
     let mut flow = FullFlow::new(false);
     flow.exchanges[0][5] = Exchange::redirect("GET", USER_PAGE, "/portal/anonymous");
@@ -830,11 +1259,15 @@ fn untrusted_destinations_stop_before_any_outbound_request() {
         (1, AuthStep::IdpToOpenAm),
         (2, AuthStep::OpenAmSuccess),
         (3, AuthStep::Saml),
-        (4, AuthStep::HoppiiSession),
+        (4, AuthStep::HoppiiAcs),
         (5, AuthStep::WebClassSso),
         (6, AuthStep::WebClassRedirect),
         (7, AuthStep::WebClassRedirect),
         (8, AuthStep::Consent),
+        (9, AuthStep::HoppiiPostAcs),
+        (10, AuthStep::HoppiiPortalLoginStart),
+        (11, AuthStep::HoppiiPortalVerify),
+        (12, AuthStep::HoppiiPortalLoginRedirect),
     ] {
         let mut flow = FullFlow::new(case == 8);
         match case {
@@ -901,13 +1334,36 @@ fn untrusted_destinations_stop_before_any_outbound_request() {
                 flow.exchanges[0].truncate(1);
                 flow.exchanges[2].clear();
             }
+            9..=12 => {
+                let index = match case {
+                    9 => 2,
+                    10 => 3,
+                    11 => 5,
+                    12 => 4,
+                    _ => unreachable!(),
+                };
+                flow.exchanges[0][index].status = 302;
+                flow.exchanges[0][index]
+                    .response_headers
+                    .retain(|(name, _)| *name != "Location");
+                flow.exchanges[0][index]
+                    .response_headers
+                    .push(("Location", malicious.clone()));
+                flow.exchanges[0].truncate(index + 1);
+                flow.exchanges[2].clear();
+            }
             _ => unreachable!(),
         }
         let error = flow
             .run(&HoseiAuthenticator::new(), false)
             .err()
             .expect("destination must be blocked");
-        assert_eq!(error, HoseiAuthError::ProtocolChanged(expected));
+        let expected_error = if expected == AuthStep::WebClassRedirect {
+            HoseiAuthError::ProtocolChangedWithReason(expected, ProtocolReason::UnexpectedOrigin)
+        } else {
+            HoseiAuthError::ProtocolChanged(expected)
+        };
+        assert_eq!(error, expected_error);
         assert_safe(error);
         assert_eq!(
             trap.accept().err().unwrap().kind(),
@@ -918,16 +1374,23 @@ fn untrusted_destinations_stop_before_any_outbound_request() {
 
 #[test]
 fn redirect_limits_bound_hoppii_http_and_webclass_http_or_js_loops() {
-    for kind in [0, 1, 2] {
+    for (hoppii_index, js_redirect, expected) in [
+        (Some(1), false, AuthStep::HoppiiPostAcs),
+        (Some(3), false, AuthStep::HoppiiPortalLoginRedirect),
+        (Some(5), false, AuthStep::HoppiiPortalVerify),
+        (None, false, AuthStep::WebClassRedirect),
+        (None, true, AuthStep::WebClassRedirect),
+    ] {
         let mut flow = FullFlow::new(false);
-        let expected = if kind == 0 {
-            AuthStep::HoppiiSession
-        } else {
-            AuthStep::WebClassRedirect
-        };
-        if kind == 0 {
-            flow.exchanges[0].truncate(2);
-            flow.exchanges[0][1].response_headers[1].1 = "/portal/loop".to_owned();
+        if let Some(index) = hoppii_index {
+            flow.exchanges[0].truncate(index + 1);
+            flow.exchanges[0][index].status = 302;
+            flow.exchanges[0][index]
+                .response_headers
+                .retain(|(name, _)| *name != "Location");
+            flow.exchanges[0][index]
+                .response_headers
+                .push(("Location", "/portal/loop".to_owned()));
             flow.exchanges[0].extend(
                 (0..MAX_REDIRECTS)
                     .map(|_| Exchange::redirect("GET", "/portal/loop", "/portal/loop")),
@@ -937,7 +1400,7 @@ fn redirect_limits_bound_hoppii_http_and_webclass_http_or_js_loops() {
             flow.exchanges[2].truncate(1);
             flow.exchanges[2][0].response_headers[1].1 = "/webclass/loop".to_owned();
             flow.exchanges[2].extend((0..MAX_REDIRECTS).map(|_| {
-                if kind == 1 {
+                if !js_redirect {
                     Exchange::redirect("GET", "/webclass/loop", "/webclass/loop")
                 } else {
                     Exchange::new(

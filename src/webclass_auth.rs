@@ -73,13 +73,35 @@ pub enum AuthStep {
     OpenAmSuccess,
     Saml,
     Consent,
-    HoppiiSession,
+    /// SAML form POST to the HOPPII ACS and validation of its response.
+    HoppiiAcs,
+    /// GET redirects following the HOPPII ACS response.
+    HoppiiPostAcs,
+    /// Initial portal login GET and validation of its response.
+    HoppiiPortalLoginStart,
+    /// GET redirects following the initial portal login response.
+    HoppiiPortalLoginRedirect,
+    /// Portal user-page verification GET and its subsequent GET redirects.
+    HoppiiPortalVerify,
     WebClassSso,
     WebClassRedirect,
     ApiVerification,
 }
 
-/// Contains only fixed categories, steps and HTTP status codes, never transport causes.
+/// Fixed WebClass redirect failure reasons; no server-provided data is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolReason {
+    UnexpectedSuccessStatus,
+    /// Location is absent, blank, or cannot be read as a header string.
+    MissingLocation,
+    BodyDecode,
+    InvalidJsRedirect,
+    InvalidTarget,
+    UnexpectedOrigin,
+    UserInfo,
+}
+
+/// Contains only fixed categories, steps, reasons and HTTP status codes, never transport causes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoseiAuthError {
     ClientInitialization,
@@ -87,6 +109,7 @@ pub enum HoseiAuthError {
     Request(AuthStep),
     HttpStatus(AuthStep, StatusCode),
     ProtocolChanged(AuthStep),
+    ProtocolChangedWithReason(AuthStep, ProtocolReason),
     RedirectLimit(AuthStep),
     ConsentFailed,
     HoppiiSessionFailed,
@@ -104,6 +127,12 @@ impl fmt::Display for HoseiAuthError {
             }
             Self::ProtocolChanged(step) => {
                 write!(f, "unexpected Hosei authentication protocol at {step:?}")
+            }
+            Self::ProtocolChangedWithReason(step, reason) => {
+                write!(
+                    f,
+                    "unexpected Hosei authentication protocol at {step:?}: {reason:?}"
+                )
             }
             Self::RedirectLimit(step) => {
                 write!(f, "Hosei authentication redirect limit reached at {step:?}")
@@ -336,16 +365,21 @@ impl<'a> AuthSession<'a> {
             resolve_destination(&base, form.action(), &self.endpoints.hoppii, AuthStep::Saml)?;
         let response = send(
             self.http.post(action).form(&form_pairs(&form)),
-            AuthStep::Saml,
+            AuthStep::HoppiiAcs,
         )?;
         if !matches!(
             response.status(),
             StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
         ) {
-            require_ok(&response, AuthStep::Saml)?;
-            return Err(HoseiAuthError::ProtocolChanged(AuthStep::Saml));
+            require_ok(&response, AuthStep::HoppiiAcs)?;
+            return Err(HoseiAuthError::ProtocolChanged(AuthStep::HoppiiAcs));
         }
-        self.follow_hoppii_get_redirects(response)?;
+        self.follow_hoppii_get_redirects(
+            response,
+            AuthStep::HoppiiAcs,
+            AuthStep::HoppiiPostAcs,
+            None,
+        )?;
         Ok(())
     }
 
@@ -405,41 +439,62 @@ impl<'a> AuthSession<'a> {
     }
 
     /// Only bounded same-origin GETs; never replay a SAML POST on a redirect.
+    /// A fixed Referer is supplied only for the portal login redirect chain.
     fn follow_hoppii_get_redirects(
         &self,
         mut response: Response,
+        mut response_step: AuthStep,
+        redirect_step: AuthStep,
+        fixed_referer: Option<&Url>,
     ) -> Result<Response, HoseiAuthError> {
         for followed in 0..=MAX_REDIRECTS {
             if !is_redirect(response.status()) {
-                require_ok(&response, AuthStep::HoppiiSession)?;
+                require_ok(&response, response_step)?;
                 return Ok(response);
             }
-            let target =
-                redirect_destination(&response, &self.endpoints.hoppii, AuthStep::HoppiiSession)?;
+            let target = redirect_destination(&response, &self.endpoints.hoppii, response_step)?;
             if followed == MAX_REDIRECTS {
-                return Err(HoseiAuthError::RedirectLimit(AuthStep::HoppiiSession));
+                return Err(HoseiAuthError::RedirectLimit(response_step));
             }
-            response = send(self.http.get(target), AuthStep::HoppiiSession)?;
+            let request = self.http.get(target);
+            let request = if let Some(referer) = fixed_referer {
+                request.header(REFERER, referer.as_str())
+            } else {
+                request
+            };
+            response = send(request, redirect_step)?;
+            response_step = redirect_step;
         }
         unreachable!("bounded loop returns at the limit")
     }
 
     fn establish_hoppii_session(&self) -> Result<(), HoseiAuthError> {
         let origin = &self.endpoints.hoppii;
+        let login_referer = endpoint(origin, PORTAL_PUBLIC);
         let response = send(
             self.http
                 .get(endpoint(origin, PORTAL_LOGIN))
-                .header(REFERER, endpoint(origin, PORTAL_PUBLIC).as_str()),
-            AuthStep::HoppiiSession,
+                .header(REFERER, login_referer.as_str()),
+            AuthStep::HoppiiPortalLoginStart,
         )?;
-        self.follow_hoppii_get_redirects(response)?;
+        self.follow_hoppii_get_redirects(
+            response,
+            AuthStep::HoppiiPortalLoginStart,
+            AuthStep::HoppiiPortalLoginRedirect,
+            Some(&login_referer),
+        )?;
         let response = send(
             self.http
                 .get(endpoint(origin, USER_PAGE))
                 .header(REFERER, endpoint(origin, PORTAL_LOGIN).as_str()),
-            AuthStep::HoppiiSession,
+            AuthStep::HoppiiPortalVerify,
         )?;
-        let response = self.follow_hoppii_get_redirects(response)?;
+        let response = self.follow_hoppii_get_redirects(
+            response,
+            AuthStep::HoppiiPortalVerify,
+            AuthStep::HoppiiPortalVerify,
+            None,
+        )?;
         if response.url().path() != USER_PAGE {
             return Err(HoseiAuthError::HoppiiSessionFailed);
         }
@@ -492,12 +547,19 @@ impl<'a> AuthSession<'a> {
                 )?)
             } else {
                 let text = read_ok(response, step)?;
-                parse_webclass_js_redirect(&text)
-                    .map_err(|_| HoseiAuthError::ProtocolChanged(step))?
-                    .map(|location| {
-                        resolve_destination(&base, &location, &self.endpoints.webclass, step)
-                    })
-                    .transpose()?
+                match parse_webclass_js_redirect(&text) {
+                    Ok(Some(location)) => Some(resolve_destination(
+                        &base,
+                        &location,
+                        &self.endpoints.webclass,
+                        step,
+                    )?),
+                    // End uninterpretable navigation; login still requires API verification.
+                    Ok(None) | Err(WebClassAuthParseError::InvalidRedirect) => None,
+                    Err(_) => {
+                        return Err(protocol_changed(step, ProtocolReason::InvalidJsRedirect));
+                    }
+                }
             };
             let Some(target) = target else { return Ok(()) };
             if followed == MAX_REDIRECTS {
@@ -513,6 +575,15 @@ fn endpoint(origin: &Url, path: &str) -> Url {
     origin.join(path).expect("fixed endpoint path")
 }
 
+// Preserve existing error categories outside the WebClass redirect stage.
+fn protocol_changed(step: AuthStep, reason: ProtocolReason) -> HoseiAuthError {
+    if step == AuthStep::WebClassRedirect {
+        HoseiAuthError::ProtocolChangedWithReason(step, reason)
+    } else {
+        HoseiAuthError::ProtocolChanged(step)
+    }
+}
+
 fn resolve_destination(
     base: &Url,
     location: &str,
@@ -521,12 +592,12 @@ fn resolve_destination(
 ) -> Result<Url, HoseiAuthError> {
     let target = base
         .join(location)
-        .map_err(|_| HoseiAuthError::ProtocolChanged(step))?;
-    if target.origin() != origin.origin()
-        || !target.username().is_empty()
-        || target.password().is_some()
-    {
-        return Err(HoseiAuthError::ProtocolChanged(step));
+        .map_err(|_| protocol_changed(step, ProtocolReason::InvalidTarget))?;
+    if target.origin() != origin.origin() {
+        return Err(protocol_changed(step, ProtocolReason::UnexpectedOrigin));
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err(protocol_changed(step, ProtocolReason::UserInfo));
     }
     Ok(target)
 }
@@ -556,7 +627,7 @@ fn redirect_destination(
         .get(LOCATION)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or(HoseiAuthError::ProtocolChanged(step))?;
+        .ok_or_else(|| protocol_changed(step, ProtocolReason::MissingLocation))?;
     resolve_destination(response.url(), location, origin, step)
 }
 
@@ -578,7 +649,10 @@ fn require_ok(response: &Response, step: AuthStep) -> Result<(), HoseiAuthError>
     } else if !response.status().is_success() {
         Err(HoseiAuthError::HttpStatus(step, response.status()))
     } else {
-        Err(HoseiAuthError::ProtocolChanged(step))
+        Err(protocol_changed(
+            step,
+            ProtocolReason::UnexpectedSuccessStatus,
+        ))
     }
 }
 
@@ -587,7 +661,8 @@ fn read_ok(response: Response, step: AuthStep) -> Result<String, HoseiAuthError>
     let bytes = response
         .bytes()
         .map_err(|error| transport_error(error, step))?;
-    String::from_utf8(bytes.to_vec()).map_err(|_| HoseiAuthError::ProtocolChanged(step))
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| protocol_changed(step, ProtocolReason::BodyDecode))
 }
 
 fn required_query_parameter(
