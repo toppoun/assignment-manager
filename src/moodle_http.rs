@@ -583,7 +583,8 @@ mod tests {
 
         use super::*;
         use crate::domain::{
-            Assignment, AssignmentId, CompletionState, Deadline, SubmissionTarget,
+            Assignment, AssignmentId, ClassSlot, CompletionState, DayOfWeek, Deadline,
+            ScheduleEntry, SubmissionTarget,
         };
         use crate::import::ExternalRecordKey;
         use crate::observation::SyncScope;
@@ -649,6 +650,16 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let feed = local_feed(listener.local_addr().unwrap());
                 Self { feed, listener }
+            }
+
+            fn with_contract(scope: &str, kind: MoodleExportKind) -> Self {
+                let mut mock = Self::new();
+                let mut feed =
+                    MoodleFeed::new(scope, kind, "https://example.invalid/calendar/export")
+                        .unwrap();
+                feed.url = mock.feed.url.clone();
+                mock.feed = feed;
+                mock
             }
 
             fn sync(
@@ -742,6 +753,366 @@ mod tests {
             DateTime::parse_from_rfc3339(value)
                 .unwrap()
                 .with_timezone(&Utc)
+        }
+
+        fn calendar(records: &[(&str, &str, &str)]) -> String {
+            let mut body = "BEGIN:VCALENDAR\nVERSION:2.0\n".to_owned();
+            for (uid, summary, categories) in records {
+                body.push_str(&format!("BEGIN:VEVENT\nUID:{uid}\nSUMMARY:{summary}\nDTSTART:20261004T145900Z\n{categories}\nEND:VEVENT\n"));
+            }
+            body.push_str("END:VCALENDAR\n");
+            body
+        }
+
+        #[test]
+        fn discovery_links_only_candidates_reuses_categories_and_separates_feed_scopes() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            let body = calendar(&[
+                ("a", "「Report」の提出期限", r"CATEGORIES: 2026\,DB "),
+                ("b", "「Report」の提出期限", r"CATEGORIES: 2026\,DB "),
+                ("c", "「Report」の提出期限", "CATEGORIES:Other"),
+                (
+                    "filtered",
+                    "Report の受験可能期間の開始",
+                    "CATEGORIES:UnusedStart",
+                ),
+                ("unknown", "Report テスト予定", "CATEGORIES:UnusedUnknown"),
+            ]);
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", &body)
+                    .unwrap()
+                    .created,
+                3
+            );
+            let a = stored(&store, "a");
+            let b = stored(&store, "b");
+            let c = stored(&store, "c");
+            assert!(a.course_id.is_some());
+            assert_eq!(a.course_id, b.course_id);
+            assert_ne!(a.course_id, c.course_id);
+            let course = store
+                .get_course(a.course_id.as_ref().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(course.name, " 2026,DB ");
+            assert!(course.schedule.is_empty());
+            assert_eq!(
+                store.find_moodle_course_id(SCOPE, " 2026,DB ").unwrap(),
+                a.course_id
+            );
+            assert_eq!(store.find_moodle_course_id(SCOPE, "2026,DB").unwrap(), None);
+            let initial = domain_snapshot(&observer);
+            assert_eq!(initial[0].len(), 3);
+            assert_eq!(initial[2].len(), 2);
+            assert_eq!(initial[3].len(), 2);
+            for category in ["UnusedStart", "UnusedUnknown"] {
+                assert_eq!(store.find_moodle_course_id(SCOPE, category).unwrap(), None);
+            }
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", &body)
+                    .unwrap()
+                    .unchanged,
+                3
+            );
+            assert_eq!(domain_snapshot(&observer), initial);
+            let other =
+                SyncMock::with_contract("other.course-related", MoodleExportKind::CourseRelated);
+            let body = calendar(&[("a", "「Report」の提出期限", r"CATEGORIES: 2026\,DB ")]);
+            assert_eq!(
+                other
+                    .sync(&client, &mut store, "200 OK", &body)
+                    .unwrap()
+                    .created,
+                1
+            );
+            let other_key = ExternalRecordKey {
+                scope: other.feed.scope().into(),
+                ..key("a")
+            };
+            let other_assignment = store
+                .find_assignment_by_external_key(&other_key)
+                .unwrap()
+                .unwrap();
+            assert!(other_assignment.course_id.is_some());
+            assert_ne!(other_assignment.course_id, a.course_id);
+            assert_ne!(other_assignment.id, a.id);
+            assert_eq!(domain_snapshot(&observer)[2].len(), 3);
+            assert_eq!(
+                other
+                    .sync(&client, &mut store, "200 OK", &body)
+                    .unwrap()
+                    .unchanged,
+                1
+            );
+            assert_eq!(stored(&store, "a"), a);
+        }
+
+        #[test]
+        fn existing_moodle_binding_keeps_name_schedule_and_does_not_merge_webclass() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            let schedule = vec![
+                ScheduleEntry::Timetabled(ClassSlot {
+                    day: DayOfWeek::Tuesday,
+                    period: 4,
+                }),
+                ScheduleEntry::OnDemand,
+            ];
+            let webclass = store
+                .create_course_with_source(
+                    "データベース",
+                    schedule.clone(),
+                    OriginKind::WebClass,
+                    "default",
+                    "Java2-2026",
+                )
+                .unwrap();
+            let moodle = store
+                .create_course_with_source(
+                    "データベース",
+                    schedule,
+                    OriginKind::Moodle,
+                    SCOPE,
+                    "Java2-2026",
+                )
+                .unwrap();
+            let before = snapshot(&observer);
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", BASIC)
+                    .unwrap()
+                    .created,
+                1
+            );
+            assert_eq!(
+                stored(&store, "1001@cms.example.edu").course_id,
+                Some(moodle.id.clone())
+            );
+            assert_ne!(webclass.id, moodle.id);
+            assert_eq!(store.get_course(&moodle.id).unwrap(), Some(moodle.clone()));
+            assert_eq!(store.get_course(&webclass.id).unwrap(), Some(webclass));
+            let after = snapshot(&observer);
+            assert_eq!(after[2], before[2]);
+            assert_eq!(after[3], before[3]);
+            assert_eq!(after[4], before[4]);
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", BASIC)
+                    .unwrap()
+                    .unchanged,
+                1
+            );
+            drop(store);
+            let store = SqliteStore::open(db.path()).unwrap();
+            assert_eq!(
+                store.find_moodle_course_id(SCOPE, "Java2-2026").unwrap(),
+                Some(moodle.id)
+            );
+        }
+
+        #[test]
+        fn current_feed_discovers_separate_course_from_legacy_moodle_binding() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let legacy = store
+                .create_course_with_source(
+                    "Historical course",
+                    vec![ScheduleEntry::OnDemand],
+                    OriginKind::Moodle,
+                    crate::persistence::LEGACY_COURSE_SOURCE_SCOPE,
+                    "Java2-2026",
+                )
+                .unwrap();
+            let mock = SyncMock::new();
+            mock.sync(&MoodleClient::new().unwrap(), &mut store, "200 OK", BASIC)
+                .unwrap();
+            let current = stored(&store, "1001@cms.example.edu").course_id.unwrap();
+            assert_ne!(current, legacy.id);
+            assert_eq!(
+                store.find_moodle_course_id(SCOPE, "Java2-2026").unwrap(),
+                Some(current)
+            );
+            assert_eq!(store.get_course(&legacy.id).unwrap(), Some(legacy));
+            assert_eq!(snapshot(&observer)[2].len(), 2);
+        }
+
+        #[test]
+        fn category_changes_relink_and_unresolved_metadata_preserves_latest_relation() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            mock.sync(&client, &mut store, "200 OK", BASIC).unwrap();
+            let original = stored(&store, "1001@cms.example.edu");
+            let changed = BASIC.replace("CATEGORIES:Java2-2026", "CATEGORIES:2026-DB-new");
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", &changed)
+                    .unwrap()
+                    .updated,
+                1
+            );
+            let updated = stored(&store, "1001@cms.example.edu");
+            assert_eq!(original.id, updated.id);
+            assert_ne!(original.course_id, updated.course_id);
+            assert_eq!(
+                updated.course_id,
+                store.find_moodle_course_id(SCOPE, "2026-DB-new").unwrap()
+            );
+            assert!(
+                store
+                    .get_course(original.course_id.as_ref().unwrap())
+                    .unwrap()
+                    .is_some()
+            );
+            let before = domain_snapshot(&observer);
+            for metadata in [
+                "",
+                "CATEGORIES:",
+                "CATEGORIES: \t ",
+                "CATEGORIES:X,Y",
+                "CATEGORIES:X,X",
+                r"CATEGORIES:X\x",
+            ] {
+                let unresolved = BASIC.replace("CATEGORIES:Java2-2026", metadata);
+                assert_eq!(
+                    mock.sync(&client, &mut store, "200 OK", &unresolved)
+                        .unwrap()
+                        .unchanged,
+                    1
+                );
+                assert_eq!(stored(&store, "1001@cms.example.edu"), updated);
+                assert_eq!(domain_snapshot(&observer), before);
+            }
+        }
+
+        #[test]
+        fn all_events_and_unknown_exports_ignore_usable_course_categories() {
+            for (scope, kind) in [
+                ("campus.all-events", MoodleExportKind::AllEvents),
+                ("campus.unknown", MoodleExportKind::Unknown),
+            ] {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::with_contract(scope, kind);
+                let client = MoodleClient::new().unwrap();
+                assert_eq!(
+                    mock.sync(&client, &mut store, "200 OK", BASIC)
+                        .unwrap()
+                        .created,
+                    1
+                );
+                let external_key = ExternalRecordKey {
+                    scope: scope.into(),
+                    ..key("1001@cms.example.edu")
+                };
+                assert_eq!(
+                    store
+                        .find_assignment_by_external_key(&external_key)
+                        .unwrap()
+                        .unwrap()
+                        .course_id,
+                    None
+                );
+                let rows = snapshot(&observer);
+                assert!(rows[2].is_empty());
+                assert!(rows[3].is_empty());
+                assert!(
+                    store
+                        .get_assignment_last_seen_at(&external_key)
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    store
+                        .get_last_synced_at(&SyncScope::MoodleFeed(scope.into()))
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(
+                    mock.sync(&client, &mut store, "200 OK", BASIC)
+                        .unwrap()
+                        .unchanged,
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn discovery_failure_rolls_back_course_and_leaves_assignment_metadata_untouched() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            let unresolved = BASIC.replace("CATEGORIES:Java2-2026", "");
+            mock.sync(&client, &mut store, "200 OK", &unresolved)
+                .unwrap();
+            observer.execute_batch("CREATE TRIGGER reject_course_binding BEFORE INSERT ON course_sources BEGIN SELECT RAISE(ABORT, NEW.scope || NEW.external_id); END;").unwrap();
+            let before = snapshot(&observer);
+            let error = mock.sync(&client, &mut store, "200 OK", BASIC).unwrap_err();
+            assert_eq!(error, MoodleSyncError::Persistence);
+            assert_safe(error, &db);
+            assert_eq!(snapshot(&observer), before);
+            observer
+                .execute_batch("DROP TRIGGER reject_course_binding")
+                .unwrap();
+            assert_eq!(
+                mock.sync(&client, &mut store, "200 OK", BASIC)
+                    .unwrap()
+                    .updated,
+                1
+            );
+            assert!(stored(&store, "1001@cms.example.edu").course_id.is_some());
+        }
+
+        #[test]
+        fn failed_link_metadata_rolls_back_assignment_relation_seen_and_freshness_but_keeps_discovery()
+         {
+            for failure in [
+                "CREATE TRIGGER reject_link BEFORE UPDATE OF course_id ON assignments BEGIN SELECT RAISE(ABORT, NEW.title); END;",
+                "CREATE TRIGGER reject_seen BEFORE UPDATE OF last_seen_at ON assignment_sources BEGIN SELECT RAISE(ABORT, NEW.external_id); END;",
+                "CREATE TRIGGER reject_scope BEFORE UPDATE ON sync_scopes BEGIN SELECT RAISE(ABORT, NEW.scope); END;",
+            ] {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::new();
+                let client = MoodleClient::new().unwrap();
+                mock.sync(&client, &mut store, "200 OK", BASIC).unwrap();
+                observer.execute_batch(failure).unwrap();
+                let before = snapshot(&observer);
+                let changed = BASIC
+                    .replace("CATEGORIES:Java2-2026", "CATEGORIES:2026-DB-new")
+                    .replace("演習課題01", PRIVATE);
+                let error = mock
+                    .sync(&client, &mut store, "200 OK", &changed)
+                    .unwrap_err();
+                assert_eq!(error, MoodleSyncError::Persistence);
+                assert_safe(error, &db);
+                let after = snapshot(&observer);
+                assert_eq!(after[0], before[0]);
+                assert_eq!(after[1], before[1]);
+                assert_eq!(after[5], before[5]);
+                assert_eq!(after[2].len(), before[2].len() + 1);
+                assert_eq!(after[3].len(), before[3].len() + 1);
+                let discovered = store
+                    .find_moodle_course_id(SCOPE, "2026-DB-new")
+                    .unwrap()
+                    .unwrap();
+                observer.execute_batch("DROP TRIGGER IF EXISTS reject_link; DROP TRIGGER IF EXISTS reject_seen; DROP TRIGGER IF EXISTS reject_scope;").unwrap();
+                assert_eq!(
+                    mock.sync(&client, &mut store, "200 OK", &changed)
+                        .unwrap()
+                        .updated,
+                    1
+                );
+                assert_eq!(
+                    stored(&store, "1001@cms.example.edu").course_id,
+                    Some(discovered)
+                );
+                assert_eq!(snapshot(&observer)[2].len(), after[2].len());
+            }
         }
 
         fn assert_safe(error: MoodleSyncError, db: &TestDatabase) {
@@ -913,7 +1284,7 @@ mod tests {
             let version: i64 = observer
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 2);
+            assert_eq!(version, 3);
         }
 
         #[test]
@@ -997,7 +1368,7 @@ mod tests {
             );
             for assignment in [&end, &deadline] {
                 assert!(assignment.id.as_str().starts_with("a_"));
-                assert_eq!(assignment.course_id, None);
+                assert!(assignment.course_id.is_some());
                 assert_eq!(assignment.submission, SubmissionTarget::Unknown);
                 assert_eq!(assignment.submission_url, None);
                 assert_eq!(assignment.completion, CompletionState::Incomplete);
@@ -1011,7 +1382,9 @@ mod tests {
                 None
             );
             let initial = domain_snapshot(&observer);
-            assert!(initial[2].is_empty());
+            assert_eq!(initial[2].len(), 2);
+            assert_eq!(initial[3].len(), 2);
+            assert_ne!(end.course_id, deadline.course_id);
             assert_eq!(
                 mock.sync(&client, &mut store, "200 OK", MULTIPLE).unwrap(),
                 AssignmentImportSummary {
@@ -1184,7 +1557,14 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error, MoodleSyncError::Persistence);
             assert_safe(error, &db);
-            assert_eq!(snapshot(&observer), before);
+            let after = snapshot(&observer);
+            // Discovery of the later candidate's course committed before import.
+            assert_eq!(after[0], before[0]);
+            assert_eq!(after[1], before[1]);
+            assert_eq!(after[2].len(), before[2].len() + 1);
+            assert_eq!(after[3].len(), before[3].len() + 1);
+            assert_eq!(after[4], before[4]);
+            assert_eq!(after[5], before[5]);
             assert_eq!(
                 store
                     .find_assignment_by_external_key(&key(PRIVATE))

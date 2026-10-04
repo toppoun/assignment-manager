@@ -987,6 +987,7 @@ mod tests {
                                 "Synthetic course",
                                 vec![],
                                 OriginKind::WebClass,
+                                "default",
                                 GROUP,
                             )
                             .unwrap()
@@ -1524,7 +1525,7 @@ mod tests {
 
             fn discovered(store: &SqliteStore, group: &str) -> Course {
                 store
-                    .find_course_by_source(OriginKind::WebClass, group)
+                    .find_course_by_source(OriginKind::WebClass, "default", group)
                     .unwrap()
                     .unwrap()
             }
@@ -1653,6 +1654,7 @@ mod tests {
                             ScheduleEntry::OnDemand,
                         ],
                         OriginKind::WebClass,
+                        "default",
                         &group,
                     )
                     .unwrap();
@@ -1736,6 +1738,7 @@ mod tests {
                         "Existing course",
                         vec![],
                         OriginKind::WebClass,
+                        "default",
                         GROUP,
                     )
                     .unwrap();
@@ -1972,7 +1975,11 @@ mod tests {
                     assert_ne!(a.id, b.id);
                     assert_eq!(
                         store
-                            .find_course_by_source(OriginKind::WebClass, "fixture-course-003")
+                            .find_course_by_source(
+                                OriginKind::WebClass,
+                                "default",
+                                "fixture-course-003"
+                            )
                             .unwrap(),
                         None
                     );
@@ -2113,7 +2120,7 @@ mod tests {
                 for group in [GROUP, "fixture-course-003"] {
                     assert_eq!(
                         store
-                            .find_course_by_source(OriginKind::WebClass, group)
+                            .find_course_by_source(OriginKind::WebClass, "default", group)
                             .unwrap(),
                         None
                     );

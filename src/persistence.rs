@@ -1,9 +1,10 @@
-//! SQLite schema v2, validated import, positive observation and local completion.
+//! SQLite schema v3, scoped course bindings, validated import and positive observation.
 //!
 //! Bindings accept non-secret logical identifiers only. Authentication values and
 //! feed URLs must never be passed as identities. Import batches are not source
 //! snapshots: absent candidates never trigger deletion or presence updates.
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -19,7 +20,11 @@ use crate::domain::{
 use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
 use crate::observation::{AssignmentObservation, SyncScope, WebClassCourseListObservation};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+/// WebClass course identities use the existing single-profile namespace.
+pub const DEFAULT_COURSE_SOURCE_SCOPE: &str = "default";
+/// Unscoped historical Moodle/Manual bindings are preserved outside feed namespaces.
+pub const LEGACY_COURSE_SOURCE_SCOPE: &str = "legacy";
 const ID_INSERT_ATTEMPTS: usize = 4;
 const TABLES: [&str; 6] = [
     "courses",
@@ -113,6 +118,27 @@ CREATE TABLE sync_scopes (
 ) STRICT;
 "#;
 
+// Rebuild in the migration transaction: a failed copy/DDL restores the v2 table.
+// Never infer a current Moodle feed from historical unscoped bindings.
+const SCHEMA_V3_UPGRADE: &str = r#"
+CREATE TABLE course_sources_v3 (
+    course_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY
+        REFERENCES courses(id) ON DELETE CASCADE,
+    origin TEXT COLLATE BINARY NOT NULL CHECK (origin IN ('moodle', 'webclass', 'manual')),
+    scope TEXT COLLATE BINARY NOT NULL CHECK (scope <> ''),
+    external_id TEXT COLLATE BINARY NOT NULL CHECK (external_id <> ''),
+    UNIQUE (origin, scope, external_id)
+) STRICT;
+
+INSERT INTO course_sources_v3 (course_id, origin, scope, external_id)
+SELECT course_id, origin,
+    CASE origin WHEN 'webclass' THEN 'default' ELSE 'legacy' END,
+    external_id
+FROM course_sources;
+DROP TABLE course_sources;
+ALTER TABLE course_sources_v3 RENAME TO course_sources;
+"#;
+
 /// Fixed classifications only. Paths, SQL, row values and driver causes are discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceError {
@@ -126,6 +152,7 @@ pub enum PersistenceError {
     IdGenerationFailed,
     InvalidExternalIdentity,
     ObservationValidation,
+    CourseResolutionValidation,
     EntityAlreadyBound,
     ExternalIdentityAlreadyBound,
     NotFound,
@@ -144,6 +171,7 @@ impl fmt::Display for PersistenceError {
             Self::IdGenerationFailed => "could not allocate an internal ID",
             Self::InvalidExternalIdentity => "external identity is empty or whitespace-only",
             Self::ObservationValidation => "invalid source observation or candidate subset",
+            Self::CourseResolutionValidation => "invalid explicit Moodle course resolution",
             Self::EntityAlreadyBound => "entity already has a source binding",
             Self::ExternalIdentityAlreadyBound => "external identity already has a binding",
             Self::NotFound => "binding target does not exist",
@@ -169,6 +197,31 @@ pub struct AssignmentImportSummary {
     pub created: usize,
     pub updated: usize,
     pub unchanged: usize,
+}
+
+/// Explicit Moodle resolution, supplied separately from assignment candidates.
+/// The decoded event category is retained exactly so persistence can check the
+/// binding's external ID as well as its origin, scope and internal CourseId.
+/// Construction is unchecked; the import boundary validates every map entry.
+#[derive(Clone)]
+pub struct MoodleCourseResolution {
+    course_id: CourseId,
+    category: String,
+}
+
+impl MoodleCourseResolution {
+    pub fn new(course_id: CourseId, category: impl Into<String>) -> Self {
+        Self {
+            course_id,
+            category: category.into(),
+        }
+    }
+}
+
+impl fmt::Debug for MoodleCourseResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MoodleCourseResolution")
+    }
 }
 
 /// Concrete synchronous SQLite store. The caller chooses the database path.
@@ -266,24 +319,26 @@ impl SqliteStore {
 
     /// Atomically create a course, schedule and source binding. `external_id` must
     /// be a non-secret logical course ID (WebClass uses its opaque `group_id`).
-    /// Moodle feed labels are assignment scopes, not course identifiers.
+    /// Moodle uses its safe feed scope and the decoded category as external ID.
     pub fn create_course_with_source(
         &mut self,
         name: impl Into<String>,
         schedule: Vec<ScheduleEntry>,
         origin: OriginKind,
+        scope: &str,
         external_id: &str,
     ) -> Result<Course, PersistenceError> {
-        self.create_course_inner(name.into(), schedule, Some((origin, external_id)))
+        self.create_course_inner(name.into(), schedule, Some((origin, scope, external_id)))
     }
 
     fn create_course_inner(
         &mut self,
         name: String,
         schedule: Vec<ScheduleEntry>,
-        source: Option<(OriginKind, &str)>,
+        source: Option<(OriginKind, &str, &str)>,
     ) -> Result<Course, PersistenceError> {
-        if let Some((_, external_id)) = source {
+        if let Some((_, scope, external_id)) = source {
+            validate_external_identity(scope)?;
             validate_external_identity(external_id)?;
         }
         let tx = self.conn.transaction().map_err(database_error)?;
@@ -302,8 +357,8 @@ impl SqliteStore {
             },
         )?;
         insert_course_schedule(&tx, &course)?;
-        if let Some((origin, external_id)) = source {
-            insert_course_binding(&tx, &course.id, origin, external_id)?;
+        if let Some((origin, scope, external_id)) = source {
+            insert_course_binding(&tx, &course.id, origin, scope, external_id)?;
         }
         tx.commit().map_err(database_error)?;
         Ok(course)
@@ -340,23 +395,27 @@ impl SqliteStore {
         &mut self,
         id: &CourseId,
         origin: OriginKind,
+        scope: &str,
         external_id: &str,
     ) -> Result<(), PersistenceError> {
+        validate_external_identity(scope)?;
         validate_external_identity(external_id)?;
         let tx = self.conn.transaction().map_err(database_error)?;
-        insert_course_binding(&tx, id, origin, external_id)?;
+        insert_course_binding(&tx, id, origin, scope, external_id)?;
         tx.commit().map_err(database_error)
     }
 
-    /// Find a course and schedule by exact origin and non-secret external course ID.
+    /// Find a course and schedule by exact origin, scope and non-secret external ID.
     pub fn find_course_by_source(
         &self,
         origin: OriginKind,
+        scope: &str,
         external_id: &str,
     ) -> Result<Option<Course>, PersistenceError> {
+        validate_external_identity(scope)?;
         validate_external_identity(external_id)?;
         let tx = self.conn.unchecked_transaction().map_err(database_error)?;
-        let course = find_course_by_source_tx(&tx, origin, external_id)?;
+        let course = find_course_by_source_tx(&tx, origin, scope, external_id)?;
         tx.commit().map_err(database_error)?;
         Ok(course)
     }
@@ -367,7 +426,18 @@ impl SqliteStore {
         group_id: &str,
     ) -> Result<Option<CourseId>, PersistenceError> {
         Ok(self
-            .find_course_by_source(OriginKind::WebClass, group_id)?
+            .find_course_by_source(OriginKind::WebClass, DEFAULT_COURSE_SOURCE_SCOPE, group_id)?
+            .map(|course| course.id))
+    }
+
+    /// Resolve an exact safe Moodle feed scope and decoded, opaque category.
+    pub fn find_moodle_course_id(
+        &self,
+        feed_scope: &str,
+        category: &str,
+    ) -> Result<Option<CourseId>, PersistenceError> {
+        Ok(self
+            .find_course_by_source(OriginKind::Moodle, feed_scope, category)?
             .map(|course| course.id))
     }
 
@@ -397,7 +467,7 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         let timestamp = encode_timestamp(&Utc::now());
-        let summary = import_assignment_batch_tx(&tx, batch, &timestamp, None)?;
+        let summary = import_assignment_batch_tx(&tx, batch, &timestamp, None, None)?;
         tx.commit().map_err(database_error)?;
         Ok(summary)
     }
@@ -416,6 +486,34 @@ impl SqliteStore {
         observation: &AssignmentObservation,
         observed_at: DateTime<Utc>,
     ) -> Result<AssignmentImportSummary, PersistenceError> {
+        self.import_assignment_batch_with_observation_inner(batch, observation, None, observed_at)
+    }
+
+    /// Commit explicit Moodle course links with assignment changes and observation.
+    /// Every resolution must refer to a Moodle candidate in this batch and its
+    /// exact source binding. Missing entries preserve existing course relations.
+    pub fn import_assignment_batch_with_observation_and_courses(
+        &mut self,
+        batch: &AssignmentCandidateBatch,
+        observation: &AssignmentObservation,
+        resolutions: &HashMap<ExternalRecordKey, MoodleCourseResolution>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<AssignmentImportSummary, PersistenceError> {
+        self.import_assignment_batch_with_observation_inner(
+            batch,
+            observation,
+            Some(resolutions),
+            observed_at,
+        )
+    }
+
+    fn import_assignment_batch_with_observation_inner(
+        &mut self,
+        batch: &AssignmentCandidateBatch,
+        observation: &AssignmentObservation,
+        resolutions: Option<&HashMap<ExternalRecordKey, MoodleCourseResolution>>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<AssignmentImportSummary, PersistenceError> {
         observation
             .validate_candidates(batch)
             .map_err(|_| PersistenceError::ObservationValidation)?;
@@ -424,7 +522,8 @@ impl SqliteStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let summary = import_assignment_batch_tx(&tx, batch, &timestamp, Some(&timestamp))?;
+        let summary =
+            import_assignment_batch_tx(&tx, batch, &timestamp, Some(&timestamp), resolutions)?;
         for key in observation.keys() {
             // Validate old metadata before overwriting it; LEFT JOIN also detects
             // orphan bindings. Zero matches are valid for never-imported records.
@@ -515,14 +614,21 @@ fn import_assignment_batch_tx(
     batch: &AssignmentCandidateBatch,
     timestamp: &str,
     last_seen_at: Option<&str>,
+    resolutions: Option<&HashMap<ExternalRecordKey, MoodleCourseResolution>>,
 ) -> Result<AssignmentImportSummary, PersistenceError> {
+    if let Some(resolutions) = resolutions {
+        validate_moodle_course_resolutions(conn, batch, resolutions)?;
+    }
     let mut summary = AssignmentImportSummary::default();
     for candidate in batch.as_slice() {
         let resolved_course_id = match candidate.external_key.origin {
             OriginKind::WebClass => {
                 find_webclass_course_id_tx(conn, &candidate.external_key.scope)?
             }
-            OriginKind::Moodle | OriginKind::Manual => None,
+            OriginKind::Moodle => resolutions
+                .and_then(|values| values.get(&candidate.external_key))
+                .map(|value| value.course_id.clone()),
+            OriginKind::Manual => None,
         };
         if let Some(mut assignment) =
             find_assignment_by_external_key_tx(conn, &candidate.external_key)?
@@ -550,6 +656,32 @@ fn import_assignment_batch_tx(
         }
     }
     Ok(summary)
+}
+
+fn validate_moodle_course_resolutions(
+    conn: &Connection,
+    batch: &AssignmentCandidateBatch,
+    resolutions: &HashMap<ExternalRecordKey, MoodleCourseResolution>,
+) -> Result<(), PersistenceError> {
+    let keys: HashSet<_> = batch
+        .as_slice()
+        .iter()
+        .map(|value| &value.external_key)
+        .collect();
+    for (key, resolution) in resolutions {
+        if !keys.contains(key)
+            || key.origin != OriginKind::Moodle
+            || resolution.category.trim().is_empty()
+        {
+            return Err(PersistenceError::CourseResolutionValidation);
+        }
+        let course =
+            find_course_by_source_tx(conn, OriginKind::Moodle, &key.scope, &resolution.category)?;
+        if course.as_ref().map(|value| &value.id) != Some(&resolution.course_id) {
+            return Err(PersistenceError::CourseResolutionValidation);
+        }
+    }
+    Ok(())
 }
 
 fn assignment_last_seen_at_tx(
@@ -655,14 +787,15 @@ fn find_assignment_by_external_key_tx(
 fn find_course_by_source_tx(
     conn: &Connection,
     origin: OriginKind,
+    scope: &str,
     external_id: &str,
 ) -> Result<Option<Course>, PersistenceError> {
     let stored = conn
         .query_one(
             "SELECT c.id, c.name, c.created_at, c.updated_at
          FROM course_sources s LEFT JOIN courses c ON c.id = s.course_id
-         WHERE s.origin = ?1 AND s.external_id = ?2",
-            params![encode_origin(origin), external_id],
+         WHERE s.origin = ?1 AND s.scope = ?2 AND s.external_id = ?3",
+            params![encode_origin(origin), scope, external_id],
             StoredCourse::from_row,
         )
         .optional()
@@ -674,7 +807,13 @@ fn find_webclass_course_id_tx(
     conn: &Connection,
     group_id: &str,
 ) -> Result<Option<CourseId>, PersistenceError> {
-    Ok(find_course_by_source_tx(conn, OriginKind::WebClass, group_id)?.map(|course| course.id))
+    Ok(find_course_by_source_tx(
+        conn,
+        OriginKind::WebClass,
+        DEFAULT_COURSE_SOURCE_SCOPE,
+        group_id,
+    )?
+    .map(|course| course.id))
 }
 
 fn insert_new_assignment_tx(
@@ -841,11 +980,12 @@ fn insert_course_binding(
     conn: &Connection,
     id: &CourseId,
     origin: OriginKind,
+    scope: &str,
     external_id: &str,
 ) -> Result<(), PersistenceError> {
     conn.execute(
-        "INSERT INTO course_sources (course_id, origin, external_id) VALUES (?1, ?2, ?3)",
-        params![id.as_str(), encode_origin(origin), external_id],
+        "INSERT INTO course_sources (course_id, origin, scope, external_id) VALUES (?1, ?2, ?3, ?4)",
+        params![id.as_str(), encode_origin(origin), scope, external_id],
     )
     .map_err(binding_error)?;
     Ok(())
@@ -912,12 +1052,23 @@ fn migrate(conn: &mut Connection) -> Result<(), PersistenceError> {
                 .map_err(|_| PersistenceError::Migration)?;
             tx.execute_batch(SCHEMA_V2_UPGRADE)
                 .map_err(|_| PersistenceError::Migration)?;
+            tx.execute_batch(SCHEMA_V3_UPGRADE)
+                .map_err(|_| PersistenceError::Migration)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|_| PersistenceError::Migration)?;
         }
         1 => {
             validate_schema_tables(&tx, &TABLES[..5])?;
             tx.execute_batch(SCHEMA_V2_UPGRADE)
+                .map_err(|_| PersistenceError::Migration)?;
+            tx.execute_batch(SCHEMA_V3_UPGRADE)
+                .map_err(|_| PersistenceError::Migration)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|_| PersistenceError::Migration)?;
+        }
+        2 => {
+            validate_schema_tables(&tx, &TABLES)?;
+            tx.execute_batch(SCHEMA_V3_UPGRADE)
                 .map_err(|_| PersistenceError::Migration)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|_| PersistenceError::Migration)?;
@@ -928,7 +1079,9 @@ fn migrate(conn: &mut Connection) -> Result<(), PersistenceError> {
         v if v > SCHEMA_VERSION => return Err(PersistenceError::UnsupportedSchemaVersion),
         _ => return Err(PersistenceError::Migration),
     }
-    // Reject a v2 marker with missing metadata columns without mutating the DB.
+    // Reject version markers with missing required columns without committing changes.
+    tx.prepare("SELECT course_id, origin, scope, external_id FROM course_sources LIMIT 0")
+        .map_err(|_| PersistenceError::Migration)?;
     tx.prepare("SELECT last_seen_at FROM assignment_sources LIMIT 0")
         .map_err(|_| PersistenceError::Migration)?;
     tx.prepare("SELECT kind, scope, last_synced_at FROM sync_scopes LIMIT 0")
@@ -1342,7 +1495,7 @@ mod tests {
     #[test]
     fn empty_database_migrates_to_six_strict_tables_and_index() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 3);
         let table_count: i64 = store.conn.query_row(
             "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*'",
             [], |row| row.get(0),
@@ -1404,7 +1557,7 @@ mod tests {
         let temp = TempDb::new();
         {
             let conn = Connection::open(&temp.path).unwrap();
-            conn.execute_batch("CREATE TABLE future_data (value TEXT); PRAGMA user_version = 3")
+            conn.execute_batch("CREATE TABLE future_data (value TEXT); PRAGMA user_version = 4")
                 .unwrap();
             conn.execute("INSERT INTO future_data VALUES (?1)", [PRIVATE])
                 .unwrap();
@@ -1413,7 +1566,7 @@ mod tests {
         assert_eq!(error, PersistenceError::UnsupportedSchemaVersion);
         assert_safe(error);
         let conn = Connection::open(&temp.path).unwrap();
-        assert_eq!(pragma_number(&conn, "user_version"), 3);
+        assert_eq!(pragma_number(&conn, "user_version"), 4);
         let value: String = conn
             .query_row("SELECT value FROM future_data", [], |row| row.get(0))
             .unwrap();
@@ -1519,7 +1672,7 @@ mod tests {
         assert_eq!(remaining_object, "sqlite_sequence");
         assert_eq!(pragma_number(&conn, "user_version"), 0);
         migrate(&mut conn).unwrap();
-        assert_eq!(pragma_number(&conn, "user_version"), 2);
+        assert_eq!(pragma_number(&conn, "user_version"), 3);
         for table in TABLES {
             assert_eq!(count(&conn, table), 0);
         }
@@ -1554,7 +1707,7 @@ mod tests {
         assert_eq!(tables, 0);
         conn.execute_batch("PRAGMA max_page_count = 100").unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(pragma_number(&conn, "user_version"), 2);
+        assert_eq!(pragma_number(&conn, "user_version"), 3);
     }
 
     #[test]
@@ -1565,7 +1718,7 @@ mod tests {
             .execute_batch("DROP TABLE course_sources")
             .unwrap();
         assert_eq!(migrate(&mut store.conn), Err(PersistenceError::Migration));
-        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 3);
     }
 
     #[test]
@@ -1787,7 +1940,7 @@ mod tests {
                 .unwrap();
         }
         let store = SqliteStore::open(&temp.path).unwrap();
-        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 3);
         assert_eq!(
             store.get_course(&expected_course.id).unwrap(),
             Some(expected_course)
@@ -2192,7 +2345,7 @@ mod tests {
         for id in ["c1", "c2", "c3", "c4"] {
             store.insert_course(&course(id, vec![])).unwrap();
         }
-        let sql = "INSERT INTO course_sources (course_id, origin, external_id) VALUES (?1, ?2, ?3)";
+        let sql = "INSERT INTO course_sources (course_id, origin, scope, external_id) VALUES (?1, ?2, 'default', ?3)";
         store
             .conn
             .execute(sql, params!["c1", "webclass", " Group-01 "])
@@ -2227,7 +2380,7 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         for sql in [
             "INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES ('missing', 'manual', 'scope', 'id')",
-            "INSERT INTO course_sources VALUES ('missing', 'manual', 'id')",
+            "INSERT INTO course_sources VALUES ('missing', 'manual', 'default', 'id')",
             "INSERT INTO course_schedule VALUES ('missing', 0, 'on_demand', NULL, NULL)",
             "INSERT INTO assignments VALUES ('a', 'missing', '', NULL, NULL, 'unknown', NULL, 'incomplete', '2026-10-04T00:00:00.000000000Z', '2026-10-04T00:00:00.000000000Z')",
         ] {
@@ -2259,7 +2412,7 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO course_sources VALUES (?1, 'webclass', 'group')",
+                "INSERT INTO course_sources VALUES (?1, 'webclass', 'default', 'group')",
                 [related.id.as_str()],
             )
             .unwrap();
@@ -2295,7 +2448,7 @@ mod tests {
         store
             .insert_course(&course("c_check", vec![ScheduleEntry::OnDemand]))
             .unwrap();
-        store.conn.execute_batch("INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES ('a_check', 'manual', 'scope', 'id'); INSERT INTO course_sources VALUES ('c_check', 'manual', 'id');").unwrap();
+        store.conn.execute_batch("INSERT INTO assignment_sources (assignment_id, origin, scope, external_id) VALUES ('a_check', 'manual', 'scope', 'id'); INSERT INTO course_sources VALUES ('c_check', 'manual', 'default', 'id');").unwrap();
         for sql in [
             "UPDATE assignments SET submission = ?1",
             "UPDATE assignments SET completion = ?1",
@@ -2328,6 +2481,7 @@ mod tests {
             "UPDATE assignment_sources SET scope = ''",
             "UPDATE assignment_sources SET external_id = ''",
             "UPDATE course_sources SET external_id = ''",
+            "UPDATE course_sources SET scope = ''",
             "UPDATE course_schedule SET position = -1",
             "UPDATE course_schedule SET entry_kind = 'timetabled'",
             "UPDATE course_schedule SET period = 0",
@@ -2533,6 +2687,7 @@ mod tests {
                         slot(DayOfWeek::Monday, 0),
                     ],
                     OriginKind::WebClass,
+                    "default",
                     group_id,
                 )
                 .unwrap();
@@ -2601,7 +2756,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .find_course_by_source(OriginKind::WebClass, group_id)
+                .find_course_by_source(OriginKind::WebClass, "default", group_id)
                 .unwrap(),
             Some(created_course.clone())
         );
@@ -2703,28 +2858,35 @@ mod tests {
     }
 
     #[test]
-    fn course_bindings_support_exact_origin_keys_and_explicit_late_binding() {
+    fn course_bindings_support_exact_scoped_keys_and_explicit_late_binding() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let webclass = store
             .create_course_with_source(
                 "Same name",
                 vec![ScheduleEntry::OnDemand],
                 OriginKind::WebClass,
+                "default",
                 " Group-01 ",
             )
             .unwrap();
         let moodle = store
-            .create_course_with_source("Same name", vec![], OriginKind::Moodle, " Group-01 ")
+            .create_course_with_source(
+                "Same name",
+                vec![],
+                OriginKind::Moodle,
+                "default",
+                " Group-01 ",
+            )
             .unwrap();
         assert_eq!(
             store
-                .find_course_by_source(OriginKind::WebClass, " Group-01 ")
+                .find_course_by_source(OriginKind::WebClass, "default", " Group-01 ")
                 .unwrap(),
             Some(webclass.clone())
         );
         assert_eq!(
             store
-                .find_course_by_source(OriginKind::Moodle, " Group-01 ")
+                .find_course_by_source(OriginKind::Moodle, "default", " Group-01 ")
                 .unwrap(),
             Some(moodle)
         );
@@ -2735,7 +2897,13 @@ mod tests {
         for distinct in [" group-01 ", "Group-01", " Group-1 "] {
             assert_eq!(store.find_webclass_course_id(distinct).unwrap(), None);
             let created = store
-                .create_course_with_source("Same name", vec![], OriginKind::WebClass, distinct)
+                .create_course_with_source(
+                    "Same name",
+                    vec![],
+                    OriginKind::WebClass,
+                    "default",
+                    distinct,
+                )
                 .unwrap();
             assert_eq!(
                 store.find_webclass_course_id(distinct).unwrap(),
@@ -2747,31 +2915,31 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .find_course_by_source(OriginKind::Manual, "manual-course")
+                .find_course_by_source(OriginKind::Manual, "default", "manual-course")
                 .unwrap(),
             None
         );
         store
-            .bind_course_source(&manual.id, OriginKind::Manual, "manual-course")
+            .bind_course_source(&manual.id, OriginKind::Manual, "default", "manual-course")
             .unwrap();
         assert_eq!(
             store
-                .find_course_by_source(OriginKind::Manual, "manual-course")
+                .find_course_by_source(OriginKind::Manual, "default", "manual-course")
                 .unwrap(),
             Some(manual.clone())
         );
         assert_eq!(
-            store.bind_course_source(&manual.id, OriginKind::WebClass, "other"),
+            store.bind_course_source(&manual.id, OriginKind::WebClass, "default", "other"),
             Err(PersistenceError::EntityAlreadyBound)
         );
         let unbound = store.create_course("Same name", vec![]).unwrap();
         assert_eq!(
-            store.bind_course_source(&unbound.id, OriginKind::WebClass, " Group-01 "),
+            store.bind_course_source(&unbound.id, OriginKind::WebClass, "default", " Group-01 "),
             Err(PersistenceError::ExternalIdentityAlreadyBound)
         );
         assert_eq!(
             store
-                .find_course_by_source(OriginKind::WebClass, "unknown")
+                .find_course_by_source(OriginKind::WebClass, "default", "unknown")
                 .unwrap(),
             None
         );
@@ -2803,11 +2971,16 @@ mod tests {
                 );
             }
             assert_eq!(
-                store.bind_course_source(&created_course.id, OriginKind::WebClass, blank),
+                store.bind_course_source(
+                    &created_course.id,
+                    OriginKind::WebClass,
+                    "default",
+                    blank
+                ),
                 Err(PersistenceError::InvalidExternalIdentity)
             );
             assert_eq!(
-                store.find_course_by_source(OriginKind::WebClass, blank),
+                store.find_course_by_source(OriginKind::WebClass, "default", blank),
                 Err(PersistenceError::InvalidExternalIdentity)
             );
             assert_eq!(
@@ -2819,6 +2992,7 @@ mod tests {
                     "Course",
                     vec![ScheduleEntry::OnDemand],
                     OriginKind::WebClass,
+                    "default",
                     blank
                 ),
                 Err(PersistenceError::InvalidExternalIdentity)
@@ -2840,7 +3014,12 @@ mod tests {
             Err(PersistenceError::NotFound)
         );
         assert_eq!(
-            store.bind_course_source(&CourseId::new("absent"), OriginKind::WebClass, "group"),
+            store.bind_course_source(
+                &CourseId::new("absent"),
+                OriginKind::WebClass,
+                "default",
+                "group"
+            ),
             Err(PersistenceError::NotFound)
         );
         for table in TABLES {
@@ -2863,6 +3042,7 @@ mod tests {
                 "Existing",
                 vec![ScheduleEntry::OnDemand],
                 OriginKind::WebClass,
+                "default",
                 "group",
             )
             .unwrap();
@@ -2871,6 +3051,7 @@ mod tests {
                 "Rejected",
                 vec![slot(DayOfWeek::Monday, 0), slot(DayOfWeek::Sunday, 255)],
                 OriginKind::WebClass,
+                "default",
                 "group"
             ),
             Err(PersistenceError::ExternalIdentityAlreadyBound)
@@ -2880,7 +3061,7 @@ mod tests {
         assert_eq!(count(&store.conn, "course_sources"), 1);
         assert_eq!(
             store
-                .find_course_by_source(OriginKind::WebClass, "group")
+                .find_course_by_source(OriginKind::WebClass, "default", "group")
                 .unwrap(),
             Some(first)
         );
@@ -2919,6 +3100,7 @@ mod tests {
                 "Rejected",
                 vec![ScheduleEntry::OnDemand; 2],
                 OriginKind::WebClass,
+                "default",
                 "group"
             ),
             Err(PersistenceError::Constraint)
@@ -3060,7 +3242,7 @@ mod tests {
             store.create_course("Course", vec![]).unwrap(),
         ];
         // Deliberately replace only source tables to simulate missing constraints.
-        store.conn.execute_batch("DROP TABLE assignment_sources; CREATE TABLE assignment_sources (assignment_id TEXT, origin TEXT, scope TEXT, external_id TEXT); DROP TABLE course_sources; CREATE TABLE course_sources (course_id TEXT, origin TEXT, external_id TEXT);").unwrap();
+        store.conn.execute_batch("DROP TABLE assignment_sources; CREATE TABLE assignment_sources (assignment_id TEXT, origin TEXT, scope TEXT, external_id TEXT); DROP TABLE course_sources; CREATE TABLE course_sources (course_id TEXT, origin TEXT, scope TEXT, external_id TEXT);").unwrap();
         for entity in assignments {
             store
                 .conn
@@ -3074,7 +3256,7 @@ mod tests {
             store
                 .conn
                 .execute(
-                    "INSERT INTO course_sources VALUES (?1, 'webclass', 'group')",
+                    "INSERT INTO course_sources VALUES (?1, 'webclass', 'default', 'group')",
                     [entity.id.as_str()],
                 )
                 .unwrap();
@@ -3084,7 +3266,7 @@ mod tests {
             Err(PersistenceError::InvalidStoredData)
         );
         assert_eq!(
-            store.find_course_by_source(OriginKind::WebClass, "group"),
+            store.find_course_by_source(OriginKind::WebClass, "default", "group"),
             Err(PersistenceError::InvalidStoredData)
         );
         assert_eq!(
@@ -3104,6 +3286,7 @@ mod tests {
                 "Course",
                 vec![ScheduleEntry::OnDemand; 3],
                 OriginKind::WebClass,
+                "default",
                 "group",
             )
             .unwrap();
@@ -3138,7 +3321,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.find_course_by_source(OriginKind::WebClass, "group"),
+            store.find_course_by_source(OriginKind::WebClass, "default", "group"),
             Err(PersistenceError::InvalidStoredData)
         );
         assert_eq!(
@@ -3158,7 +3341,7 @@ mod tests {
         assert_eq!(error, PersistenceError::Constraint);
         assert_safe(error);
         let error = store
-            .bind_course_source(&created_course.id, OriginKind::Manual, PRIVATE)
+            .bind_course_source(&created_course.id, OriginKind::Manual, "default", PRIVATE)
             .unwrap_err();
         assert_eq!(error, PersistenceError::Constraint);
         assert_safe(error);
@@ -3488,10 +3671,22 @@ mod tests {
     fn webclass_course_resolution_is_per_exact_scope_and_preserves_unresolved_relations() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let first = store
-            .create_course_with_source("Same name", vec![], OriginKind::WebClass, " Group-01 ")
+            .create_course_with_source(
+                "Same name",
+                vec![],
+                OriginKind::WebClass,
+                "default",
+                " Group-01 ",
+            )
             .unwrap();
         let second = store
-            .create_course_with_source("Same name", vec![], OriginKind::WebClass, "other-group")
+            .create_course_with_source(
+                "Same name",
+                vec![],
+                OriginKind::WebClass,
+                "default",
+                "other-group",
+            )
             .unwrap();
         let candidate = import_candidate(OriginKind::WebClass, " Group-01 ", "id");
         let other = import_candidate(OriginKind::WebClass, "other-group", "id");
@@ -3560,7 +3755,13 @@ mod tests {
             None
         );
         let replacement = store
-            .create_course_with_source("Same name", vec![], OriginKind::WebClass, " Group-01 ")
+            .create_course_with_source(
+                "Same name",
+                vec![],
+                OriginKind::WebClass,
+                "default",
+                " Group-01 ",
+            )
             .unwrap();
         assert_eq!(
             store
@@ -3841,7 +4042,13 @@ mod tests {
         let candidates = crate::webclass::map_contents_for_group(&contents, group).unwrap();
         let mut store = SqliteStore::open_in_memory().unwrap();
         let course = store
-            .create_course_with_source("Synthetic course", vec![], OriginKind::WebClass, group)
+            .create_course_with_source(
+                "Synthetic course",
+                vec![],
+                OriginKind::WebClass,
+                "default",
+                group,
+            )
             .unwrap();
         assert_eq!(
             store.import_assignment_batch(&candidates).unwrap().created,
@@ -3955,7 +4162,426 @@ mod tests {
             Some(expected.clone())
         );
         assert_eq!(assignment_metadata(&store, &expected.id), metadata);
-        assert_eq!(pragma_number(&store.conn, "user_version"), 2);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 3);
+    }
+
+    mod scoped_course_tests {
+        use super::*;
+        use rusqlite::types::Value;
+
+        fn rows(conn: &Connection, tables: &[&str]) -> Vec<Vec<Vec<Value>>> {
+            tables
+                .iter()
+                .map(|table| {
+                    let mut statement = conn
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+                        .unwrap();
+                    let columns = statement.column_count();
+                    statement
+                        .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn schema(conn: &Connection) -> String {
+            conn.query_row(
+                "SELECT group_concat(sql, ';') FROM (SELECT sql FROM sqlite_schema ORDER BY name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn populated_v2_migrates_all_origins_without_changing_domain_or_observation_and_reopens() {
+            let temp = TempDb::new();
+            let mut expected_courses = Vec::new();
+            let expected_assignment;
+            let before;
+            let key = external_key(OriginKind::Moodle, "legacy-feed", "legacy-uid");
+            let unchanged_tables = [
+                "courses",
+                "assignments",
+                "course_schedule",
+                "assignment_sources",
+                "sync_scopes",
+            ];
+            {
+                let conn = Connection::open(&temp.path).unwrap();
+                configure(&conn).unwrap();
+                conn.execute_batch(SCHEMA_V1).unwrap();
+                conn.execute_batch(SCHEMA_V2_UPGRADE).unwrap();
+                conn.pragma_update(None, "user_version", 2).unwrap();
+                let mut old = SqliteStore { conn };
+                for origin in [OriginKind::WebClass, OriginKind::Moodle, OriginKind::Manual] {
+                    let course = old
+                        .create_course(
+                            "Local course",
+                            vec![ScheduleEntry::OnDemand, slot(DayOfWeek::Friday, 4)],
+                        )
+                        .unwrap();
+                    old.conn
+                        .execute(
+                            "INSERT INTO course_sources VALUES (?1, ?2, ?3)",
+                            params![course.id.as_str(), encode_origin(origin), " 2026-DB \t "],
+                        )
+                        .unwrap();
+                    expected_courses.push((origin, course));
+                }
+                let mut input = manual_input();
+                input.course_id = Some(expected_courses[1].1.id.clone());
+                expected_assignment = old.create_assignment_inner(input, Some(&key)).unwrap();
+                old.conn
+                    .execute("UPDATE assignment_sources SET last_seen_at = ?1", [STAMP])
+                    .unwrap();
+                old.conn
+                    .execute(
+                        "INSERT INTO sync_scopes VALUES ('moodle_feed', 'legacy-feed', ?1)",
+                        [STAMP],
+                    )
+                    .unwrap();
+                before = rows(&old.conn, &unchanged_tables);
+            }
+            let after;
+            {
+                let store = SqliteStore::open(&temp.path).unwrap();
+                assert_eq!(pragma_number(&store.conn, "user_version"), 3);
+                assert_eq!(rows(&store.conn, &unchanged_tables), before);
+                for (origin, course) in &expected_courses {
+                    let scope = if *origin == OriginKind::WebClass {
+                        DEFAULT_COURSE_SOURCE_SCOPE
+                    } else {
+                        LEGACY_COURSE_SOURCE_SCOPE
+                    };
+                    assert_eq!(
+                        store
+                            .find_course_by_source(*origin, scope, " 2026-DB \t ")
+                            .unwrap(),
+                        Some(course.clone())
+                    );
+                    assert_eq!(store.get_course(&course.id).unwrap(), Some(course.clone()));
+                }
+                assert_eq!(
+                    store
+                        .find_moodle_course_id("campus.course-related", " 2026-DB \t ")
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    store.get_assignment(&expected_assignment.id).unwrap(),
+                    Some(expected_assignment.clone())
+                );
+                assert_eq!(
+                    store.get_assignment_last_seen_at(&key).unwrap(),
+                    Some(decode_timestamp(STAMP).unwrap())
+                );
+                assert_eq!(
+                    schema(&store.conn),
+                    schema(&SqliteStore::open_in_memory().unwrap().conn)
+                );
+                after = rows(&store.conn, &TABLES);
+            }
+            let reopened = SqliteStore::open(&temp.path).unwrap();
+            assert_eq!(rows(&reopened.conn, &TABLES), after);
+            assert_eq!(
+                reopened.get_assignment(&expected_assignment.id).unwrap(),
+                Some(expected_assignment)
+            );
+        }
+
+        #[test]
+        fn v2_rebuild_copy_and_late_ddl_failures_restore_schema_rows_and_version() {
+            for fail_copy in [true, false] {
+                let mut conn = Connection::open_in_memory().unwrap();
+                configure(&conn).unwrap();
+                conn.execute_batch(SCHEMA_V1).unwrap();
+                conn.execute_batch(SCHEMA_V2_UPGRADE).unwrap();
+                conn.pragma_update(None, "user_version", 2).unwrap();
+                insert_course_row(&conn, &course("c_old", vec![]), STAMP).unwrap();
+                conn.execute(
+                    "INSERT INTO course_sources VALUES ('c_old', 'moodle', ?1)",
+                    [PRIVATE],
+                )
+                .unwrap();
+                if fail_copy {
+                    conn.execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE course_sources SET origin = 'invalid'; PRAGMA ignore_check_constraints = OFF;").unwrap();
+                } else {
+                    // This valid v2 trigger makes ALTER's schema validation fail
+                    // after DROP, while the old table is temporarily absent.
+                    conn.execute_batch("CREATE TRIGGER legacy_reference AFTER INSERT ON courses BEGIN SELECT external_id FROM course_sources; END;").unwrap();
+                }
+                let before_schema = schema(&conn);
+                let before = rows(&conn, &TABLES);
+                let error = migrate(&mut conn).unwrap_err();
+                assert_eq!(error, PersistenceError::Migration);
+                assert_safe(error);
+                assert!(conn.is_autocommit());
+                assert_eq!(pragma_number(&conn, "user_version"), 2);
+                assert_eq!(schema(&conn), before_schema);
+                assert_eq!(rows(&conn, &TABLES), before);
+                assert!(conn.prepare("SELECT scope FROM course_sources").is_err());
+                if fail_copy {
+                    conn.execute_batch("UPDATE course_sources SET origin = 'moodle'")
+                        .unwrap();
+                } else {
+                    conn.execute_batch("DROP TRIGGER legacy_reference").unwrap();
+                }
+                migrate(&mut conn).unwrap();
+                assert_eq!(pragma_number(&conn, "user_version"), 3);
+            }
+        }
+
+        #[test]
+        fn scoped_course_keys_are_exact_and_each_course_still_has_one_binding() {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            for scope in [" Scope-A ", "scope-a", "Scope-A", "Scope-B"] {
+                let created = store
+                    .create_course_with_source(
+                        "Same name",
+                        vec![],
+                        OriginKind::Moodle,
+                        scope,
+                        " Category \t ",
+                    )
+                    .unwrap();
+                assert_eq!(
+                    store.find_moodle_course_id(scope, " Category \t ").unwrap(),
+                    Some(created.id.clone())
+                );
+                assert_eq!(
+                    store.bind_course_source(&created.id, OriginKind::Manual, "other", "other"),
+                    Err(PersistenceError::EntityAlreadyBound)
+                );
+            }
+            assert_eq!(count(&store.conn, "courses"), 4);
+            assert_eq!(
+                store.find_moodle_course_id("Scope-A", "Category").unwrap(),
+                None
+            );
+            let before = rows(&store.conn, &TABLES);
+            assert_eq!(
+                store.create_course_with_source(
+                    "Rejected",
+                    vec![ScheduleEntry::OnDemand],
+                    OriginKind::Moodle,
+                    "Scope-A",
+                    " Category \t "
+                ),
+                Err(PersistenceError::ExternalIdentityAlreadyBound)
+            );
+            assert_eq!(rows(&store.conn, &TABLES), before);
+            let unbound = store.create_course("Unbound", vec![]).unwrap();
+            for blank in ["", " \t\n", "\u{3000}"] {
+                assert_eq!(
+                    store.find_course_by_source(OriginKind::Moodle, blank, "category"),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+                assert_eq!(
+                    store.bind_course_source(&unbound.id, OriginKind::Moodle, blank, "category"),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+                assert_eq!(
+                    store.create_course_with_source(
+                        "Rejected",
+                        vec![],
+                        OriginKind::Moodle,
+                        blank,
+                        "category"
+                    ),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+                assert_eq!(
+                    store.find_moodle_course_id(blank, "category"),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+                assert_eq!(
+                    store.find_moodle_course_id("Scope-A", blank),
+                    Err(PersistenceError::InvalidExternalIdentity)
+                );
+            }
+        }
+
+        #[test]
+        fn explicit_resolutions_validate_complete_candidate_key_and_complete_course_binding() {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let scope = "campus.course-related";
+            let category = " Category \t ";
+            let valid = store
+                .create_course_with_source(
+                    "Local name",
+                    vec![],
+                    OriginKind::Moodle,
+                    scope,
+                    category,
+                )
+                .unwrap();
+            let other_scope = store
+                .create_course_with_source(
+                    "Local name",
+                    vec![],
+                    OriginKind::Moodle,
+                    "other.course-related",
+                    category,
+                )
+                .unwrap();
+            let other_category = store
+                .create_course_with_source(
+                    "Local name",
+                    vec![],
+                    OriginKind::Moodle,
+                    scope,
+                    "other-category",
+                )
+                .unwrap();
+            let webclass = store
+                .create_course_with_source(
+                    "Local name",
+                    vec![],
+                    OriginKind::WebClass,
+                    "default",
+                    category,
+                )
+                .unwrap();
+            let manual = store
+                .create_course_with_source(
+                    "Local name",
+                    vec![],
+                    OriginKind::Manual,
+                    scope,
+                    category,
+                )
+                .unwrap();
+            let unbound = store.create_course("Unbound", vec![]).unwrap();
+            let mut candidate = import_candidate(OriginKind::Moodle, scope, "uid");
+            let observation = AssignmentObservation::try_new(
+                SyncScope::MoodleFeed(scope.into()),
+                vec![candidate.external_key.clone()],
+            )
+            .unwrap();
+            let observed_at = decode_timestamp(STAMP).unwrap();
+            store
+                .import_assignment_batch_with_observation(
+                    &batch(vec![candidate.clone()]),
+                    &observation,
+                    observed_at,
+                )
+                .unwrap();
+            candidate.title = PRIVATE.into();
+            let checked_batch = batch(vec![candidate.clone()]);
+            let later = observed_at + chrono::Duration::seconds(1);
+            let mut bad = vec![
+                (
+                    external_key(OriginKind::Moodle, scope, "outside"),
+                    valid.id.clone(),
+                    category,
+                ),
+                (
+                    external_key(OriginKind::Moodle, "other.course-related", "uid"),
+                    valid.id.clone(),
+                    category,
+                ),
+                (
+                    external_key(OriginKind::WebClass, scope, "uid"),
+                    valid.id.clone(),
+                    category,
+                ),
+            ];
+            for id in [
+                other_scope.id,
+                other_category.id,
+                webclass.id,
+                manual.id,
+                unbound.id,
+                CourseId::new(PRIVATE),
+            ] {
+                bad.push((candidate.external_key.clone(), id, category));
+            }
+            for category in ["Category", " category \t ", "", PRIVATE] {
+                bad.push((candidate.external_key.clone(), valid.id.clone(), category));
+            }
+            let before = rows(&store.conn, &TABLES);
+            for (key, id, category) in bad {
+                let resolution = MoodleCourseResolution::new(id, category);
+                assert_eq!(format!("{resolution:?}"), "MoodleCourseResolution");
+                let resolutions = HashMap::from([(key, resolution)]);
+                let error = store
+                    .import_assignment_batch_with_observation_and_courses(
+                        &checked_batch,
+                        &observation,
+                        &resolutions,
+                        later,
+                    )
+                    .unwrap_err();
+                assert_eq!(error, PersistenceError::CourseResolutionValidation);
+                assert_eq!(
+                    error.to_string(),
+                    "invalid explicit Moodle course resolution"
+                );
+                assert_eq!(format!("{error:?}"), "CourseResolutionValidation");
+                assert_safe(error);
+                assert_eq!(rows(&store.conn, &TABLES), before);
+            }
+            // Even a batch containing the key cannot give a non-Moodle candidate
+            // an explicit Moodle relation.
+            for origin in [OriginKind::WebClass, OriginKind::Manual] {
+                let other = import_candidate(origin, scope, "uid");
+                let resolutions = HashMap::from([(
+                    other.external_key.clone(),
+                    MoodleCourseResolution::new(valid.id.clone(), category),
+                )]);
+                assert_eq!(
+                    import_assignment_batch_tx(
+                        &store.conn,
+                        &batch(vec![other]),
+                        STAMP,
+                        None,
+                        Some(&resolutions)
+                    ),
+                    Err(PersistenceError::CourseResolutionValidation)
+                );
+                assert_eq!(rows(&store.conn, &TABLES), before);
+            }
+            let resolutions = HashMap::from([(
+                candidate.external_key.clone(),
+                MoodleCourseResolution::new(valid.id.clone(), category),
+            )]);
+            assert_eq!(
+                store
+                    .import_assignment_batch_with_observation_and_courses(
+                        &checked_batch,
+                        &observation,
+                        &resolutions,
+                        later
+                    )
+                    .unwrap()
+                    .updated,
+                1
+            );
+            let assignment = store
+                .find_assignment_by_external_key(&candidate.external_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(assignment.course_id, Some(valid.id));
+            // The observation wrapper supplies no implicit Moodle resolution.
+            assert_eq!(
+                store
+                    .import_assignment_batch_with_observation(
+                        &checked_batch,
+                        &observation,
+                        observed_at
+                    )
+                    .unwrap()
+                    .unchanged,
+                1
+            );
+            assert_eq!(
+                store.get_assignment(&assignment.id).unwrap(),
+                Some(assignment)
+            );
+        }
     }
 
     mod observation_tests {
@@ -3966,10 +4592,10 @@ mod tests {
             tables
                 .iter()
                 .map(|table| {
-                    let columns = if legacy && *table == "assignment_sources" {
-                        "assignment_id, origin, scope, external_id"
-                    } else {
-                        "*"
+                    let columns = match (legacy, *table) {
+                        (true, "assignment_sources") => "assignment_id, origin, scope, external_id",
+                        (true, "course_sources") => "course_id, origin, external_id",
+                        _ => "*",
                     };
                     let mut statement = conn
                         .prepare(&format!("SELECT {columns} FROM {table} ORDER BY 1, 2"))
@@ -3989,7 +4615,7 @@ mod tests {
         }
 
         #[test]
-        fn populated_v1_migrates_without_inventing_observations_and_reopens_as_v2() {
+        fn populated_v1_migrates_without_inventing_observations_and_reopens_as_v3() {
             let temp = TempDb::new();
             let before;
             let expected_assignment;
@@ -4002,13 +4628,12 @@ mod tests {
                 conn.pragma_update(None, "user_version", 1).unwrap();
                 let mut legacy = SqliteStore { conn };
                 expected_course = legacy
-                    .create_course_with_source(
+                    .create_course(
                         "Existing course",
                         vec![ScheduleEntry::OnDemand, slot(DayOfWeek::Friday, 2)],
-                        OriginKind::WebClass,
-                        "group",
                     )
                     .unwrap();
+                legacy.conn.execute("INSERT INTO course_sources (course_id, origin, external_id) VALUES (?1, 'webclass', 'group')", [expected_course.id.as_str()]).unwrap();
                 let mut input = manual_input();
                 input.course_id = Some(expected_course.id.clone());
                 let assignment = legacy.create_manual_assignment(input).unwrap();
@@ -4022,7 +4647,7 @@ mod tests {
             let after;
             {
                 let store = SqliteStore::open(&temp.path).unwrap();
-                assert_eq!(pragma_number(&store.conn, "user_version"), 2);
+                assert_eq!(pragma_number(&store.conn, "user_version"), 3);
                 assert_eq!(rows(&store.conn, &TABLES[..5], true), before);
                 assert_eq!(
                     store.get_assignment(&expected_assignment.id).unwrap(),
@@ -4077,7 +4702,7 @@ mod tests {
             assert_eq!(value, PRIVATE);
             conn.execute_batch("DROP TABLE sync_scopes").unwrap();
             migrate(&mut conn).unwrap();
-            assert_eq!(pragma_number(&conn, "user_version"), 2);
+            assert_eq!(pragma_number(&conn, "user_version"), 3);
         }
 
         #[test]
@@ -4345,7 +4970,7 @@ mod tests {
                             .conn
                             .execute_batch("PRAGMA defer_foreign_keys = ON")
                             .unwrap();
-                        "CREATE TRIGGER fail_observation AFTER UPDATE ON sync_scopes BEGIN INSERT INTO course_sources VALUES ('absent', 'webclass', 'deferred'); END;"
+                        "CREATE TRIGGER fail_observation AFTER UPDATE ON sync_scopes BEGIN INSERT INTO course_sources VALUES ('absent', 'webclass', 'default', 'deferred'); END;"
                     }
                     _ => unreachable!(),
                 };

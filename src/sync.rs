@@ -3,16 +3,19 @@
 //! Fetching, parsing, mapping and validation finish before the store starts its
 //! import transaction. Candidate absence has no deletion or presence semantics.
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
 use chrono::Utc;
 
 use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
-use crate::moodle::{map_events, parse_calendar};
+use crate::moodle::{map_events, parse_calendar, single_course_category};
 use crate::moodle_http::{MoodleClient, MoodleFeed};
 use crate::observation::{AssignmentObservation, SyncScope, WebClassCourseListObservation};
-use crate::persistence::{AssignmentImportSummary, SqliteStore};
+use crate::persistence::{
+    AssignmentImportSummary, DEFAULT_COURSE_SOURCE_SCOPE, MoodleCourseResolution, SqliteStore,
+};
 use crate::webclass::{WebClassMapError, map_contents_for_group, parse_contents, parse_courses};
 use crate::webclass_auth::{HoseiAuthenticator, HoseiCredentials};
 use crate::webclass_http::{WebClassClient, WebClassHttpError};
@@ -43,8 +46,11 @@ impl Error for MoodleSyncError {}
 /// Synchronize one Moodle feed once on the calling thread.
 ///
 /// The reusable client and feed are borrowed. Only the feed's fixed, non-secret
-/// scope reaches the mapper; feed labels do not resolve courses. Pre-import
-/// failures leave the database untouched. Import failures roll back the store's
+/// scope reaches the mapper. After all validation, usable categories referenced
+/// by candidates discover courses by Moodle + feed scope + category. Each new
+/// course/binding commits separately and survives a later import failure. Existing
+/// names and schedules are retained. Pre-discovery failures leave the DB untouched.
+/// Import failures roll back the store's
 /// batch transaction and never return a partial summary. An empty validated batch
 /// returns zero counts without changing existing assignments. All parsed events,
 /// including unclassified/start events, supply identities before mapping. Positive
@@ -77,8 +83,51 @@ pub fn sync_moodle_once(
         .validate_candidates(&batch)
         .map_err(|_| MoodleSyncError::Validation)?;
     let observed_at = Utc::now();
+    let candidate_keys: HashSet<_> = batch
+        .as_slice()
+        .iter()
+        .map(|candidate| &candidate.external_key)
+        .collect();
+    let mut resolutions = HashMap::new();
+    for event in &events {
+        let key = ExternalRecordKey {
+            origin: OriginKind::Moodle,
+            scope: feed.scope().to_owned(),
+            id: event.uid.clone(),
+        };
+        if !candidate_keys.contains(&key) {
+            continue;
+        }
+        let Some(category) = single_course_category(event, feed) else {
+            continue;
+        };
+        let course_id = match store
+            .find_moodle_course_id(feed.scope(), category)
+            .map_err(|_| MoodleSyncError::Persistence)?
+        {
+            Some(id) => id,
+            None => {
+                store
+                    .create_course_with_source(
+                        category,
+                        vec![],
+                        OriginKind::Moodle,
+                        feed.scope(),
+                        category,
+                    )
+                    .map_err(|_| MoodleSyncError::Persistence)?
+                    .id
+            }
+        };
+        resolutions.insert(key, MoodleCourseResolution::new(course_id, category));
+    }
     store
-        .import_assignment_batch_with_observation(&batch, &observation, observed_at)
+        .import_assignment_batch_with_observation_and_courses(
+            &batch,
+            &observation,
+            &resolutions,
+            observed_at,
+        )
         .map_err(|_| MoodleSyncError::Persistence)
 }
 
@@ -237,6 +286,7 @@ pub fn sync_webclass_all_once(
                     course.group_name,
                     vec![],
                     OriginKind::WebClass,
+                    DEFAULT_COURSE_SOURCE_SCOPE,
                     &course.group_id,
                 )
                 .map_err(|_| WebClassSyncError::CoursePersistence)?;
