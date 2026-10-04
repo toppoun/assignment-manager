@@ -457,6 +457,14 @@ impl Exchange {
 }
 
 fn script(listener: TcpListener, exchanges: Vec<Exchange>) -> JoinHandle<TcpListener> {
+    script_with_probe(listener, exchanges, || {})
+}
+
+fn script_with_probe(
+    listener: TcpListener,
+    exchanges: Vec<Exchange>,
+    before_response: impl Fn() + Send + 'static,
+) -> JoinHandle<TcpListener> {
     thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         for exchange in exchanges {
@@ -474,6 +482,7 @@ fn script(listener: TcpListener, exchanges: Vec<Exchange>) -> JoinHandle<TcpList
                 }
             };
             exchange.assert_request(&read_request(&mut stream));
+            before_response();
             let body = exchange
                 .response_bytes
                 .as_deref()
@@ -1602,5 +1611,682 @@ fn finite_timeout_covers_headers_and_response_body_without_exposing_secrets() {
         server.join().unwrap();
         assert_eq!(error, HoseiAuthError::Timeout(step));
         assert_safe(error);
+    }
+}
+
+// Reuse the real Phase 5C protocol script, adding only application sync requests.
+// Neither credentials nor authentication responses reach the persistence API.
+mod reauth_sync_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rusqlite::{Connection, types::Value as SqlValue};
+
+    use super::*;
+    use crate::persistence::SqliteStore;
+    use crate::sync::{
+        WebClassCredentialProvider, WebClassReauthSyncError, WebClassSyncError,
+        WebClassSyncSummary, sync_webclass_all_with_reauth,
+    };
+
+    const COURSE_FIXTURE: &str = include_str!("../fixtures/webclass/courses_basic.json");
+    const CONTENT_FIXTURE: &str = include_str!("../fixtures/webclass/contents_basic.json");
+    const OLD_COOKIE: &str = "synthetic-old-cookie";
+    const NEW_COOKIE: &str = "synthetic-cookie";
+    const GROUPS: [&str; 3] = [
+        "fixture-course-001",
+        "fixture-course-002",
+        "fixture-course-003",
+    ];
+    type Snapshot = [Vec<Vec<SqlValue>>; 5];
+
+    struct TempDatabase {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempDatabase {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "assignment-reauth-{}-{nonce}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("sync.sqlite");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TempDatabase {
+        fn drop(&mut self) {
+            for name in [
+                "sync.sqlite",
+                "sync.sqlite-wal",
+                "sync.sqlite-shm",
+                "sync.sqlite-journal",
+            ] {
+                let _ = std::fs::remove_file(self.directory.join(name));
+            }
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    fn snapshot(connection: &Connection) -> Snapshot {
+        [
+            "assignments",
+            "assignment_sources",
+            "courses",
+            "course_sources",
+            "course_schedule",
+        ]
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<SqlValue>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    }
+
+    fn assert_no_auth_data(database: &Snapshot) {
+        let rendered = format!("{database:?}");
+        for secret in SECRETS.iter().copied().chain([OLD_COOKIE]) {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    fn assert_safe_error(error: WebClassReauthSyncError) {
+        let rendered = format!("{error} {error:?} {error:#?}");
+        for secret in SECRETS.iter().copied().chain([
+            OLD_COOKIE,
+            "http:",
+            "localhost",
+            "127.0.0.1",
+            "sync.sqlite",
+            "SELECT",
+            "fixture-course",
+            "fixture-content",
+            "演習課題",
+            "線形代数",
+        ]) {
+            assert!(!rendered.contains(secret));
+        }
+        assert!(error.source().is_none());
+    }
+
+    // Each HTTP response (including login) checks that another connection can
+    // begin a write transaction immediately, proving no DB transaction spans HTTP.
+    fn serve(
+        listener: TcpListener,
+        exchanges: Vec<Exchange>,
+        path: &Path,
+    ) -> JoinHandle<TcpListener> {
+        let path = path.to_owned();
+        script_with_probe(listener, exchanges, move || {
+            let connection = Connection::open(&path).unwrap();
+            connection.busy_timeout(Duration::ZERO).unwrap();
+            connection
+                .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                .unwrap();
+        })
+    }
+
+    struct SyntheticProvider<'a> {
+        observer: &'a Connection,
+        available: bool,
+        calls: usize,
+        released: bool,
+        before_login: Option<Snapshot>,
+    }
+
+    impl<'a> SyntheticProvider<'a> {
+        fn new(observer: &'a Connection, available: bool) -> Self {
+            Self {
+                observer,
+                available,
+                calls: 0,
+                released: false,
+                before_login: None,
+            }
+        }
+    }
+
+    impl WebClassCredentialProvider for SyntheticProvider<'_> {
+        fn with_credentials<R>(
+            &mut self,
+            use_credentials: impl FnOnce(HoseiCredentials<'_>) -> R,
+        ) -> Option<R> {
+            self.calls += 1;
+            self.before_login = Some(snapshot(self.observer));
+            if !self.available {
+                return None;
+            }
+            // Owned credential values live only inside this acquisition/login call.
+            let university_id = STUDENT.to_owned();
+            let password = PASSWORD.to_owned();
+            let result = use_credentials(HoseiCredentials::new(&university_id, &password));
+            drop(password);
+            drop(university_id);
+            self.released = true;
+            Some(result)
+        }
+    }
+
+    fn initial_client() -> (WebClassClient, TcpListener, Url) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let jar = Arc::new(Jar::default());
+        jar.add_cookie_str(&format!("wc_test={OLD_COOKIE}; Path=/webclass"), &origin);
+        let http = Client::builder()
+            .cookie_provider(jar)
+            .timeout(Duration::from_secs(3))
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .referer(false)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut client = WebClassClient::from_http(http);
+        client.set_test_origin(origin.clone());
+        (client, listener, origin)
+    }
+
+    fn request(origin: &Url, group: Option<&str>, cookie: &'static str, body: &str) -> Exchange {
+        let target = match group {
+            None => COURSES.to_owned(),
+            Some(group) => {
+                let mut url = endpoint(
+                    origin,
+                    "/webclass/ip_mods.php/plugin/score_summary_table/contents",
+                );
+                url.query_pairs_mut().append_pair("group_id", group);
+                format!("{}?{}", url.path(), url.query().unwrap())
+            }
+        };
+        Exchange::new("GET", &target, 200, body)
+            .json_response()
+            .header("accept", "application/json")
+            .header(
+                "referer",
+                endpoint(
+                    origin,
+                    "/webclass/ip_mods.php/plugin/score_summary_table/dashboard",
+                )
+                .as_str(),
+            )
+            .cookie("wc_test", cookie)
+    }
+
+    fn contents(group: &str) -> Value {
+        let mut records: Value = serde_json::from_str(CONTENT_FIXTURE).unwrap();
+        for record in records.as_array_mut().unwrap() {
+            record["group_id"] = json!(group);
+        }
+        records
+    }
+
+    fn full_sync(origin: &Url, cookie: &'static str) -> Vec<Exchange> {
+        let mut exchanges = vec![request(origin, None, cookie, COURSE_FIXTURE)];
+        exchanges.extend(
+            GROUPS.map(|group| request(origin, Some(group), cookie, &contents(group).to_string())),
+        );
+        exchanges
+    }
+
+    fn expired(origin: &Url, group: Option<&str>, cookie: &'static str) -> Exchange {
+        let mut exchange = request(origin, group, cookie, "synthetic-private-body");
+        exchange.status = 302;
+        exchange.response_headers.push((
+            "Location",
+            "/webclass/login.php?secret=synthetic-openam-token".to_owned(),
+        ));
+        exchange
+    }
+
+    fn partially_expired(origin: &Url) -> Vec<Exchange> {
+        vec![
+            request(origin, None, OLD_COOKIE, COURSE_FIXTURE),
+            request(
+                origin,
+                Some(GROUPS[0]),
+                OLD_COOKIE,
+                &contents(GROUPS[0]).to_string(),
+            ),
+            expired(origin, Some(GROUPS[1]), OLD_COOKIE),
+        ]
+    }
+
+    fn start_auth(
+        flow: FullFlow,
+        path: &Path,
+    ) -> (HoseiAuthenticator, Vec<JoinHandle<TcpListener>>) {
+        let servers = flow
+            .listeners
+            .into_iter()
+            .zip(flow.exchanges)
+            .map(|(listener, exchanges)| serve(listener, exchanges, path))
+            .collect();
+        (
+            HoseiAuthenticator {
+                test_endpoints: Some(flow.endpoints),
+            },
+            servers,
+        )
+    }
+
+    fn idle_auth(path: &Path) -> (HoseiAuthenticator, Vec<JoinHandle<TcpListener>>) {
+        let mut flow = FullFlow::new(false);
+        for exchanges in &mut flow.exchanges {
+            exchanges.clear();
+        }
+        start_auth(flow, path)
+    }
+
+    fn finish_auth(servers: Vec<JoinHandle<TcpListener>>) {
+        for server in servers {
+            finish(server);
+        }
+    }
+
+    fn assert_full_database(connection: &Connection) -> Snapshot {
+        let state = snapshot(connection);
+        assert_eq!(state.each_ref().map(Vec::len), [9, 9, 3, 3, 0]);
+        let linked: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM assignments a JOIN assignment_sources s ON s.assignment_id = a.id
+             JOIN course_sources c ON c.course_id = a.course_id
+             WHERE s.origin = c.origin AND s.scope = c.external_id", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(linked, 9);
+        assert_no_auth_data(&state);
+        state
+    }
+
+    fn new_summary() -> WebClassSyncSummary {
+        WebClassSyncSummary {
+            courses_discovered: 3,
+            courses_created: 3,
+            groups_synced: 3,
+            assignments_created: 9,
+            assignments_updated: 0,
+            assignments_unchanged: 0,
+        }
+    }
+
+    #[test]
+    fn healthy_session_never_acquires_credentials_or_logs_in() {
+        let database = TempDatabase::new();
+        let mut store = SqliteStore::open(&database.path).unwrap();
+        let observer = Connection::open(&database.path).unwrap();
+        let mut provider = SyntheticProvider::new(&observer, true);
+        let (mut client, listener, origin) = initial_client();
+        let mut exchanges = full_sync(&origin, OLD_COOKIE);
+        exchanges.push(request(&origin, None, OLD_COOKIE, "[]"));
+        let server = serve(listener, exchanges, &database.path);
+        let (authenticator, auth_servers) = idle_auth(&database.path);
+        assert_eq!(
+            sync_webclass_all_with_reauth(&mut client, &authenticator, &mut provider, &mut store)
+                .unwrap(),
+            new_summary()
+        );
+        assert_eq!(provider.calls, 0);
+        assert!(provider.before_login.is_none());
+        assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+        assert_full_database(&observer);
+        finish(server);
+        finish_auth(auth_servers);
+    }
+
+    #[test]
+    fn courses_expiry_logs_in_once_retries_and_replaces_the_callers_client() {
+        let database = TempDatabase::new();
+        let mut store = SqliteStore::open(&database.path).unwrap();
+        let observer = Connection::open(&database.path).unwrap();
+        let before = snapshot(&observer);
+        let mut provider = SyntheticProvider::new(&observer, true);
+        let (mut client, listener, origin) = initial_client();
+        let server = serve(
+            listener,
+            vec![expired(&origin, None, OLD_COOKIE)],
+            &database.path,
+        );
+        let mut flow = FullFlow::new(true);
+        flow.exchanges[2].extend(full_sync(&flow.endpoints.webclass, NEW_COOKIE));
+        flow.exchanges[2].push(request(&flow.endpoints.webclass, None, NEW_COOKIE, "[]"));
+        let (authenticator, auth_servers) = start_auth(flow, &database.path);
+        assert_eq!(
+            sync_webclass_all_with_reauth(&mut client, &authenticator, &mut provider, &mut store)
+                .unwrap(),
+            new_summary()
+        );
+        assert_eq!(provider.calls, 1);
+        assert!(provider.released);
+        assert_eq!(provider.before_login.as_ref().unwrap(), &before);
+        // Different origin and cookie confirm replacement, independently of sync success.
+        assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+        assert_full_database(&observer);
+        finish(server);
+        finish_auth(auth_servers);
+    }
+
+    #[test]
+    fn contents_expiry_keeps_commits_and_full_retry_returns_only_final_attempt_counts() {
+        let database = TempDatabase::new();
+        let mut store = SqliteStore::open(&database.path).unwrap();
+        let observer = Connection::open(&database.path).unwrap();
+        let mut provider = SyntheticProvider::new(&observer, true);
+        let (mut client, listener, origin) = initial_client();
+        let server = serve(listener, partially_expired(&origin), &database.path);
+        let mut flow = FullFlow::new(false);
+        flow.exchanges[2].extend(full_sync(&flow.endpoints.webclass, NEW_COOKIE));
+        flow.exchanges[2].push(request(&flow.endpoints.webclass, None, NEW_COOKIE, "[]"));
+        let (authenticator, auth_servers) = start_auth(flow, &database.path);
+        let summary =
+            sync_webclass_all_with_reauth(&mut client, &authenticator, &mut provider, &mut store)
+                .unwrap();
+        assert_eq!(
+            summary,
+            WebClassSyncSummary {
+                courses_created: 1,
+                assignments_created: 6,
+                assignments_unchanged: 3,
+                ..new_summary()
+            }
+        );
+        assert_eq!(provider.calls, 1);
+        assert!(provider.released);
+        let partial = provider.before_login.as_ref().unwrap();
+        assert_eq!(partial.each_ref().map(Vec::len), [3, 3, 2, 2, 0]);
+        let final_state = assert_full_database(&observer);
+        for (before, after) in partial.iter().zip(&final_state) {
+            for row in before {
+                // Includes internal IDs, completion and both assignment timestamps.
+                assert!(after.contains(row));
+            }
+        }
+        assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+        finish(server);
+        finish_auth(auth_servers);
+    }
+
+    #[test]
+    fn second_expiry_returns_sync_category_without_another_login_or_acquisition() {
+        let database = TempDatabase::new();
+        let mut store = SqliteStore::open(&database.path).unwrap();
+        let observer = Connection::open(&database.path).unwrap();
+        let before = snapshot(&observer);
+        let mut provider = SyntheticProvider::new(&observer, true);
+        let (mut client, listener, origin) = initial_client();
+        let server = serve(
+            listener,
+            vec![expired(&origin, None, OLD_COOKIE)],
+            &database.path,
+        );
+        let mut flow = FullFlow::new(false);
+        flow.exchanges[2].push(expired(&flow.endpoints.webclass, None, NEW_COOKIE));
+        flow.exchanges[2].push(request(&flow.endpoints.webclass, None, NEW_COOKIE, "[]"));
+        let (authenticator, auth_servers) = start_auth(flow, &database.path);
+        let error =
+            sync_webclass_all_with_reauth(&mut client, &authenticator, &mut provider, &mut store)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            WebClassReauthSyncError::Sync(WebClassSyncError::AuthExpired)
+        );
+        assert_safe_error(error);
+        assert_eq!(provider.calls, 1);
+        assert!(provider.released);
+        assert_eq!(snapshot(&observer), before);
+        assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+        finish(server);
+        finish_auth(auth_servers);
+    }
+
+    // Real HTTP/parser/mapper/SQLite failures exercise every non-auth category.
+    fn failure_requests(
+        category: WebClassSyncError,
+        origin: &Url,
+        cookie: &'static str,
+        observer: &Connection,
+    ) -> Vec<Exchange> {
+        let mut courses: Value = serde_json::from_str(COURSE_FIXTURE).unwrap();
+        courses.as_array_mut().unwrap().truncate(1);
+        let mut records = contents(GROUPS[0]);
+        let mut course_request = request(origin, None, cookie, &courses.to_string());
+        match category {
+            WebClassSyncError::Fetch => {
+                course_request.status = 500;
+                course_request.body = "synthetic-private-body".to_owned();
+            }
+            WebClassSyncError::Parse => course_request.body = "{synthetic-private-body".to_owned(),
+            WebClassSyncError::CourseValidation => {
+                let duplicate = courses[0].clone();
+                courses.as_array_mut().unwrap().push(duplicate);
+                course_request.body = courses.to_string();
+            }
+            WebClassSyncError::CoursePersistence => {
+                observer
+                    .execute_batch(
+                        "CREATE TRIGGER reject_reauth_course BEFORE INSERT ON course_sources
+                    BEGIN SELECT RAISE(ABORT, NEW.external_id || 'synthetic-private-body'); END;",
+                    )
+                    .unwrap();
+            }
+            WebClassSyncError::Map => records[1]["end_date"] = json!("synthetic-private-body"),
+            WebClassSyncError::Validation => {
+                records[1]["group_id"] = json!("synthetic-private-body")
+            }
+            WebClassSyncError::Persistence => {
+                observer.execute_batch("CREATE TRIGGER reject_reauth_assignment BEFORE INSERT ON assignment_sources
+                    WHEN NEW.external_id = 'fixture-content-002'
+                    BEGIN SELECT RAISE(ABORT, NEW.scope || NEW.external_id || 'synthetic-private-body'); END;").unwrap();
+            }
+            WebClassSyncError::AuthExpired => unreachable!(),
+        }
+        let mut exchanges = vec![course_request];
+        if matches!(
+            category,
+            WebClassSyncError::Map | WebClassSyncError::Validation | WebClassSyncError::Persistence
+        ) {
+            exchanges.push(request(
+                origin,
+                Some(GROUPS[0]),
+                cookie,
+                &records.to_string(),
+            ));
+        }
+        exchanges
+    }
+
+    const NON_AUTH_ERRORS: [WebClassSyncError; 7] = [
+        WebClassSyncError::Fetch,
+        WebClassSyncError::Parse,
+        WebClassSyncError::CourseValidation,
+        WebClassSyncError::CoursePersistence,
+        WebClassSyncError::Map,
+        WebClassSyncError::Validation,
+        WebClassSyncError::Persistence,
+    ];
+
+    fn assert_failed_import_state(observer: &Connection, category: WebClassSyncError) {
+        let state = snapshot(observer);
+        let course_count = usize::from(matches!(
+            category,
+            WebClassSyncError::Map | WebClassSyncError::Validation | WebClassSyncError::Persistence
+        ));
+        assert_eq!(
+            state.each_ref().map(Vec::len),
+            [0, 0, course_count, course_count, 0]
+        );
+        assert_no_auth_data(&state);
+    }
+
+    #[test]
+    fn every_non_auth_failure_skips_provider_login_and_retry_and_keeps_old_client() {
+        for category in NON_AUTH_ERRORS {
+            let database = TempDatabase::new();
+            let mut store = SqliteStore::open(&database.path).unwrap();
+            let observer = Connection::open(&database.path).unwrap();
+            let mut provider = SyntheticProvider::new(&observer, true);
+            let (mut client, listener, origin) = initial_client();
+            let mut exchanges = failure_requests(category, &origin, OLD_COOKIE, &observer);
+            exchanges.push(request(&origin, None, OLD_COOKIE, "[]"));
+            let server = serve(listener, exchanges, &database.path);
+            let (authenticator, auth_servers) = idle_auth(&database.path);
+            let error = sync_webclass_all_with_reauth(
+                &mut client,
+                &authenticator,
+                &mut provider,
+                &mut store,
+            )
+            .unwrap_err();
+            assert_eq!(error, WebClassReauthSyncError::Sync(category));
+            assert_safe_error(error);
+            assert_eq!(provider.calls, 0);
+            assert!(provider.before_login.is_none());
+            assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+            assert_failed_import_state(&observer, category);
+            finish(server);
+            finish_auth(auth_servers);
+        }
+    }
+
+    #[test]
+    fn unavailable_credentials_skip_login_keep_old_client_and_preserve_partial_progress() {
+        for partial in [false, true] {
+            let database = TempDatabase::new();
+            let mut store = SqliteStore::open(&database.path).unwrap();
+            let observer = Connection::open(&database.path).unwrap();
+            let mut provider = SyntheticProvider::new(&observer, false);
+            let (mut client, listener, origin) = initial_client();
+            let mut exchanges = if partial {
+                partially_expired(&origin)
+            } else {
+                vec![expired(&origin, None, OLD_COOKIE)]
+            };
+            exchanges.push(request(&origin, None, OLD_COOKIE, "[]"));
+            let server = serve(listener, exchanges, &database.path);
+            let (authenticator, auth_servers) = idle_auth(&database.path);
+            let error = sync_webclass_all_with_reauth(
+                &mut client,
+                &authenticator,
+                &mut provider,
+                &mut store,
+            )
+            .unwrap_err();
+            assert_eq!(error, WebClassReauthSyncError::CredentialsUnavailable);
+            assert_safe_error(error);
+            assert_eq!(provider.calls, 1);
+            assert!(!provider.released);
+            let state = snapshot(&observer);
+            assert_eq!(&state, provider.before_login.as_ref().unwrap());
+            assert_eq!(
+                state.each_ref().map(Vec::len),
+                if partial { [3, 3, 2, 2, 0] } else { [0; 5] }
+            );
+            assert_no_auth_data(&state);
+            assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+            finish(server);
+            finish_auth(auth_servers);
+        }
+    }
+
+    #[test]
+    fn login_http_or_protocol_failure_keeps_old_client_and_does_not_retry() {
+        for protocol in [false, true] {
+            let database = TempDatabase::new();
+            let mut store = SqliteStore::open(&database.path).unwrap();
+            let observer = Connection::open(&database.path).unwrap();
+            let mut provider = SyntheticProvider::new(&observer, true);
+            let (mut client, listener, origin) = initial_client();
+            let mut exchanges = partially_expired(&origin);
+            exchanges.push(request(&origin, None, OLD_COOKIE, "[]"));
+            let server = serve(listener, exchanges, &database.path);
+            let mut flow = FullFlow::new(false);
+            flow.exchanges[0].truncate(1);
+            flow.exchanges[2].clear();
+            if protocol {
+                flow.exchanges[1].truncate(2);
+                flow.exchanges[1][1].body = r#"{"message":"synthetic-private-body"}"#.to_owned();
+            } else {
+                flow.exchanges[0][0].status = 500;
+                flow.exchanges[0][0].body = "synthetic-private-body".to_owned();
+                flow.exchanges[1].clear();
+            }
+            let (authenticator, auth_servers) = start_auth(flow, &database.path);
+            let error = sync_webclass_all_with_reauth(
+                &mut client,
+                &authenticator,
+                &mut provider,
+                &mut store,
+            )
+            .unwrap_err();
+            assert_eq!(error, WebClassReauthSyncError::AuthenticationFailed);
+            assert_safe_error(error);
+            assert_eq!(provider.calls, 1);
+            assert!(provider.released);
+            let state = snapshot(&observer);
+            assert_eq!(&state, provider.before_login.as_ref().unwrap());
+            assert_eq!(state.each_ref().map(Vec::len), [3, 3, 2, 2, 0]);
+            assert_no_auth_data(&state);
+            assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+            finish(server);
+            finish_auth(auth_servers);
+        }
+    }
+
+    #[test]
+    fn successful_login_keeps_new_client_even_when_retry_fails_in_any_non_auth_stage() {
+        for category in NON_AUTH_ERRORS {
+            let database = TempDatabase::new();
+            let mut store = SqliteStore::open(&database.path).unwrap();
+            let observer = Connection::open(&database.path).unwrap();
+            let mut provider = SyntheticProvider::new(&observer, true);
+            let (mut client, listener, origin) = initial_client();
+            let server = serve(
+                listener,
+                vec![expired(&origin, None, OLD_COOKIE)],
+                &database.path,
+            );
+            let mut flow = FullFlow::new(false);
+            flow.exchanges[2].extend(failure_requests(
+                category,
+                &flow.endpoints.webclass,
+                NEW_COOKIE,
+                &observer,
+            ));
+            flow.exchanges[2].push(request(&flow.endpoints.webclass, None, NEW_COOKIE, "[]"));
+            let (authenticator, auth_servers) = start_auth(flow, &database.path);
+            let error = sync_webclass_all_with_reauth(
+                &mut client,
+                &authenticator,
+                &mut provider,
+                &mut store,
+            )
+            .unwrap_err();
+            assert_eq!(error, WebClassReauthSyncError::Sync(category));
+            assert_safe_error(error);
+            assert_eq!(provider.calls, 1);
+            assert!(provider.released);
+            assert_eq!(client.fetch_courses_json().unwrap(), "[]");
+            assert_failed_import_state(&observer, category);
+            finish(server);
+            finish_auth(auth_servers);
+        }
     }
 }

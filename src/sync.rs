@@ -14,6 +14,7 @@ use crate::persistence::{AssignmentImportSummary, SqliteStore};
 use crate::webclass::{
     WebClassCourse, WebClassMapError, map_contents_for_group, parse_contents, parse_courses,
 };
+use crate::webclass_auth::{HoseiAuthenticator, HoseiCredentials};
 use crate::webclass_http::{WebClassClient, WebClassHttpError};
 
 /// Fixed stage classifications only; source payloads and underlying errors are discarded.
@@ -206,6 +207,85 @@ fn validate_webclass_courses(courses: &[WebClassCourse]) -> Result<(), WebClassS
     Ok(())
 }
 
+/// Obtain credentials only when requested and lend them to one login attempt.
+///
+/// Providers acquire their owned secret values inside this method and release them
+/// before returning. Invoke the callback exactly once on successful acquisition,
+/// or return `None` without invoking it when unavailable, cancelled or failed.
+/// The callback accepts any credential lifetime; its result cannot borrow those
+/// credentials. No Debug, Clone, serialization or credential storage is required.
+///
+/// Credentials cannot escape through the callback's result:
+/// ```compile_fail
+/// use assignment_manager::sync::WebClassCredentialProvider;
+/// use assignment_manager::webclass_auth::HoseiCredentials;
+/// fn retain_credentials(
+///     provider: &mut impl WebClassCredentialProvider,
+/// ) -> HoseiCredentials<'_> {
+///     provider.with_credentials(|credentials| credentials).unwrap()
+/// }
+/// ```
+pub trait WebClassCredentialProvider {
+    fn with_credentials<R>(
+        &mut self,
+        use_credentials: impl FnOnce(HoseiCredentials<'_>) -> R,
+    ) -> Option<R>;
+}
+
+/// Safe classifications only. `Sync` retains only the fixed sync category, not a cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebClassReauthSyncError {
+    Sync(WebClassSyncError),
+    CredentialsUnavailable,
+    AuthenticationFailed,
+}
+
+impl fmt::Display for WebClassReauthSyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sync(category) => category.fmt(f),
+            Self::CredentialsUnavailable => f.write_str("WebClass sync credentials unavailable"),
+            Self::AuthenticationFailed => f.write_str("WebClass sync reauthentication failed"),
+        }
+    }
+}
+
+// Even the safe sync category is not exposed as an underlying error chain.
+impl Error for WebClassReauthSyncError {}
+
+/// Synchronize with the current client, recovering from authentication expiry once.
+///
+/// Only a first-attempt [`WebClassSyncError::AuthExpired`] acquires credentials
+/// and calls [`HoseiAuthenticator::login`]. Credential or login failure preserves
+/// the old client. Successful login replaces the caller's client before retrying
+/// [`sync_webclass_all_once`], and it stays replaced even if that retry fails.
+/// A second expiry or any other retry error is returned without another login.
+/// Credentials are borrowed only inside the login callback, never retained in a
+/// client, database, result or error. No transaction spans login or an HTTP fetch.
+///
+/// First-attempt commits remain and are safely reimported by the full retry.
+/// Success returns only the final successful attempt's summary, never combined
+/// partial counts from the expired attempt. Existing full-sync failure and
+/// disappearance semantics remain unchanged.
+pub fn sync_webclass_all_with_reauth(
+    client: &mut WebClassClient,
+    authenticator: &HoseiAuthenticator,
+    credential_provider: &mut impl WebClassCredentialProvider,
+    store: &mut SqliteStore,
+) -> Result<WebClassSyncSummary, WebClassReauthSyncError> {
+    match sync_webclass_all_once(client, store) {
+        Ok(summary) => return Ok(summary),
+        Err(WebClassSyncError::AuthExpired) => {}
+        Err(category) => return Err(WebClassReauthSyncError::Sync(category)),
+    }
+    let new_client = credential_provider
+        .with_credentials(|credentials| authenticator.login(credentials))
+        .ok_or(WebClassReauthSyncError::CredentialsUnavailable)?
+        .map_err(|_| WebClassReauthSyncError::AuthenticationFailed)?;
+    *client = new_client;
+    sync_webclass_all_once(client, store).map_err(WebClassReauthSyncError::Sync)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +354,41 @@ mod tests {
                 WebClassSyncError::Persistence,
                 "Persistence",
                 "WebClass sync persistence failed",
+            ),
+        ] {
+            assert_eq!(format!("{error:?}"), debug);
+            assert_eq!(error.to_string(), display);
+            assert!(error.source().is_none());
+        }
+    }
+
+    #[test]
+    fn reauth_sync_errors_have_fixed_display_debug_and_no_source() {
+        for category in [
+            WebClassSyncError::AuthExpired,
+            WebClassSyncError::Fetch,
+            WebClassSyncError::Parse,
+            WebClassSyncError::CourseValidation,
+            WebClassSyncError::CoursePersistence,
+            WebClassSyncError::Map,
+            WebClassSyncError::Validation,
+            WebClassSyncError::Persistence,
+        ] {
+            let error = WebClassReauthSyncError::Sync(category);
+            assert_eq!(format!("{error:?}"), format!("Sync({category:?})"));
+            assert_eq!(error.to_string(), category.to_string());
+            assert!(error.source().is_none());
+        }
+        for (error, debug, display) in [
+            (
+                WebClassReauthSyncError::CredentialsUnavailable,
+                "CredentialsUnavailable",
+                "WebClass sync credentials unavailable",
+            ),
+            (
+                WebClassReauthSyncError::AuthenticationFailed,
+                "AuthenticationFailed",
+                "WebClass sync reauthentication failed",
             ),
         ] {
             assert_eq!(format!("{error:?}"), debug);

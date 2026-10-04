@@ -151,7 +151,15 @@ impl fmt::Display for HoseiAuthError {
 impl Error for HoseiAuthError {}
 
 /// Stateless authenticator. Every login creates a new client and an in-memory cookie jar.
+#[cfg(not(test))]
 pub struct HoseiAuthenticator;
+
+// Private per-instance endpoint selection lets application tests call the public
+// login API through the existing localhost protocol mocks. Absent in production.
+#[cfg(test)]
+pub struct HoseiAuthenticator {
+    test_endpoints: Option<AuthEndpoints>,
+}
 
 impl Default for HoseiAuthenticator {
     fn default() -> Self {
@@ -161,7 +169,16 @@ impl Default for HoseiAuthenticator {
 
 impl HoseiAuthenticator {
     pub fn new() -> Self {
-        Self
+        #[cfg(not(test))]
+        {
+            Self
+        }
+        #[cfg(test)]
+        {
+            Self {
+                test_endpoints: None,
+            }
+        }
     }
 
     /// Log in once and verify `/courses` as a JSON array before returning the client.
@@ -170,6 +187,10 @@ impl HoseiAuthenticator {
         &self,
         credentials: HoseiCredentials<'_>,
     ) -> Result<WebClassClient, HoseiAuthError> {
+        #[cfg(test)]
+        if let Some(endpoints) = &self.test_endpoints {
+            return self.login_with_endpoints(credentials, endpoints);
+        }
         self.login_with_endpoints(credentials, &AuthEndpoints::production())
     }
 
