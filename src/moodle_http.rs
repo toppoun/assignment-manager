@@ -10,15 +10,63 @@ use reqwest::{StatusCode, Url};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-/// The feed label is public; the URL is a bearer secret and is deliberately private.
+/// Explicit, non-secret calendar export contract; never inferred from a token URL.
+/// Only `CourseRelated` permits CATEGORIES to supply a Course key candidate.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoodleExportKind {
+    CourseRelated,
+    AllEvents,
+    /// The caller has not established the export contract. No course inference.
+    Unknown,
+}
+
+impl MoodleExportKind {
+    // Stable namespace suffixes, independent of enum order and Debug output.
+    // New kinds must get distinct suffixes; existing suffixes must never change.
+    fn scope_suffix(self) -> &'static str {
+        match self {
+            Self::CourseRelated => ".course-related",
+            Self::AllEvents => ".all-events",
+            Self::Unknown => ".unknown",
+        }
+    }
+}
+
+/// The scope/kind are public; the URL is a bearer secret and deliberately private.
 /// Production feeds require HTTPS and forbid URL userinfo.
+///
+/// Scope identifies one logical Moodle environment/profile AND export contract.
+/// Callers must use a nonempty safe profile label followed by the kind's fixed
+/// suffix: `.course-related`, `.all-events` or `.unknown`. The supplied scope is
+/// retained exactly. This stateless validation fixes scope -> kind across feeds
+/// and process restarts without a global registry or a new persistence table.
+/// Changing kind requires a new scope; changing environment/profile or contract
+/// details within a kind also requires a new caller-selected profile label.
+/// Legacy unqualified scopes are rejected, never silently rewritten. Reusing an
+/// existing label for a different environment is the caller's responsibility.
 pub struct MoodleFeed {
     scope: String,
+    export_kind: MoodleExportKind,
     url: Url,
 }
 
 impl MoodleFeed {
-    pub fn new(scope: impl Into<String>, secret_url: &str) -> Result<Self, MoodleHttpError> {
+    /// Construct an explicitly declared export. No URL query inference or request.
+    /// ```
+    /// use assignment_manager::moodle_http::{MoodleExportKind, MoodleFeed};
+    /// let feed = MoodleFeed::new(
+    ///     "campus-main.course-related",
+    ///     MoodleExportKind::CourseRelated,
+    ///     "https://example.invalid/calendar/export_execute.php",
+    /// ).unwrap();
+    /// assert_eq!(feed.scope(), "campus-main.course-related");
+    /// ```
+    pub fn new(
+        scope: impl Into<String>,
+        export_kind: MoodleExportKind,
+        secret_url: &str,
+    ) -> Result<Self, MoodleHttpError> {
         let scope = scope.into();
         if scope.is_empty()
             || !scope
@@ -26,6 +74,12 @@ impl MoodleFeed {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
             return Err(MoodleHttpError::InvalidScope);
+        }
+        if !scope
+            .strip_suffix(export_kind.scope_suffix())
+            .is_some_and(|profile| !profile.is_empty())
+        {
+            return Err(MoodleHttpError::ScopeExportKindMismatch);
         }
 
         let url = Url::parse(secret_url).map_err(|_| MoodleHttpError::InvalidUrl)?;
@@ -38,11 +92,19 @@ impl MoodleFeed {
         if url.host().is_none() {
             return Err(MoodleHttpError::InvalidUrl);
         }
-        Ok(Self { scope, url })
+        Ok(Self {
+            scope,
+            export_kind,
+            url,
+        })
     }
 
     pub fn scope(&self) -> &str {
         &self.scope
+    }
+
+    pub fn export_kind(&self) -> MoodleExportKind {
+        self.export_kind
     }
 }
 
@@ -50,6 +112,7 @@ impl fmt::Debug for MoodleFeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MoodleFeed")
             .field("scope", &self.scope)
+            .field("export_kind", &self.export_kind)
             .field("url", &"[redacted]")
             .finish()
     }
@@ -59,6 +122,7 @@ impl fmt::Debug for MoodleFeed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoodleHttpError {
     InvalidScope,
+    ScopeExportKindMismatch,
     InvalidUrl,
     InsecureScheme,
     UserInfoNotAllowed,
@@ -75,6 +139,9 @@ impl fmt::Display for MoodleHttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidScope => write!(f, "invalid Moodle feed scope"),
+            Self::ScopeExportKindMismatch => {
+                write!(f, "Moodle feed scope does not match export kind")
+            }
             Self::InvalidUrl => write!(f, "invalid Moodle calendar URL"),
             Self::InsecureScheme => write!(f, "Moodle calendar URL must use HTTPS"),
             Self::UserInfoNotAllowed => write!(f, "Moodle calendar URL must not contain userinfo"),
@@ -150,7 +217,7 @@ mod tests {
     use crate::import::OriginKind;
     use crate::moodle::{MoodleParseError, map_events, parse_calendar};
 
-    const SCOPE: &str = "cis-moodle-main";
+    const SCOPE: &str = "cis-moodle-main.course-related";
     const BASIC: &str = include_str!("../fixtures/moodle/calendar_basic.ics");
     const SYNTHETIC_TOKEN: &str = "VERY_PRIVATE_MARKER_5_5B";
     const SYNTHETIC_LOCATION: &str = "VERY_PRIVATE_LOCATION_5_5B";
@@ -168,6 +235,7 @@ mod tests {
         assert!(address.ip().is_loopback());
         let mut feed = MoodleFeed::new(
             SCOPE,
+            MoodleExportKind::CourseRelated,
             &format!("https://example.invalid/calendar/export?authtoken={SYNTHETIC_TOKEN}"),
         )
         .unwrap();
@@ -361,16 +429,17 @@ mod tests {
     #[test]
     fn production_feed_requires_https() {
         let url = format!("https://example.invalid/calendar?authtoken={SYNTHETIC_TOKEN}");
-        assert!(MoodleFeed::new(SCOPE, &url).is_ok());
+        assert!(MoodleFeed::new(SCOPE, MoodleExportKind::CourseRelated, &url).is_ok());
         for scheme in ["http", "ftp", "ws", "file"] {
             let url = format!("{scheme}://example.invalid/calendar?authtoken={SYNTHETIC_TOKEN}");
-            let error = MoodleFeed::new(SCOPE, &url).unwrap_err();
+            let error = MoodleFeed::new(SCOPE, MoodleExportKind::CourseRelated, &url).unwrap_err();
             assert_eq!(error, MoodleHttpError::InsecureScheme);
             assert_secret_free(&error);
         }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let feed = local_feed(listener.local_addr().unwrap());
-        let error = MoodleFeed::new(SCOPE, feed.url.as_str()).unwrap_err();
+        let error =
+            MoodleFeed::new(SCOPE, MoodleExportKind::CourseRelated, feed.url.as_str()).unwrap_err();
         assert_eq!(error, MoodleHttpError::InsecureScheme);
         assert_secret_free(&error);
         assert_no_request(&listener);
@@ -386,7 +455,7 @@ mod tests {
         ] {
             let url =
                 format!("https://{userinfo}@example.invalid/calendar?authtoken={SYNTHETIC_TOKEN}");
-            let error = MoodleFeed::new(SCOPE, &url).unwrap_err();
+            let error = MoodleFeed::new(SCOPE, MoodleExportKind::CourseRelated, &url).unwrap_err();
             assert_eq!(error, MoodleHttpError::UserInfoNotAllowed);
             assert_secret_free(&error);
         }
@@ -395,15 +464,73 @@ mod tests {
     #[test]
     fn feed_debug_and_configuration_errors_hide_secret_url() {
         let url = format!("https://example.invalid/calendar?authtoken={SYNTHETIC_TOKEN}");
-        let feed = MoodleFeed::new(SCOPE, &url).unwrap();
-        assert!(!format!("{feed:?}").contains(SYNTHETIC_TOKEN));
-        let error = MoodleFeed::new(&url, &url).unwrap_err();
+        let feed = MoodleFeed::new(SCOPE, MoodleExportKind::CourseRelated, &url).unwrap();
+        let debug = format!("{feed:?}");
+        assert!(debug.contains("CourseRelated"));
+        for forbidden in [SYNTHETIC_TOKEN, &url, "authtoken", "https://", "calendar?"] {
+            assert!(!debug.contains(forbidden));
+        }
+        let error = MoodleFeed::new(&url, MoodleExportKind::CourseRelated, &url).unwrap_err();
         assert_eq!(error, MoodleHttpError::InvalidScope);
         assert_secret_free(&error);
-        let error =
-            MoodleFeed::new(SCOPE, &format!("invalid?authtoken={SYNTHETIC_TOKEN}")).unwrap_err();
+        let error = MoodleFeed::new(
+            SCOPE,
+            MoodleExportKind::CourseRelated,
+            &format!("invalid?authtoken={SYNTHETIC_TOKEN}"),
+        )
+        .unwrap_err();
         assert_eq!(error, MoodleHttpError::InvalidUrl);
         assert_secret_free(&error);
+    }
+
+    #[test]
+    fn export_kind_is_explicit_and_each_scope_accepts_exactly_one_kind() {
+        let url = format!(
+            "https://example.invalid/calendar/export?events=course&authtoken={SYNTHETIC_TOKEN}"
+        );
+        let contracts = [
+            (
+                "same-profile.course-related",
+                MoodleExportKind::CourseRelated,
+            ),
+            ("same-profile.all-events", MoodleExportKind::AllEvents),
+            ("same-profile.unknown", MoodleExportKind::Unknown),
+        ];
+        for (scope, intended) in contracts {
+            for (_, declared) in contracts {
+                let result = MoodleFeed::new(scope, declared, &url);
+                if intended == declared {
+                    let feed = result.unwrap();
+                    assert_eq!(feed.scope(), scope);
+                    assert_eq!(feed.export_kind(), intended);
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error, MoodleHttpError::ScopeExportKindMismatch);
+                    assert_secret_free(&error);
+                }
+            }
+        }
+        // Validation uses the scope itself, without any live feed or registry.
+        drop(MoodleFeed::new(SCOPE, MoodleExportKind::CourseRelated, &url).unwrap());
+        assert_eq!(
+            MoodleFeed::new(SCOPE, MoodleExportKind::AllEvents, &url).unwrap_err(),
+            MoodleHttpError::ScopeExportKindMismatch
+        );
+        for (scope, kind) in [
+            ("legacy-unqualified", MoodleExportKind::CourseRelated),
+            (".course-related", MoodleExportKind::CourseRelated),
+            (".all-events", MoodleExportKind::AllEvents),
+            (".unknown", MoodleExportKind::Unknown),
+            ("same-profile.all-events.extra", MoodleExportKind::AllEvents),
+        ] {
+            let error = MoodleFeed::new(scope, kind, &url).unwrap_err();
+            assert_eq!(error, MoodleHttpError::ScopeExportKindMismatch);
+            assert_secret_free(&error);
+        }
+        // Query text cannot enable course inference for an AllEvents declaration.
+        let all =
+            MoodleFeed::new("same-profile.all-events", MoodleExportKind::AllEvents, &url).unwrap();
+        assert_eq!(all.export_kind(), MoodleExportKind::AllEvents);
     }
 
     #[test]
@@ -427,6 +554,7 @@ mod tests {
     fn every_http_error_has_secret_free_display_debug_and_source() {
         for error in [
             MoodleHttpError::InvalidScope,
+            MoodleHttpError::ScopeExportKindMismatch,
             MoodleHttpError::InvalidUrl,
             MoodleHttpError::InsecureScheme,
             MoodleHttpError::UserInfoNotAllowed,
@@ -665,10 +793,25 @@ mod tests {
                 .set_completion(&original.id, CompletionState::Completed)
                 .unwrap();
             let domain = domain_snapshot(&observer);
-            for suffix in [" テスト予定", " の受験可能期間の開始"] {
+            for (suffix, categories) in [" テスト予定", " の受験可能期間の開始"]
+                .into_iter()
+                .flat_map(|suffix| {
+                    [
+                        "",
+                        "CATEGORIES:X,Y",
+                        "CATEGORIES:X,X",
+                        "CATEGORIES: ",
+                        r"CATEGORIES:X\x",
+                    ]
+                    .into_iter()
+                    .map(move |categories| (suffix, categories))
+                })
+            {
                 // Force an old observation rather than relying on timer resolution.
                 observer.execute_batch("UPDATE assignment_sources SET last_seen_at = '2000-01-01T00:00:00.000000001Z'; UPDATE sync_scopes SET last_synced_at = '2000-01-01T00:00:00.000000001Z'").unwrap();
-                let body = BASIC.replace("の提出期限", suffix);
+                let body = BASIC
+                    .replace("の提出期限", suffix)
+                    .replace("CATEGORIES:Java2-2026", categories);
                 let before = Utc::now();
                 assert_eq!(
                     mock.sync(&client, &mut store, "200 OK", &body).unwrap(),
@@ -718,6 +861,59 @@ mod tests {
             assert_eq!(reappeared.id, original.id);
             assert_eq!(reappeared.completion, CompletionState::Completed);
             assert_eq!(domain_snapshot(&observer), domain);
+        }
+
+        #[test]
+        fn unusable_category_metadata_keeps_import_seen_and_scope_freshness() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let client = MoodleClient::new().unwrap();
+            let scope = SyncScope::MoodleFeed(mock.feed.scope().into());
+            let mut original = None;
+            for categories in [
+                "",
+                "CATEGORIES:",
+                "CATEGORIES: \t ",
+                "CATEGORIES:X,Y",
+                "CATEGORIES:X,X",
+                "CATEGORIES:X\nCATEGORIES:Y",
+                "CATEGORIES:X,",
+                "CATEGORIES:,X",
+                r"CATEGORIES:X\x",
+                r"CATEGORIES:X\",
+            ] {
+                let body = BASIC.replace("CATEGORIES:Java2-2026", categories);
+                let before = Utc::now();
+                let summary = mock.sync(&client, &mut store, "200 OK", &body).unwrap();
+                let assignment = stored(&store, "1001@cms.example.edu");
+                if let Some(original) = &original {
+                    assert_eq!(summary.unchanged, 1);
+                    assert_eq!(&assignment, original);
+                } else {
+                    assert_eq!(summary.created, 1);
+                    original = Some(assignment.clone());
+                }
+                assert_eq!(assignment.course_id, None);
+                let seen = store
+                    .get_assignment_last_seen_at(&key("1001@cms.example.edu"))
+                    .unwrap()
+                    .unwrap();
+                assert!(before <= seen && seen <= Utc::now());
+                assert_eq!(store.get_last_synced_at(&scope).unwrap(), Some(seen));
+            }
+            for table in ["courses", "course_sources"] {
+                let count: i64 = observer
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+            let version: i64 = observer
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 2);
         }
 
         #[test]

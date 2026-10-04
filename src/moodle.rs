@@ -4,22 +4,60 @@ use std::error::Error;
 use std::fmt;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use ical::IcalParser;
 use ical::property::Property;
-use ical::{IcalParser, LineReader};
 
 use crate::domain::{Deadline, SubmissionTarget};
 use crate::import::{AssignmentCandidate, ExternalRecordKey, OriginKind};
+use crate::moodle_http::{MoodleExportKind, MoodleFeed};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoodleEvent {
     pub uid: String,
     pub summary: String,
     pub description: Option<String>,
-    /// Category text is retained for inspection; it is not linked to a CourseId.
-    pub categories: Vec<String>,
+    /// Decoded TEXT values, in source order across all CATEGORIES properties.
+    /// Empty values and duplicates are retained; no business normalization occurs.
+    /// `Ok(vec![])` means absent metadata. `Err` means unusable category syntax,
+    /// not an invalid assignment. No partial list is exposed after a decode failure.
+    ///
+    /// Unlike `ical` 0.11's LineReader (which trims physical lines) and property
+    /// parser (which removes leading colons), this metadata comes from raw ICS.
+    /// CRLF/LF delimiters and exactly one fold SPACE/HTAB are removed; all other
+    /// value whitespace is preserved. The other event fields retain the existing
+    /// crate's behavior. Input is UTF-8 `&str`; invalid UTF-8 is rejected upstream.
+    pub categories: Result<Vec<String>, MoodleCategoryError>,
     pub dtstart: DateTime<Utc>,
     pub dtend: Option<DateTime<Utc>>,
     pub last_modified: Option<DateTime<Utc>>,
+}
+
+/// Fixed metadata classification; never retains raw ICS or category values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoodleCategoryError {
+    InvalidText,
+}
+
+impl fmt::Display for MoodleCategoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid Moodle CATEGORIES TEXT syntax")
+    }
+}
+
+impl Error for MoodleCategoryError {}
+
+type ParsedCategories = Result<Vec<String>, MoodleCategoryError>;
+
+/// An opaque source-level Course key candidate, without discovery or persistence.
+/// Duplicate values count separately. Trimming is used only to reject blanks.
+pub fn single_course_category<'a>(event: &'a MoodleEvent, feed: &MoodleFeed) -> Option<&'a str> {
+    if feed.export_kind() != MoodleExportKind::CourseRelated {
+        return None;
+    }
+    let [category] = event.categories.as_ref().ok()?.as_slice() else {
+        return None;
+    };
+    (!category.trim().is_empty()).then_some(category.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,9 +116,10 @@ impl fmt::Display for MoodleParseError {
 
 impl Error for MoodleParseError {}
 
-/// Parse one calendar. Any malformed VEVENT fails the whole import.
+/// Parse one calendar. Structural/required-event errors fail the whole import;
+/// unusable CATEGORIES metadata is retained separately on an otherwise valid event.
 pub fn parse_calendar(ics: &str) -> Result<Vec<MoodleEvent>, MoodleParseError> {
-    validate_component_boundaries(ics)?;
+    let categories = parse_category_metadata(ics)?;
     let calendars = IcalParser::new(ics.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| MoodleParseError::InvalidIcs("invalid component or property"))?;
@@ -90,20 +129,29 @@ pub fn parse_calendar(ics: &str) -> Result<Vec<MoodleEvent>, MoodleParseError> {
         ));
     };
 
+    if calendar.events.len() != categories.len() {
+        return Err(MoodleParseError::InvalidIcs(
+            "inconsistent VEVENT boundaries",
+        ));
+    }
     calendar
         .events
         .iter()
+        .zip(categories)
         .enumerate()
-        .map(|(index, event)| parse_event(&event.properties, index + 1))
+        .map(|(index, (event, categories))| parse_event(&event.properties, index + 1, categories))
         .collect()
 }
 
-// The crate parses properties and unfolding, but does not check matching END names.
-fn validate_component_boundaries(ics: &str) -> Result<(), MoodleParseError> {
+// Only unfolding, the existing matching-boundary validation, and direct VEVENT
+// CATEGORIES are handled here. `ical` still parses components/properties;
+// the existing datetime validation is unchanged.
+// Calendar, VTODO, VTIMEZONE and nested VALARM categories must not leak into events.
+fn parse_category_metadata(ics: &str) -> Result<Vec<ParsedCategories>, MoodleParseError> {
     let mut stack: Vec<String> = Vec::new();
     let mut calendar_seen = false;
-    for line in LineReader::new(ics.as_bytes()) {
-        let line = line.as_str();
+    let mut events: Vec<ParsedCategories> = Vec::new();
+    for line in unfold_content_lines(ics) {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("BEGIN") {
                 if stack.is_empty() {
@@ -111,6 +159,9 @@ fn validate_component_boundaries(ics: &str) -> Result<(), MoodleParseError> {
                         return Err(MoodleParseError::InvalidIcs("expected one VCALENDAR root"));
                     }
                     calendar_seen = true;
+                }
+                if stack.len() == 1 && value.eq_ignore_ascii_case("VEVENT") {
+                    events.push(Ok(Vec::new()));
                 }
                 stack.push(value.to_owned());
                 continue;
@@ -128,19 +179,115 @@ fn validate_component_boundaries(ics: &str) -> Result<(), MoodleParseError> {
         if stack.is_empty() && !line.is_empty() {
             return Err(MoodleParseError::InvalidIcs("content outside VCALENDAR"));
         }
+        if stack.len() == 2 && stack[1].eq_ignore_ascii_case("VEVENT") {
+            let name = line.split([';', ':']).next().unwrap_or("");
+            if name.eq_ignore_ascii_case("CATEGORIES") {
+                // Locate the value delimiter outside quoted parameter values.
+                // Parameters themselves are still validated by the `ical` parser.
+                let mut quoted = false;
+                let value = line.char_indices().find_map(|(index, character)| {
+                    if character == '"' {
+                        quoted = !quoted;
+                    }
+                    (character == ':' && !quoted).then(|| &line[index + 1..])
+                });
+                let decoded = value
+                    .ok_or(MoodleCategoryError::InvalidText)
+                    .and_then(decode_categories);
+                let categories = events.last_mut().expect("direct VEVENT has metadata slot");
+                match decoded {
+                    Ok(values) => {
+                        if let Ok(categories) = categories {
+                            categories.extend(values);
+                        }
+                    }
+                    Err(error) => *categories = Err(error),
+                }
+            }
+        }
     }
     if !calendar_seen || !stack.is_empty() {
         return Err(MoodleParseError::InvalidIcs(
             "unclosed or missing VCALENDAR",
         ));
     }
-    Ok(())
+    Ok(events)
+}
+
+// RFC 5545 section 3.1. Accept LF as well for existing offline fixtures. Only
+// strip a CR that belongs to CRLF, and one ASCII SPACE/HTAB from continuations.
+fn unfold_content_lines(ics: &str) -> Vec<String> {
+    let mut unfolded: Vec<String> = Vec::new();
+    for physical in ics.split_inclusive('\n') {
+        let line = physical
+            .strip_suffix("\r\n")
+            .or_else(|| physical.strip_suffix('\n'))
+            .unwrap_or(physical);
+        if let Some(continuation) = line.strip_prefix([' ', '\t'])
+            && let Some(previous) = unfolded.last_mut()
+        {
+            previous.push_str(continuation);
+            continue;
+        }
+        unfolded.push(line.to_owned());
+    }
+    unfolded
+}
+
+// Split while escapes are still present. Decoding first would make an escaped
+// comma indistinguishable from a list separator. Empty TEXT values are retained.
+fn decode_categories(value: &str) -> ParsedCategories {
+    let mut values = Vec::new();
+    let mut start = 0;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == ',' {
+            values.push(decode_category_text(&value[start..index])?);
+            start = index + 1;
+        }
+    }
+    values.push(decode_category_text(&value[start..])?);
+    Ok(values)
+}
+
+fn decode_category_text(value: &str) -> Result<String, MoodleCategoryError> {
+    // TEXT forbids literal semicolons and control characters other than HTAB.
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if !matches!(characters.next(), Some('\\' | ',' | ';' | 'n' | 'N')) {
+                return Err(MoodleCategoryError::InvalidText);
+            }
+        } else if character == ';' || (character.is_ascii_control() && character != '\t') {
+            return Err(MoodleCategoryError::InvalidText);
+        }
+    }
+    // Reuse the existing TEXT escape decoder, with a metadata-only safe error.
+    decode_text(value).map_err(|_| MoodleCategoryError::InvalidText)
 }
 
 fn parse_event(
     properties: &[Property],
     event_index: usize,
+    categories: ParsedCategories,
 ) -> Result<MoodleEvent, MoodleParseError> {
+    let categories = if properties.iter().any(|property| {
+        property.name.eq_ignore_ascii_case("CATEGORIES")
+            && property.params.as_ref().is_some_and(|params| {
+                params.iter().any(|(name, values)| {
+                    name.eq_ignore_ascii_case("VALUE")
+                        && !(values.len() == 1 && values[0].eq_ignore_ascii_case("TEXT"))
+                })
+            })
+    }) {
+        Err(MoodleCategoryError::InvalidText)
+    } else {
+        categories
+    };
     let uid = property(properties, "UID")?
         .and_then(|value| value.value.as_deref())
         .filter(|value| !value.is_empty())
@@ -154,11 +301,6 @@ fn parse_event(
     let description = property(properties, "DESCRIPTION")?
         .map(|value| decode_text(value.value.as_deref().unwrap_or("")))
         .transpose()?;
-    let categories = properties
-        .iter()
-        .filter(|value| value.name == "CATEGORIES")
-        .map(|value| decode_text(value.value.as_deref().unwrap_or("")))
-        .collect::<Result<Vec<_>, _>>()?;
     let dtstart = property(properties, "DTSTART")?
         .ok_or(MoodleParseError::MissingDtstart { event_index })
         .and_then(|value| parse_datetime(value, "DTSTART", event_index))?;
@@ -313,6 +455,7 @@ mod tests {
     const MULTIPLE: &str = include_str!("../fixtures/moodle/calendar_multiple.ics");
     const EMPTY: &str = include_str!("../fixtures/moodle/calendar_empty.ics");
     const EDGE_CASES: &str = include_str!("../fixtures/moodle/calendar_edge_cases.ics");
+    const COURSE_RELATED: &str = include_str!("../fixtures/moodle/calendar_course_related.ics");
     const PRIVATE_MARKER: &str = "VERY_PRIVATE_MARKER_5_5B";
 
     fn assert_private_marker_absent(error: &dyn Error) {
@@ -333,6 +476,191 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn category_calendar(properties: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:category-test@example.invalid\nSUMMARY:「Synthetic task」の提出期限\nDTSTART:20261004T000000Z\n{properties}\nEND:VEVENT\nEND:VCALENDAR\n"
+        )
+    }
+
+    fn course_feed() -> MoodleFeed {
+        MoodleFeed::new(
+            "synthetic-main.course-related",
+            MoodleExportKind::CourseRelated,
+            "https://example.invalid/calendar/export",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn category_values_preserve_list_syntax_order_duplicates_and_empty_values() {
+        let baseline = map_events(&parse_calendar(&category_calendar("")).unwrap(), SCOPE);
+        for (properties, expected) in [
+            ("", vec![]),
+            ("CATEGORIES:", vec![""]),
+            ("CATEGORIES:X", vec!["X"]),
+            ("CATEGORIES: \t \u{3000}", vec![" \t \u{3000}"]),
+            ("CATEGORIES:X\nCATEGORIES:Y", vec!["X", "Y"]),
+            ("CATEGORIES:X,Y", vec!["X", "Y"]),
+            (r"CATEGORIES:X\,Y", vec!["X,Y"]),
+            (r"CATEGORIES:X\,Y,Z", vec!["X,Y", "Z"]),
+            ("CATEGORIES:X,X", vec!["X", "X"]),
+            ("CATEGORIES:X,", vec!["X", ""]),
+            ("CATEGORIES:,X", vec!["", "X"]),
+            ("CATEGORIES:X\nCATEGORIES:", vec!["X", ""]),
+            (r"CATEGORIES:X\\Y", vec![r"X\Y"]),
+            (r"CATEGORIES:X\\,Y", vec![r"X\", "Y"]),
+            (r"CATEGORIES:X\\\,Y", vec![r"X\,Y"]),
+            (r"CATEGORIES:X\;Y", vec!["X;Y"]),
+            (r"CATEGORIES:X\nY\NZ", vec!["X\nY\nZ"]),
+            ("CATEGORIES:Z,a,Z", vec!["Z", "a", "Z"]),
+            ("categories;LANGUAGE=ja:X", vec!["X"]),
+            ("CATEGORIES;VALUE=TEXT:X", vec!["X"]),
+            ("CATEGORIES;X-INFO=\"a:b,c\":X\\,Y", vec!["X,Y"]),
+            ("CATEGORIES::X", vec![":X"]),
+        ] {
+            let events = parse_calendar(&category_calendar(properties)).unwrap();
+            assert_eq!(events[0].categories.as_ref().unwrap(), &expected);
+            // Metadata ambiguity never changes an otherwise valid assignment.
+            assert_eq!(map_events(&events, SCOPE), baseline);
+        }
+    }
+
+    #[test]
+    fn raw_categories_unfold_without_the_dependency_whitespace_loss() {
+        for (properties, expected) in [
+            ("CATEGORIES:  AbC \t ", "  AbC \t "),
+            (
+                "CATEGORIES: first \t\n  second\t \n\t third  ",
+                " first \t second\t  third  ",
+            ),
+            ("CATEGORIES:Java2-\n 2026", "Java2-2026"),
+            ("CATE\n GORIES:X\\\n\t,Y", "X,Y"),
+            ("CATEGORIES:X\\n\n Y", "X\nY"),
+            ("CATEGORIES:e\u{301} Ａa", "e\u{301} Ａa"),
+        ] {
+            let calendar = category_calendar(properties);
+            for calendar in [calendar.clone(), calendar.replace('\n', "\r\n")] {
+                let events = parse_calendar(&calendar).unwrap();
+                assert_eq!(events[0].categories.as_ref().unwrap(), &[expected]);
+                assert_eq!(
+                    single_course_category(&events[0], &course_feed()),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn categories_stay_with_their_direct_event_and_ignore_other_components() {
+        let calendar = category_calendar(
+            "CATEGORIES:X\nBEGIN:VALARM\nCATEGORIES:alarm-category\nEND:VALARM",
+        )
+        .replace("VERSION:2.0", "VERSION:2.0\nCATEGORIES:calendar-category\nBEGIN:VTODO\nCATEGORIES:todo-category\nEND:VTODO")
+        .replace("END:VCALENDAR", "BEGIN:VEVENT\nUID:second@example.invalid\nSUMMARY:Second\nDTSTART:20261004T000000Z\nCATEGORIES:Y,Z\nEND:VEVENT\nEND:VCALENDAR");
+        let events = parse_calendar(&calendar).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].categories.as_ref().unwrap(), &["X"]);
+        assert_eq!(events[1].categories.as_ref().unwrap(), &["Y", "Z"]);
+    }
+
+    #[test]
+    fn invalid_category_text_is_metadata_failure_without_partial_course_key() {
+        for properties in [
+            r"CATEGORIES:X\x",
+            r"CATEGORIES:X\",
+            "CATEGORIES:X;Y",
+            "CATEGORIES:X\u{7}Y",
+            "CATEGORIES:X\rY",
+            "CATEGORIES;VALUE=DATE:20261004",
+            "CATEGORIES:X\nCATEGORIES:Y\\x",
+            "CATEGORIES:X\\x\nCATEGORIES:Y",
+        ] {
+            let events = parse_calendar(&category_calendar(properties)).unwrap();
+            assert_eq!(events[0].categories, Err(MoodleCategoryError::InvalidText));
+            assert_eq!(single_course_category(&events[0], &course_feed()), None);
+            assert_eq!(map_events(&events, SCOPE).len(), 1);
+        }
+        let calendar = category_calendar(&format!("CATEGORIES:{PRIVATE_MARKER}\\x"));
+        let events = parse_calendar(&calendar).unwrap();
+        assert_private_marker_absent(events[0].categories.as_ref().unwrap_err());
+    }
+
+    #[test]
+    fn category_error_display_debug_and_source_do_not_expose_ics_or_token_url() {
+        let url = format!(
+            "https://example.invalid/calendar/export?authtoken={PRIVATE_MARKER}&events=course"
+        );
+        let calendar = category_calendar(&format!("CATEGORIES:{url}\\x"));
+        let events = parse_calendar(&calendar).unwrap();
+        let error = events[0].categories.as_ref().unwrap_err();
+        let rendered = format!("{error} {error:?}");
+        for forbidden in [
+            calendar.as_str(),
+            url.as_str(),
+            PRIVATE_MARKER,
+            "authtoken",
+            "events=course",
+            "BEGIN:VCALENDAR",
+            "CATEGORIES:",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert!(error.source().is_none());
+        assert_eq!(map_events(&events, SCOPE).len(), 1);
+    }
+
+    #[test]
+    fn course_key_requires_course_related_export_and_exactly_one_nonblank_value() {
+        let course = course_feed();
+        let all = MoodleFeed::new(
+            "synthetic-main.all-events",
+            MoodleExportKind::AllEvents,
+            "https://example.invalid/calendar/export?events=course",
+        )
+        .unwrap();
+        let unknown = MoodleFeed::new(
+            "synthetic-main.unknown",
+            MoodleExportKind::Unknown,
+            "https://example.invalid/calendar/export",
+        )
+        .unwrap();
+        for (properties, expected) in [
+            ("CATEGORIES:X", Some("X")),
+            (r"CATEGORIES:X\,Y", Some("X,Y")),
+            ("CATEGORIES: X \t", Some(" X \t")),
+            ("", None),
+            ("CATEGORIES:", None),
+            ("CATEGORIES: \t\u{3000}", None),
+            (r"CATEGORIES:\n\N", None),
+            ("CATEGORIES:X,Y", None),
+            ("CATEGORIES:X,X", None),
+            ("CATEGORIES:X\nCATEGORIES:X", None),
+            ("CATEGORIES:X,", None),
+            ("CATEGORIES:,X", None),
+            (r"CATEGORIES:X\x", None),
+        ] {
+            let events = parse_calendar(&category_calendar(properties)).unwrap();
+            assert_eq!(single_course_category(&events[0], &course), expected);
+            assert_eq!(single_course_category(&events[0], &all), None);
+            assert_eq!(single_course_category(&events[0], &unknown), None);
+        }
+    }
+
+    #[test]
+    fn synthetic_course_related_export_shape_supplies_single_course_keys() {
+        let events = parse_calendar(COURSE_RELATED).unwrap();
+        assert_eq!(events.len(), 3);
+        let feed = course_feed();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| single_course_category(event, &feed))
+                .collect::<Vec<_>>(),
+            [Some("2026-DB"), Some("Java2-2026"), Some("AI2026_Ak")]
+        );
+        assert_eq!(map_events(&events, feed.scope()).len(), 2);
+    }
+
     #[test]
     fn basic_deadline_maps_to_one_candidate() {
         let events = parse_calendar(BASIC).unwrap();
@@ -341,7 +669,7 @@ mod tests {
         assert_eq!(event.uid, "1001@cms.example.edu");
         assert_eq!(event.summary, "「演習課題01」の提出期限");
         assert_eq!(event.description.as_deref(), Some(""));
-        assert_eq!(event.categories, ["Java2-2026"]);
+        assert_eq!(event.categories.as_ref().unwrap(), &["Java2-2026"]);
         assert_eq!(event.dtstart, utc("2026-09-27T14:59:00Z"));
         assert_eq!(event.dtend, Some(event.dtstart));
         assert_eq!(event.last_modified, Some(utc("2026-09-20T09:12:59Z")));
@@ -442,7 +770,7 @@ mod tests {
         let events = parse_calendar(EDGE_CASES).unwrap();
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].description.as_deref(), Some(""));
-        assert_eq!(events[0].categories, ["2026-DB"]);
+        assert_eq!(events[0].categories.as_ref().unwrap(), &["2026-DB"]);
         assert_eq!(classify_event(&events[0]), MoodleEventKind::AvailabilityEnd);
         assert_eq!(
             events[1].summary,
