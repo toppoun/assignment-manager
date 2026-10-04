@@ -4,6 +4,7 @@
 mod commands;
 mod dto;
 mod error;
+mod list_query;
 mod storage;
 
 use error::ApplicationError;

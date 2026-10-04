@@ -8,6 +8,24 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AssignmentListDto {
+    pub items: Vec<AssignmentDto>,
+    /// All courses referenced by assignments, in core Course sort order.
+    pub courses: Vec<CourseDto>,
+    pub total_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadlineStatusDto {
+    Overdue,
+    Today,
+    Upcoming,
+    None,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssignmentDto {
     pub id: String,
     pub title: String,
@@ -17,6 +35,7 @@ pub struct AssignmentDto {
     // The initial UI needs presence only; no submission/token URL crosses IPC.
     pub has_submission_url: bool,
     pub course: Option<CourseDto>,
+    pub status: DeadlineStatusDto,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +126,7 @@ impl From<AssignmentListItem> for AssignmentDto {
             },
             has_submission_url: item.submission_url.is_some(),
             course: item.course.map(Into::into),
+            status: DeadlineStatusDto::None,
         }
     }
 }

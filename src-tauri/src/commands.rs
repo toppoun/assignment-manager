@@ -1,16 +1,18 @@
 use tauri::State;
 
 use crate::{
-    dto::{AssignmentDto, CompletionDto},
+    dto::{AssignmentListDto, CompletionDto},
     error::ApplicationError,
+    list_query::ListRequest,
     storage::DesktopState,
 };
 
 #[tauri::command]
 pub async fn list_assignments(
+    request: ListRequest,
     state: State<'_, DesktopState>,
-) -> Result<Vec<AssignmentDto>, ApplicationError> {
-    state.list().await
+) -> Result<AssignmentListDto, ApplicationError> {
+    state.list(request).await
 }
 
 #[tauri::command]

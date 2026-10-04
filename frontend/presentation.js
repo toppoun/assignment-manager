@@ -1,25 +1,73 @@
 const dateTimeFormat = new Intl.DateTimeFormat(undefined, {
   year: "numeric", month: "2-digit", day: "2-digit",
-  hour: "2-digit", minute: "2-digit", second: "2-digit",
-  timeZoneName: "short",
+  hour: "2-digit", minute: "2-digit", timeZoneName: "short",
 });
+
+export const DEFAULT_CONTROLS = Object.freeze({
+  completion: "incomplete", deadline: "all", course: "all", sort: "deadline",
+});
+
+export function buildQueryRequest(controls) {
+  if (!["all", "incomplete", "completed"].includes(controls.completion)
+      || !["all", "overdue", "within_seven_days", "today"].includes(controls.deadline)
+      || !["deadline", "course", "title"].includes(controls.sort)) {
+    throw new Error("Invalid controls");
+  }
+  let course;
+  if (controls.course === "all" || controls.course === "unassigned") {
+    course = { kind: controls.course };
+  } else if (controls.course.startsWith("course:") && controls.course.length > 7) {
+    course = { kind: "course", id: controls.course.slice(7) };
+  } else {
+    throw new Error("Invalid course selection");
+  }
+  return { completion: controls.completion, course, deadline: controls.deadline, sort: controls.sort };
+}
+
+// Server group order comes from core Course sort. Retain core item order inside groups.
+export function groupAssignments(items, courses) {
+  const groups = new Map(courses.map(course => [course.id, { course, items: [] }]));
+  const unassigned = { course: null, items: [] };
+  for (const item of items) {
+    if (item.course === null) {
+      unassigned.items.push(item);
+    } else {
+      const group = groups.get(item.course.id);
+      if (!group) throw new Error("Missing course metadata");
+      group.items.push(item);
+    }
+  }
+  const result = [...groups.values()].filter(group => group.items.length > 0);
+  if (unassigned.items.length) result.push(unassigned);
+  return result;
+}
+
+export function emptyState(response) {
+  if (response.totalCount === 0) {
+    return { title: "課題はまだありません", description: "保存されている課題は0件です。", filtered: false };
+  }
+  if (response.items.length === 0) {
+    return { title: "条件に一致する課題はありません", description: "絞り込み条件を変更してみてください。", filtered: true };
+  }
+  return null;
+}
 
 export function deadlineLabel(deadline) {
   switch (deadline.kind) {
     case "date_only":
-      // Keep a calendar date as a calendar date; never parse it as UTC midnight.
-      return `締切: ${deadline.value}（日付のみ）`;
+      // Format only; never turn a calendar date into an instant or evaluate it.
+      return `締切: ${deadline.value.replace(/^([+-]?\d+)-(\d{2})-(\d{2})$/, "$1/$2/$3")}（日付のみ）`;
     case "date_time":
       return `締切: ${dateTimeFormat.format(new Date(deadline.value))}（日時）`;
     case "none":
-      return "締切なし";
+      return "期限なし";
     default:
       return "締切を表示できません";
   }
 }
 
 export function courseLabel(course) {
-  if (!course) return "Course未設定";
+  if (!course) return "未所属";
   const prefix = course.origin === "moodle" ? "Course表示ラベル" : "Course";
   return `${prefix}: ${course.displayLabel}`;
 }
@@ -27,24 +75,28 @@ export function courseLabel(course) {
 export function originLabel(course) {
   if (!course) return null;
   return {
-    moodle: "Moodle",
-    web_class: "WebClass",
-    manual: "手動",
-    unbound: "手動 / 連携なし",
+    moodle: "Moodle", web_class: "WebClass", manual: "手動", unbound: "手動 / 連携なし",
   }[course.origin] ?? "連携なし";
+}
+
+export function courseOptionLabel(course) {
+  return `${course.displayLabel} · ${originLabel(course)}${course.origin === "moodle" ? "（表示ラベル）" : ""}`;
+}
+
+// No clock or deadline comparison: Rust supplies the semantic status.
+export function statusPresentation(status, completion) {
+  if (completion === "completed") return null;
+  const labels = { overdue: "期限切れ", today: "今日", upcoming: "7日以内" };
+  return Object.hasOwn(labels, status) ? { label: labels[status], className: `badge-${status}` } : null;
 }
 
 export function submissionLabel(submission) {
   return {
-    unknown: "提出先: 未確認",
-    none: "提出不要",
-    moodle: "提出先: Moodle",
-    web_class: "提出先: WebClass",
-    external: "提出先: 外部",
+    unknown: "提出先: 未確認", none: "提出不要", moodle: "提出先: Moodle",
+    web_class: "提出先: WebClass", external: "提出先: 外部",
   }[submission] ?? "提出先: 未確認";
 }
 
-// Never display an arbitrary rejection or its message, even for IPC/framework errors.
 export function safeErrorMessage(error) {
   const messages = {
     data_directory: "アプリの保存先を準備できませんでした。",
@@ -52,10 +104,20 @@ export function safeErrorMessage(error) {
     storage: "保存データを読み書きできませんでした。",
     not_found: "課題が見つかりません。一覧を再読み込みしてください。",
     invalid_assignment_id: "課題を指定できませんでした。",
+    invalid_query: "一覧の条件を指定できませんでした。",
     busy: "処理が混み合っています。少し待って再試行してください。",
     unavailable: "アプリの処理を実行できませんでした。再起動してください。",
   };
   return Object.hasOwn(messages, error?.code)
     ? messages[error.code]
     : "処理を完了できませんでした。再試行してください。";
+}
+
+export function operationErrorMessage(operation, error) {
+  const prefixes = {
+    query: "一覧の取得に失敗しました。",
+    toggle: "完了状態を変更できませんでした。",
+    refresh_after_toggle: "完了状態は保存しましたが、一覧を更新できませんでした。再読み込みしてください。",
+  };
+  return `${prefixes[operation]} ${safeErrorMessage(error)}`;
 }

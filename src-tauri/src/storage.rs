@@ -5,18 +5,14 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use assignment_manager::{
-    actions,
-    domain::AssignmentId,
-    persistence::SqliteStore,
-    query::{AssignmentListOptions, QueryTimeContext, query_assignments},
-};
-use chrono::{DateTime, Local, Offset, TimeZone, Utc};
+use assignment_manager::{actions, domain::AssignmentId, persistence::SqliteStore};
+use chrono::Local;
 use tokio::sync::oneshot;
 
 use crate::{
-    dto::{AssignmentDto, CompletionDto},
+    dto::{AssignmentListDto, CompletionDto},
     error::ApplicationError,
+    list_query::{ListRequest, QueryClock, list_from_store},
 };
 
 const DATABASE_FILENAME: &str = "assignment-manager.db";
@@ -24,7 +20,7 @@ const QUEUE_CAPACITY: usize = 32;
 type Reply<T> = oneshot::Sender<Result<T, ApplicationError>>;
 
 enum Request {
-    List(Reply<Vec<AssignmentDto>>),
+    List(ListRequest, Reply<AssignmentListDto>),
     Toggle(String, Reply<CompletionDto>),
 }
 
@@ -51,9 +47,10 @@ impl DesktopState {
                 let mut store = directory.and_then(|path| open_app_store(&path));
                 for request in receiver {
                     match request {
-                        Request::List(reply) => {
+                        Request::List(request, reply) => {
                             let result = match &store {
-                                Ok(store) => list_from_store(store),
+                                Ok(store) => QueryClock::from_local(Local::now())
+                                    .and_then(|clock| list_from_store(store, &request, &clock)),
                                 Err(error) => Err(*error),
                             };
                             let _ = reply.send(result);
@@ -87,9 +84,9 @@ impl DesktopState {
             })
     }
 
-    pub async fn list(&self) -> Result<Vec<AssignmentDto>, ApplicationError> {
+    pub async fn list(&self, request: ListRequest) -> Result<AssignmentListDto, ApplicationError> {
         let (reply, response) = oneshot::channel();
-        self.send(Request::List(reply))?;
+        self.send(Request::List(request, reply))?;
         response.await.map_err(|_| ApplicationError::Unavailable)?
     }
 
@@ -117,32 +114,22 @@ fn open_app_store(directory: &Path) -> Result<SqliteStore, ApplicationError> {
     SqliteStore::open(path).map_err(|_| ApplicationError::DatabaseStartup)
 }
 
-fn time_context<T: TimeZone>(local_now: DateTime<T>) -> QueryTimeContext {
-    QueryTimeContext {
-        now: local_now.with_timezone(&Utc),
-        local_date: local_now.date_naive(),
-        utc_offset: local_now.offset().fix(),
-    }
-}
-
-fn list_from_store(store: &SqliteStore) -> Result<Vec<AssignmentDto>, ApplicationError> {
-    // One OS-local clock sample supplies a consistent instant, date and offset.
-    query_assignments(
-        store,
-        &AssignmentListOptions::default(),
-        time_context(Local::now()),
-    )
-    .map(|items| items.into_iter().map(Into::into).collect())
-    .map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::list_query::{CompletionSelection, time_context};
     use assignment_manager::{
         domain::{Deadline, SubmissionTarget},
         persistence::ManualAssignmentInput,
     };
+    use chrono::{DateTime, Utc};
+
+    fn all_request() -> ListRequest {
+        ListRequest {
+            completion: CompletionSelection::All,
+            ..Default::default()
+        }
+    }
 
     fn stop(state: DesktopState, worker: JoinHandle<()>) {
         drop(state);
@@ -209,7 +196,7 @@ mod tests {
         drop(seed);
         let (state, worker) = DesktopState::start_worker(Ok(directory.clone())).unwrap();
         tauri::async_runtime::block_on(async {
-            let items = state.list().await.unwrap();
+            let items = state.list(all_request()).await.unwrap().items;
             assert_eq!(items.len(), 2);
             assert_eq!(items[0].id, ids[1]);
             assert_eq!(items[1].id, ids[0]);
@@ -218,9 +205,13 @@ mod tests {
                 CompletionDto::Completed
             );
             assert_eq!(
-                state.list().await.unwrap()[0].completion,
+                state.list(all_request()).await.unwrap().items[0].completion,
                 CompletionDto::Completed
             );
+            let incomplete = state.list(ListRequest::default()).await.unwrap();
+            assert_eq!(incomplete.total_count, 2);
+            assert_eq!(incomplete.items.len(), 1);
+            assert_eq!(incomplete.items[0].id, ids[0]);
             assert_eq!(
                 state
                     .toggle("unknown-internal-id".into())
@@ -237,7 +228,7 @@ mod tests {
         let (state, worker) = DesktopState::start_worker(Ok(directory)).unwrap();
         tauri::async_runtime::block_on(async {
             assert_eq!(
-                state.list().await.unwrap()[0].completion,
+                state.list(all_request()).await.unwrap().items[0].completion,
                 CompletionDto::Completed
             );
             assert_eq!(
@@ -253,8 +244,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (state, worker) = DesktopState::start_worker(Ok(root.path().join("app"))).unwrap();
         assert!(
-            tauri::async_runtime::block_on(state.list())
+            tauri::async_runtime::block_on(state.list(all_request()))
                 .unwrap()
+                .items
                 .is_empty()
         );
         stop(state, worker);
@@ -267,14 +259,14 @@ mod tests {
         fs::write(&blocked, "a file prevents directory creation").unwrap();
         let (state, worker) = DesktopState::start_worker(Ok(blocked.clone())).unwrap();
         assert_eq!(
-            tauri::async_runtime::block_on(state.list()).unwrap_err(),
+            tauri::async_runtime::block_on(state.list(all_request())).unwrap_err(),
             ApplicationError::DataDirectory
         );
         // Repairing the path does not cause a command to open a different connection.
         fs::remove_file(&blocked).unwrap();
         fs::create_dir(&blocked).unwrap();
         assert_eq!(
-            tauri::async_runtime::block_on(state.list()).unwrap_err(),
+            tauri::async_runtime::block_on(state.list(all_request())).unwrap_err(),
             ApplicationError::DataDirectory
         );
         stop(state, worker);
@@ -282,7 +274,7 @@ mod tests {
         let bad_database = root.path().join(DATABASE_FILENAME);
         fs::write(&bad_database, "invalid SQLite content containing a secret").unwrap();
         let (state, worker) = DesktopState::start_worker(Ok(root.path().to_owned())).unwrap();
-        let error = tauri::async_runtime::block_on(state.list()).unwrap_err();
+        let error = tauri::async_runtime::block_on(state.list(all_request())).unwrap_err();
         assert_eq!(error, ApplicationError::DatabaseStartup);
         let serialized = serde_json::to_string(&error).unwrap();
         assert!(!serialized.contains("secret"));
@@ -293,7 +285,7 @@ mod tests {
         let (state, worker) =
             DesktopState::start_worker(Err(ApplicationError::DataDirectory)).unwrap();
         assert_eq!(
-            tauri::async_runtime::block_on(state.list()).unwrap_err(),
+            tauri::async_runtime::block_on(state.list(all_request())).unwrap_err(),
             ApplicationError::DataDirectory
         );
         stop(state, worker);

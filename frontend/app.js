@@ -1,23 +1,42 @@
 import {
-  courseLabel, deadlineLabel, originLabel, safeErrorMessage, submissionLabel,
+  DEFAULT_CONTROLS, buildQueryRequest, courseOptionLabel, deadlineLabel, emptyState,
+  groupAssignments, operationErrorMessage, originLabel, statusPresentation, submissionLabel,
 } from "./presentation.js";
 
 const list = document.querySelector("#assignments");
 const empty = document.querySelector("#empty");
 const status = document.querySelector("#status");
+const count = document.querySelector("#count");
 const errorBanner = document.querySelector("#error");
 const reload = document.querySelector("#reload");
-let assignments = [];
+const reset = document.querySelector("#reset-filters");
+const form = document.querySelector("#filters");
+const controls = {
+  completion: document.querySelector("#completion-filter"),
+  deadline: document.querySelector("#deadline-filter"),
+  course: document.querySelector("#course-filter"),
+  sort: document.querySelector("#sort"),
+};
+let appliedControls = { ...DEFAULT_CONTROLS };
 let busy = false;
+let hasSnapshot = false;
+let needsRefresh = false;
 
 function invoke(command, arguments_) {
   return window.__TAURI__.core.invoke(command, arguments_);
 }
 
+function readControls() {
+  return Object.fromEntries(Object.entries(controls).map(([name, input]) => [name, input.value]));
+}
+
+function writeControls(values) {
+  for (const [name, input] of Object.entries(controls)) input.value = values[name];
+}
+
 function textElement(tag, className, text) {
   const element = document.createElement(tag);
   element.className = className;
-  // Titles and source labels are untrusted display text, never HTML.
   element.textContent = text;
   return element;
 }
@@ -25,94 +44,177 @@ function textElement(tag, className, text) {
 function setBusy(value) {
   busy = value;
   reload.disabled = value;
+  reset.disabled = value;
+  for (const input of Object.values(controls)) input.disabled = value;
   list.setAttribute("aria-busy", String(value));
-  for (const input of list.querySelectorAll("input")) input.disabled = value;
+  for (const input of list.querySelectorAll("input")) input.disabled = value || needsRefresh;
 }
 
-function showError(error) {
-  errorBanner.textContent = safeErrorMessage(error);
+function rememberFocus() {
+  const element = document.activeElement;
+  const checkboxes = [...list.querySelectorAll("input")];
+  return { element, assignmentId: element?.dataset?.assignmentId, index: checkboxes.indexOf(element) };
+}
+
+function restoreFocus(focus) {
+  if (focus.element === reset && empty.hidden) {
+    controls.completion.focus();
+  } else if (focus.element?.isConnected && !focus.element.disabled && !focus.element.hidden) {
+    focus.element.focus();
+  } else if (focus.assignmentId) {
+    const checkboxes = [...list.querySelectorAll("input")].filter(input => !input.disabled);
+    const next = checkboxes.find(input => input.dataset.assignmentId === focus.assignmentId)
+      ?? checkboxes[Math.min(focus.index, checkboxes.length - 1)] ?? controls.completion;
+    next.focus();
+  } else if (focus.element === reset) {
+    controls.completion.focus();
+  }
+}
+
+function showError(operation, error) {
+  errorBanner.textContent = operationErrorMessage(operation, error);
   errorBanner.hidden = false;
 }
 
-function render() {
-  const rows = assignments.map((assignment) => {
-    const completed = assignment.completion === "completed";
-    const row = document.createElement("li");
-    row.className = `assignment${completed ? " completed" : ""}`;
-    const label = document.createElement("label");
-    label.className = "completion-control";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = completed;
-    checkbox.disabled = busy;
-    checkbox.setAttribute("aria-label", `${assignment.title} の完了状態`);
-    checkbox.addEventListener("change", () => toggle(assignment, checkbox));
-    label.append(checkbox, textElement("span", "completion-text", completed ? "完了" : "未完了"));
+function updateCourseOptions(courses, selected) {
+  const option = (value, text) => {
+    const element = textElement("option", "", text);
+    element.value = value;
+    return element;
+  };
+  controls.course.replaceChildren(
+    option("all", "すべて"), option("unassigned", "未所属"),
+    ...courses.map(course => option(`course:${course.id}`, courseOptionLabel(course))),
+  );
+  if (![...controls.course.options].some(option => option.value === selected)) {
+    controls.course.append(option(selected, "選択中のCourse（課題なし）"));
+  }
+  controls.course.value = selected;
+}
 
-    const content = document.createElement("div");
-    content.className = "assignment-content";
-    const course = document.createElement("div");
-    course.className = "course-line";
-    course.append(textElement("span", "course-label", courseLabel(assignment.course)));
-    const origin = originLabel(assignment.course);
-    if (origin) course.append(textElement("span", "origin", origin));
-    const submission = submissionLabel(assignment.submission)
-      + (assignment.hasSubmissionUrl ? " · 提出URLあり" : "");
-    content.append(
-      textElement("h2", "assignment-title", assignment.title),
-      textElement("p", "deadline", deadlineLabel(assignment.deadline)),
-      course,
-      textElement("p", "submission", submission),
-    );
-    row.append(label, content);
-    return row;
+function assignmentRow(assignment) {
+  const completed = assignment.completion === "completed";
+  const badge = statusPresentation(assignment.status, assignment.completion);
+  const row = document.createElement("li");
+  row.className = `assignment${completed ? " completed" : ""}${badge?.className === "badge-overdue" ? " overdue" : ""}`;
+  const label = document.createElement("label");
+  label.className = "completion-control";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = completed;
+  checkbox.disabled = busy || needsRefresh;
+  checkbox.dataset.assignmentId = assignment.id;
+  checkbox.setAttribute("aria-label", `${assignment.title} の完了状態`);
+  checkbox.addEventListener("change", () => toggle(assignment, checkbox));
+  label.append(checkbox, textElement("span", "completion-text", completed ? "完了済み" : "未完了"));
+  const content = document.createElement("div");
+  content.className = "assignment-content";
+  const titleLine = document.createElement("div");
+  titleLine.className = "title-line";
+  titleLine.append(textElement("h3", "assignment-title", assignment.title));
+  if (badge) titleLine.append(textElement("span", `status-badge ${badge.className}`, badge.label));
+  const submission = submissionLabel(assignment.submission)
+    + (assignment.hasSubmissionUrl ? " · 提出URLあり" : "");
+  content.append(titleLine, textElement("p", "deadline", deadlineLabel(assignment.deadline)), textElement("p", "submission", submission));
+  row.append(label, content);
+  return row;
+}
+
+function render(response, selected) {
+  const groups = groupAssignments(response.items, response.courses);
+  const sections = groups.map((group, index) => {
+    const section = document.createElement("section");
+    section.className = "course-group";
+    const heading = document.createElement("div");
+    heading.className = "group-header";
+    const title = textElement("h2", "group-title", group.course?.displayLabel ?? "未所属");
+    title.id = `course-group-${index}`;
+    section.setAttribute("aria-labelledby", title.id);
+    heading.append(title);
+    if (group.course) {
+      heading.append(textElement("span", "origin", originLabel(group.course)));
+      if (group.course.origin === "moodle") heading.append(textElement("span", "label-note", "表示ラベル"));
+    }
+    heading.append(textElement("span", "group-count", `${group.items.length}件`));
+    const rows = document.createElement("ul");
+    rows.className = "assignment-list";
+    rows.append(...group.items.map(assignmentRow));
+    section.append(heading, rows);
+    return section;
   });
-  // Flat list preserves each Assignment/Course ID. No name-based merging.
-  list.replaceChildren(...rows);
-  empty.hidden = assignments.length !== 0;
-  status.textContent = assignments.length ? `${assignments.length}件の課題` : "";
+  list.replaceChildren(...sections);
+  updateCourseOptions(response.courses, selected.course);
+  const emptyMessage = emptyState(response);
+  empty.hidden = emptyMessage === null;
+  if (emptyMessage) {
+    document.querySelector("#empty-title").textContent = emptyMessage.title;
+    document.querySelector("#empty-description").textContent = emptyMessage.description;
+    reset.hidden = !emptyMessage.filtered;
+  }
+  count.textContent = `${response.items.length} / ${response.totalCount}件の課題`;
+  hasSnapshot = true;
+  needsRefresh = false;
+  appliedControls = { ...selected };
+}
+
+async function query(selected) {
+  return invoke("list_assignments", { request: buildQueryRequest(selected) });
 }
 
 async function load() {
   if (busy) return;
+  const focus = rememberFocus();
+  const selected = readControls();
   setBusy(true);
   errorBanner.hidden = true;
-  empty.hidden = true;
-  status.textContent = "課題を読み込んでいます…";
+  status.textContent = "一覧を更新しています…";
   try {
-    assignments = await invoke("list_assignments");
-    render();
+    render(await query(selected), selected);
+    status.textContent = "";
   } catch (error) {
-    showError(error);
-    status.textContent = assignments.length ? `${assignments.length}件の課題（前回の表示）` : "";
+    writeControls(appliedControls);
+    showError("query", error);
+    status.textContent = hasSnapshot ? "前回取得した一覧を表示しています。" : "";
   } finally {
     setBusy(false);
+    restoreFocus(focus);
   }
 }
 
 async function toggle(assignment, checkbox) {
-  // Native checkbox changes on click. Restore it until the DB confirms commit.
   checkbox.checked = assignment.completion === "completed";
-  if (busy) return;
+  if (busy || needsRefresh) return;
+  const focus = rememberFocus();
   setBusy(true);
   errorBanner.hidden = true;
   status.textContent = "完了状態を保存しています…";
+  let committed = false;
   try {
-    const completion = await invoke("toggle_assignment_completion", {
-      assignmentId: assignment.id,
-    });
-    assignment.completion = completion;
-    // Use the committed state directly; no second query can turn a successful
-    // toggle into an ambiguous retry that accidentally flips it again.
-    render();
-    status.textContent = completion === "completed" ? "完了として保存しました。" : "未完了として保存しました。";
+    await invoke("toggle_assignment_completion", { assignmentId: assignment.id });
+    committed = true;
+    render(await query(appliedControls), appliedControls);
+    status.textContent = "完了状態を保存し、一覧を更新しました。";
   } catch (error) {
-    showError(error);
-    status.textContent = "完了状態を変更できませんでした。";
+    if (committed) {
+      // Prevent a second click on a stale row from flipping the saved state again.
+      needsRefresh = true;
+      showError("refresh_after_toggle", error);
+      status.textContent = "一覧の再読み込みが必要です。";
+    } else {
+      showError("toggle", error);
+      status.textContent = "完了状態は変更されていません。";
+    }
   } finally {
     setBusy(false);
+    restoreFocus(focus);
   }
 }
 
+form.addEventListener("submit", event => event.preventDefault());
+for (const input of Object.values(controls)) input.addEventListener("change", load);
 reload.addEventListener("click", load);
+reset.addEventListener("click", () => {
+  writeControls({ ...DEFAULT_CONTROLS, completion: "all" });
+  void load();
+});
 void load();

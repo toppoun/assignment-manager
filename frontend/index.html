@@ -13,17 +13,55 @@
         <div>
           <p class="eyebrow">Assignment Manager</p>
           <h1>課題一覧</h1>
-          <p class="description">締切の早い順 · 完了した課題も表示</p>
+          <p class="description">Courseごとに、いま取り組む課題を確認</p>
         </div>
         <button id="reload" type="button">再読み込み</button>
       </header>
+      <form id="filters" class="toolbar" aria-label="課題の表示条件">
+        <div class="field">
+          <label for="completion-filter">完了状態</label>
+          <select id="completion-filter" name="completion">
+            <option value="incomplete" selected>未完了</option>
+            <option value="all">すべて</option>
+            <option value="completed">完了済み</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="deadline-filter">締切</label>
+          <select id="deadline-filter" name="deadline">
+            <option value="all">すべて</option>
+            <option value="overdue">期限切れ</option>
+            <option value="today">今日</option>
+            <option value="within_seven_days">7日以内</option>
+          </select>
+        </div>
+        <div class="field course-field">
+          <label for="course-filter">Course</label>
+          <select id="course-filter" name="course">
+            <option value="all">すべて</option>
+            <option value="unassigned">未所属</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="sort">並び順</label>
+          <select id="sort" name="sort">
+            <option value="deadline">締切が近い順</option>
+            <option value="course">Course順</option>
+            <option value="title">タイトル順</option>
+          </select>
+        </div>
+      </form>
+      <div class="list-summary">
+        <p id="count" class="count"></p>
+        <p id="status" class="status" role="status" aria-live="polite">課題を読み込んでいます…</p>
+      </div>
       <p id="error" class="error" role="alert" hidden></p>
-      <p id="status" class="status" role="status" aria-live="polite">課題を読み込んでいます…</p>
       <section id="empty" class="empty" hidden>
-        <h2>課題はまだありません</h2>
-        <p>保存されている課題は0件です。</p>
+        <h2 id="empty-title"></h2>
+        <p id="empty-description"></p>
+        <button id="reset-filters" type="button" hidden>すべての課題を表示</button>
       </section>
-      <ul id="assignments" class="assignment-list" aria-label="課題一覧" aria-busy="true"></ul>
+      <div id="assignments" class="course-groups" aria-label="Courseごとの課題一覧" aria-busy="true"></div>
     </main>
   </body>
 </html>

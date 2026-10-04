@@ -3,6 +3,12 @@ name = "assignment-manager-desktop"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "assignment-manager-desktop"
+
+[[bin]]
+name = "list-smoke"
+path = "smoke/main.rs"
+required-features = ["smoke-test"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -21,3 +27,5 @@ tempfile = "3"
 [features]
 # Also permits `cargo run --features custom-protocol` without a frontend server.
 custom-protocol = ["tauri/custom-protocol"]
+# Separate synthetic-data executable, excluded from ordinary app builds.
+smoke-test = []

@@ -11,6 +11,7 @@ pub enum ApplicationError {
     Storage,
     NotFound,
     InvalidAssignmentId,
+    InvalidQuery,
     Busy,
     Unavailable,
 }
@@ -23,6 +24,7 @@ impl ApplicationError {
             Self::Storage => "storage",
             Self::NotFound => "not_found",
             Self::InvalidAssignmentId => "invalid_assignment_id",
+            Self::InvalidQuery => "invalid_query",
             Self::Busy => "busy",
             Self::Unavailable => "unavailable",
         }
@@ -35,6 +37,7 @@ impl ApplicationError {
             Self::Storage => "保存データを読み書きできませんでした。",
             Self::NotFound => "課題が見つかりません。一覧を再読み込みしてください。",
             Self::InvalidAssignmentId => "課題を指定できませんでした。",
+            Self::InvalidQuery => "一覧の条件を指定できませんでした。",
             Self::Busy => "処理が混み合っています。少し待って再試行してください。",
             Self::Unavailable => "アプリの処理を実行できませんでした。再起動してください。",
         }
@@ -102,6 +105,7 @@ mod tests {
             ApplicationError::Storage,
             ApplicationError::NotFound,
             ApplicationError::InvalidAssignmentId,
+            ApplicationError::InvalidQuery,
             ApplicationError::Busy,
             ApplicationError::Unavailable,
         ] {
