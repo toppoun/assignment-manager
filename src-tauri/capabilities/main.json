@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Local assignment list and completion actions in the main window.",
+  "description": "Local assignments and app-owned settings/credential operations in the main window.",
   "windows": ["main"],
-  "permissions": ["allow-list-assignments", "allow-toggle-assignment-completion"]
+  "permissions": ["allow-list-assignments", "allow-toggle-assignment-completion", "allow-get-settings-status", "allow-save-moodle-feed", "allow-remove-moodle-feed", "allow-save-webclass-credentials", "allow-remove-webclass-credentials"]
 }

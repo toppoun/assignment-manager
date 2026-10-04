@@ -15,6 +15,8 @@
         "title": "Assignment Manager",
         "width": 900,
         "height": 700,
+        "incognito": true,
+        "generalAutofillEnabled": false,
         "minWidth": 420,
         "minHeight": 360
       }

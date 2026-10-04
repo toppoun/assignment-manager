@@ -6,9 +6,15 @@
     <title>Assignment Manager</title>
     <link rel="stylesheet" href="styles.css" />
     <script type="module" src="app.js"></script>
+    <script type="module" src="settings_view.js"></script>
   </head>
   <body>
     <main>
+      <nav class="view-navigation" aria-label="画面切り替え">
+        <button id="show-list" type="button" aria-controls="list-view" aria-pressed="true">課題一覧</button>
+        <button id="show-settings" type="button" aria-controls="settings-view" aria-pressed="false">設定</button>
+      </nav>
+      <div id="list-view">
       <header class="page-header">
         <div>
           <p class="eyebrow">Assignment Manager</p>
@@ -62,6 +68,61 @@
         <button id="reset-filters" type="button" hidden>すべての課題を表示</button>
       </section>
       <div id="assignments" class="course-groups" aria-label="Courseごとの課題一覧" aria-busy="true"></div>
+      </div>
+      <section id="settings-view" aria-labelledby="settings-title" aria-busy="false" hidden>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">Assignment Manager</p>
+            <h1 id="settings-title">設定</h1>
+            <p class="description">MoodleとWebClassの接続情報を保存</p>
+          </div>
+          <button id="settings-reload" type="button">状態を確認</button>
+        </header>
+        <p class="settings-note">URL・大学ID・passwordはOSの認証情報ストアへ保存します。保存済みの値は表示しません。ここで保存しても同期やログインは行いません。</p>
+        <p id="settings-error" class="error" role="alert" hidden></p>
+        <p id="settings-message" class="status" role="status" aria-live="polite"></p>
+        <div class="settings-cards">
+          <section class="settings-card" aria-labelledby="moodle-title">
+            <div class="settings-card-header">
+              <h2 id="moodle-title">Moodle</h2>
+              <span id="moodle-status" class="configured-status">未確認</span>
+            </div>
+            <p class="settings-description">Course関連のcalendar URLを保存します。URLを更新しても同じfeedとして扱います。</p>
+            <form id="moodle-form" autocomplete="off">
+              <div class="field">
+                <label for="moodle-url">Calendar URL</label>
+                <input id="moodle-url" name="moodle-url" type="password" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="moodle-help" />
+                <p id="moodle-help" class="input-help">HTTPS URLを入力してください。tokenを含むため、入力内容は伏せて表示します。</p>
+              </div>
+              <div class="settings-actions">
+                <button id="moodle-save" type="submit">保存</button>
+                <button id="moodle-remove" class="remove-button" type="button" disabled>Moodle設定を削除</button>
+              </div>
+            </form>
+          </section>
+          <section class="settings-card" aria-labelledby="webclass-title">
+            <div class="settings-card-header">
+              <h2 id="webclass-title">WebClass</h2>
+              <span id="webclass-status" class="configured-status">未確認</span>
+            </div>
+            <p class="settings-description">大学IDとpasswordを一組で保存します。この画面では認証の正当性を確認しません。</p>
+            <form id="webclass-form" autocomplete="off">
+              <div class="field">
+                <label for="webclass-id">大学ID</label>
+                <input id="webclass-id" name="webclass-id" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" required />
+              </div>
+              <div class="field">
+                <label for="webclass-password">Password</label>
+                <input id="webclass-password" name="webclass-password" type="password" autocomplete="off" required />
+              </div>
+              <div class="settings-actions">
+                <button id="webclass-save" type="submit">保存</button>
+                <button id="webclass-remove" class="remove-button" type="button" disabled>WebClass認証情報を削除</button>
+              </div>
+            </form>
+          </section>
+        </div>
+      </section>
     </main>
   </body>
 </html>

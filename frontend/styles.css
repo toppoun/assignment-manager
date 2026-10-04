@@ -15,7 +15,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 32px 28px 48px; }
 .eyebrow { margin: 0 0 6px; font-size: 13px; letter-spacing: .05em; color: var(--muted); }
 h1 { margin: 0; font-size: 28px; letter-spacing: .02em; }
 .description { margin: 9px 0 0; color: var(--muted); font-size: 14px; }
-button, select { border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; color: inherit; background: var(--surface); font: inherit; }
+button, select, input:not([type="checkbox"]) { border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; color: inherit; background: var(--surface); font: inherit; }
 button { cursor: pointer; white-space: nowrap; }
 button:hover:enabled { background: #e8eef5; }
 button:disabled, select:disabled, input:disabled { cursor: wait; opacity: .7; }
@@ -56,6 +56,21 @@ input[type="checkbox"] { width: 22px; height: 22px; margin: 0; accent-color: #28
 .empty h2 { font-size: 20px; margin: 0 0 12px; }
 .empty p { color: var(--muted); font-size: 14px; margin: 0 0 20px; }
 [hidden] { display: none !important; }
+.view-navigation { display: flex; gap: 8px; margin-bottom: 24px; }
+.view-navigation button[aria-pressed="true"] { background: #286ba1; color: white; border-color: #286ba1; }
+.settings-note { color: var(--muted); font-size: 13px; line-height: 1.7; margin: 0 0 20px; }
+.settings-cards { display: grid; gap: 20px; }
+.settings-card { padding: 22px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.settings-card-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.settings-card h2 { margin: 0; font-size: 19px; }
+.configured-status { border: 1px solid var(--border); border-radius: 5px; padding: 3px 9px; font-size: 12px; color: var(--muted); }
+.configured-status[data-state="configured"] { color: #245c91; background: #e8f2fc; }
+.settings-description, .input-help { font-size: 13px; line-height: 1.6; color: var(--muted); }
+.settings-card .field { margin-top: 16px; }
+.settings-card input { width: 100%; }
+.input-help { margin: 7px 0 0; font-size: 12px; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.remove-button { color: #a42f29; }
 @media (max-width: 540px) {
   main { padding: 22px 16px; }
   h1 { font-size: 24px; }
@@ -64,6 +79,7 @@ input[type="checkbox"] { width: 22px; height: 22px; margin: 0; accent-color: #28
   .field, .course-field { flex: 1 1 140px; }
   .assignment { padding: 16px 12px; gap: 10px; }
   .assignment.overdue { padding-left: 9px; }
+  .settings-card { padding: 16px; }
   button { padding: 9px 10px; font-size: 13px; }
 }
 @media (prefers-color-scheme: dark) {
@@ -76,4 +92,6 @@ input[type="checkbox"] { width: 22px; height: 22px; margin: 0; accent-color: #28
   .assignment.overdue { border-left-color: #e8897d; }
   .error { background: #442923; color: #ffd1c8; border-color: #8d5144; }
   button:hover:enabled { background: #35465b; }
+  .configured-status[data-state="configured"] { color: #c0ddff; background: #2a4260; }
+  .remove-button { color: #ffbbb3; }
 }

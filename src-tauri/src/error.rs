@@ -12,6 +12,14 @@ pub enum ApplicationError {
     NotFound,
     InvalidAssignmentId,
     InvalidQuery,
+    CredentialUnavailable,
+    CredentialReadFailed,
+    CredentialWriteFailed,
+    CredentialDeleteFailed,
+    SettingsReadFailed,
+    SettingsWriteFailed,
+    InvalidMoodleFeed,
+    InvalidCredentials,
     Busy,
     Unavailable,
 }
@@ -25,6 +33,14 @@ impl ApplicationError {
             Self::NotFound => "not_found",
             Self::InvalidAssignmentId => "invalid_assignment_id",
             Self::InvalidQuery => "invalid_query",
+            Self::CredentialUnavailable => "credential_unavailable",
+            Self::CredentialReadFailed => "credential_read_failed",
+            Self::CredentialWriteFailed => "credential_write_failed",
+            Self::CredentialDeleteFailed => "credential_delete_failed",
+            Self::SettingsReadFailed => "settings_read_failed",
+            Self::SettingsWriteFailed => "settings_write_failed",
+            Self::InvalidMoodleFeed => "invalid_moodle_feed",
+            Self::InvalidCredentials => "invalid_credentials",
             Self::Busy => "busy",
             Self::Unavailable => "unavailable",
         }
@@ -38,6 +54,18 @@ impl ApplicationError {
             Self::NotFound => "課題が見つかりません。一覧を再読み込みしてください。",
             Self::InvalidAssignmentId => "課題を指定できませんでした。",
             Self::InvalidQuery => "一覧の条件を指定できませんでした。",
+            Self::CredentialUnavailable => "OSの認証情報ストアを利用できませんでした。",
+            Self::CredentialReadFailed => "保存済みの認証情報を確認できませんでした。",
+            Self::CredentialWriteFailed => "認証情報を保存できませんでした。",
+            Self::CredentialDeleteFailed => "認証情報を削除できませんでした。",
+            Self::SettingsReadFailed => {
+                "設定ファイルを読み込めませんでした。ファイルは変更していません。"
+            }
+            Self::SettingsWriteFailed => "設定ファイルを保存できませんでした。",
+            Self::InvalidMoodleFeed => {
+                "Moodle URLはユーザー名・passwordを含まないHTTPS URLを入力してください。"
+            }
+            Self::InvalidCredentials => "大学IDとpasswordの両方を入力してください。",
             Self::Busy => "処理が混み合っています。少し待って再試行してください。",
             Self::Unavailable => "アプリの処理を実行できませんでした。再起動してください。",
         }
@@ -106,6 +134,14 @@ mod tests {
             ApplicationError::NotFound,
             ApplicationError::InvalidAssignmentId,
             ApplicationError::InvalidQuery,
+            ApplicationError::CredentialUnavailable,
+            ApplicationError::CredentialReadFailed,
+            ApplicationError::CredentialWriteFailed,
+            ApplicationError::CredentialDeleteFailed,
+            ApplicationError::SettingsReadFailed,
+            ApplicationError::SettingsWriteFailed,
+            ApplicationError::InvalidMoodleFeed,
+            ApplicationError::InvalidCredentials,
             ApplicationError::Busy,
             ApplicationError::Unavailable,
         ] {

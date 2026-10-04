@@ -3,12 +3,18 @@
 
 #[path = "../src/commands.rs"]
 mod commands;
+#[path = "../src/credential_store.rs"]
+mod credential_store;
 #[path = "../src/dto.rs"]
 mod dto;
 #[path = "../src/error.rs"]
 mod error;
 #[path = "../src/list_query.rs"]
 mod list_query;
+#[path = "../src/settings.rs"]
+mod settings;
+#[path = "../src/settings_worker.rs"]
+mod settings_worker;
 #[path = "../src/storage.rs"]
 mod storage;
 
@@ -117,11 +123,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .app_data_dir()
                 .map_err(|_| error::ApplicationError::DataDirectory);
             app.manage(storage::DesktopState::start(directory)?);
+            let config_directory = app
+                .path()
+                .app_config_dir()
+                .map_err(|_| error::ApplicationError::SettingsReadFailed);
+            app.manage(settings_worker::SettingsState::start(
+                config_directory,
+                "io.assignment-manager.settings-smoke",
+            )?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_assignments,
-            commands::toggle_assignment_completion
+            commands::toggle_assignment_completion,
+            commands::get_settings_status,
+            commands::save_moodle_feed,
+            commands::remove_moodle_feed,
+            commands::save_webclass_credentials,
+            commands::remove_webclass_credentials
         ])
         .run(context)?;
     Ok(())

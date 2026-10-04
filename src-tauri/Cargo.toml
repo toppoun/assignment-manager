@@ -17,12 +17,18 @@ tauri-build = { version = "2", features = [] }
 assignment-manager = { path = ".." }
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring-core = "1"
+tempfile = "3"
+zeroize = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["sync"] }
 
-[dev-dependencies]
-serde_json = "1"
-tempfile = "3"
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { version = "1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
 [features]
 # Also permits `cargo run --features custom-protocol` without a frontend server.
