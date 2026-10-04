@@ -219,22 +219,31 @@ mod tests {
     fn mock_response(status: &str, headers: &str, body: &[u8]) -> (WebClassClient, MockServer) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let server = mock_response_at(listener, status, headers, body);
+        (
+            local_client(test_http(Duration::from_secs(2)), address),
+            server,
+        )
+    }
+
+    fn mock_response_at(
+        listener: TcpListener,
+        status: &str,
+        headers: &str,
+        body: &[u8],
+    ) -> MockServer {
         let response = format!(
             "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let body = body.to_vec();
-        let server = thread::spawn(move || {
+        thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_request_headers(&mut stream);
             stream.write_all(response.as_bytes()).unwrap();
             stream.write_all(&body).unwrap();
             (request, listener)
-        });
-        (
-            local_client(test_http(Duration::from_secs(2)), address),
-            server,
-        )
+        })
     }
 
     fn finish(server: MockServer) -> String {
@@ -572,6 +581,652 @@ mod tests {
             WebClassHttpError::UnexpectedResponse,
         ] {
             assert_secret_free(error);
+        }
+    }
+
+    // Exercise application sync through the existing private authenticated mock
+    // client and HTTP helpers, without changing production constructors/policies.
+    mod sync_tests {
+        use std::fs;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use chrono::{DateTime, Utc};
+        use rusqlite::{Connection, params, types::Value};
+        use serde_json::{Value as JsonValue, json};
+
+        use super::*;
+        use crate::domain::{
+            Assignment, AssignmentId, CompletionState, Deadline, SubmissionTarget,
+        };
+        use crate::import::{ExternalRecordKey, OriginKind};
+        use crate::persistence::{AssignmentImportSummary, SqliteStore};
+        use crate::sync::{WebClassSyncError, sync_webclass_group_once};
+
+        const GROUP: &str = "fixture-course-002";
+        const PRIVATE: &str = "SYNTHETIC_PRIVATE_SYNC_VALUE_7B1";
+        const JSON_HEADERS: &str = "Content-Type: application/json\r\n";
+        const EMPTY: &str = include_str!("../fixtures/webclass/contents_empty.json");
+
+        struct TestDatabase {
+            directory: PathBuf,
+        }
+
+        impl TestDatabase {
+            fn new() -> Self {
+                static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let directory = std::env::temp_dir().join(format!(
+                    "assignment-manager-webclass-sync-{}-{nonce}-{sequence}",
+                    std::process::id()
+                ));
+                fs::create_dir(&directory).unwrap();
+                Self { directory }
+            }
+
+            fn path(&self) -> PathBuf {
+                self.directory.join("test.sqlite3")
+            }
+
+            fn open(&self) -> (SqliteStore, Connection) {
+                let store = SqliteStore::open(self.path()).unwrap();
+                let observer = Connection::open(self.path()).unwrap();
+                (store, observer)
+            }
+        }
+
+        impl Drop for TestDatabase {
+            fn drop(&mut self) {
+                for name in [
+                    "test.sqlite3",
+                    "test.sqlite3-journal",
+                    "test.sqlite3-wal",
+                    "test.sqlite3-shm",
+                ] {
+                    let _ = fs::remove_file(self.directory.join(name));
+                }
+                let _ = fs::remove_dir(&self.directory);
+            }
+        }
+
+        struct SyncMock {
+            client: WebClassClient,
+            listener: TcpListener,
+        }
+
+        impl SyncMock {
+            fn new() -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let client = local_client(
+                    test_http(Duration::from_secs(2)),
+                    listener.local_addr().unwrap(),
+                );
+                Self { client, listener }
+            }
+
+            fn assert_request(&self, request: &str, group: &str) {
+                assert!(request.starts_with("GET "));
+                let target = request.split_whitespace().nth(1).unwrap();
+                let url = self.client.base_url.join(target).unwrap();
+                assert_eq!(url.path(), CONTENTS_PATH);
+                assert_eq!(
+                    url.query_pairs().collect::<Vec<_>>(),
+                    vec![("group_id".into(), group.into())]
+                );
+                let headers = request.to_ascii_lowercase();
+                assert!(headers.contains("\r\naccept: application/json\r\n"));
+                assert!(
+                    headers.contains(&format!("\r\ncookie: test_session={SYNTHETIC_COOKIE}\r\n"))
+                );
+            }
+
+            fn sync(
+                &self,
+                store: &mut SqliteStore,
+                group: &str,
+                status: &str,
+                headers: &str,
+                body: &str,
+            ) -> Result<AssignmentImportSummary, WebClassSyncError> {
+                let server = mock_response_at(
+                    self.listener.try_clone().unwrap(),
+                    status,
+                    headers,
+                    body.as_bytes(),
+                );
+                let result = sync_webclass_group_once(&self.client, group, store);
+                // Also rejects a redirect follow-up, retry or course-list request.
+                let request = finish(server);
+                self.listener.set_nonblocking(false).unwrap();
+                self.assert_request(&request, group);
+                result
+            }
+
+            fn sync_json(
+                &self,
+                store: &mut SqliteStore,
+                group: &str,
+                body: &str,
+            ) -> Result<AssignmentImportSummary, WebClassSyncError> {
+                self.sync(store, group, "200 OK", JSON_HEADERS, body)
+            }
+        }
+
+        fn records() -> Vec<JsonValue> {
+            serde_json::from_str(CONTENTS).unwrap()
+        }
+
+        fn key(group: &str, id: &str) -> ExternalRecordKey {
+            ExternalRecordKey {
+                origin: OriginKind::WebClass,
+                scope: group.into(),
+                id: id.into(),
+            }
+        }
+
+        fn stored(store: &SqliteStore, group: &str, id: &str) -> Assignment {
+            store
+                .find_assignment_by_external_key(&key(group, id))
+                .unwrap()
+                .unwrap()
+        }
+
+        // Includes all rows, bindings, metadata and courses, not just domain fields.
+        fn snapshot(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
+            [
+                "assignments",
+                "assignment_sources",
+                "courses",
+                "course_sources",
+                "course_schedule",
+            ]
+            .into_iter()
+            .map(|table| {
+                let mut statement = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            })
+            .collect()
+        }
+
+        fn metadata(conn: &Connection, id: &AssignmentId) -> (String, String) {
+            conn.query_row(
+                "SELECT created_at, updated_at FROM assignments WHERE id = ?1",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        fn age_updated_at(conn: &Connection, id: &AssignmentId) {
+            conn.execute(
+                "UPDATE assignments SET updated_at = ?1 WHERE id = ?2",
+                params!["2000-01-01T00:00:00.000000001Z", id.as_str()],
+            )
+            .unwrap();
+        }
+
+        fn utc(value: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .with_timezone(&Utc)
+        }
+
+        fn assert_safe(error: WebClassSyncError, db: &TestDatabase) {
+            let rendered = format!("{error} {error:?}");
+            for forbidden in [
+                PRIVATE,
+                SYNTHETIC_COOKIE,
+                SYNTHETIC_TOKEN,
+                SYNTHETIC_BODY,
+                GROUP,
+                "fixture-content-001",
+                "fixture-content-003",
+                "演習課題A",
+                "group_id",
+                "contents_name",
+                "127.0.0.1",
+                ORIGIN,
+                LOGIN_PATH,
+                CONTENTS_PATH,
+                "<html>",
+                "SELECT",
+                "RAISE",
+                "assignment_sources",
+            ] {
+                assert!(!rendered.contains(forbidden));
+            }
+            assert!(!rendered.contains(db.path().to_str().unwrap()));
+            assert!(error.source().is_none());
+        }
+
+        #[test]
+        fn sync_imports_and_resyncs_with_and_without_course_binding() {
+            for bound in [false, true] {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let course_id = if bound {
+                    Some(
+                        store
+                            .create_course_with_source(
+                                "Synthetic course",
+                                vec![],
+                                OriginKind::WebClass,
+                                GROUP,
+                            )
+                            .unwrap()
+                            .id,
+                    )
+                } else {
+                    None
+                };
+                let mock = SyncMock::new();
+                assert_eq!(
+                    mock.sync_json(&mut store, GROUP, CONTENTS).unwrap(),
+                    AssignmentImportSummary {
+                        created: 3,
+                        ..Default::default()
+                    }
+                );
+                let first = stored(&store, GROUP, "fixture-content-001");
+                assert_eq!(first.title, "演習課題A");
+                assert_eq!(
+                    first.deadline,
+                    Some(Deadline::DateTime(utc("2026-10-31T14:59:59Z")))
+                );
+                for id in [
+                    "fixture-content-001",
+                    "fixture-content-002",
+                    "fixture-content-003",
+                ] {
+                    let assignment = stored(&store, GROUP, id);
+                    assert!(assignment.id.as_str().starts_with("a_"));
+                    assert_eq!(assignment.course_id, course_id);
+                    assert_eq!(assignment.submission, SubmissionTarget::WebClass);
+                    assert_eq!(assignment.submission_url, None);
+                    assert_eq!(assignment.completion, CompletionState::Incomplete);
+                    let (created, updated) = metadata(&observer, &assignment.id);
+                    assert_eq!(created, updated);
+                }
+                let initial = snapshot(&observer);
+                assert_eq!(initial[0].len(), 3);
+                assert_eq!(initial[1].len(), 3);
+                assert_eq!(initial[2].len(), usize::from(bound));
+                assert_eq!(initial[3].len(), usize::from(bound));
+                assert_eq!(
+                    mock.sync_json(&mut store, GROUP, CONTENTS).unwrap(),
+                    AssignmentImportSummary {
+                        unchanged: 3,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(snapshot(&observer), initial);
+
+                store
+                    .set_completion(&first.id, CompletionState::Completed)
+                    .unwrap();
+                let completed = snapshot(&observer);
+                assert_eq!(
+                    mock.sync_json(&mut store, GROUP, CONTENTS).unwrap(),
+                    AssignmentImportSummary {
+                        unchanged: 3,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(snapshot(&observer), completed);
+                let mut answered = records();
+                for record in &mut answered {
+                    record["scores"] =
+                        json!([{"max_score": 0, "answer_datetime": "2026-10-04 12:00:00"}]);
+                }
+                assert_eq!(
+                    mock.sync_json(
+                        &mut store,
+                        GROUP,
+                        &serde_json::to_string(&answered).unwrap()
+                    )
+                    .unwrap(),
+                    AssignmentImportSummary {
+                        unchanged: 3,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(snapshot(&observer), completed);
+                let resynced = stored(&store, GROUP, "fixture-content-001");
+                assert_eq!(resynced.id, first.id);
+                assert_eq!(resynced.completion, CompletionState::Completed);
+                assert_eq!(
+                    stored(&store, GROUP, "fixture-content-002").completion,
+                    CompletionState::Incomplete
+                );
+            }
+        }
+
+        #[test]
+        fn sync_updates_title_and_deadline_preserving_identity_completion_and_created_at() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+            let original = stored(&store, GROUP, "fixture-content-001");
+            store
+                .set_completion(&original.id, CompletionState::Completed)
+                .unwrap();
+            age_updated_at(&observer, &original.id);
+            let previous = metadata(&observer, &original.id);
+            let mut changed = records();
+            changed[0]["contents_name"] = json!(PRIVATE);
+            changed[0]["end_date"] = json!("2026-11-10 09:00:00");
+            let before = Utc::now();
+            assert_eq!(
+                mock.sync_json(&mut store, GROUP, &serde_json::to_string(&changed).unwrap())
+                    .unwrap(),
+                AssignmentImportSummary {
+                    updated: 1,
+                    unchanged: 2,
+                    created: 0
+                }
+            );
+            let after = Utc::now();
+            let updated = stored(&store, GROUP, "fixture-content-001");
+            assert_eq!(updated.id, original.id);
+            assert_eq!(updated.title, PRIVATE);
+            assert_eq!(
+                updated.deadline,
+                Some(Deadline::DateTime(utc("2026-11-10T00:00:00Z")))
+            );
+            assert_eq!(updated.completion, CompletionState::Completed);
+            let current = metadata(&observer, &updated.id);
+            assert_eq!(current.0, previous.0);
+            assert_ne!(current.1, previous.1);
+            assert!(before <= utc(&current.1) && utc(&current.1) <= after);
+            assert_eq!(snapshot(&observer)[0].len(), 3);
+        }
+
+        #[test]
+        fn sync_reuses_authenticated_client_across_exact_opaque_groups() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+            let other_group = " group &role=admin+日本/%?#0002 ";
+            let mut other = records();
+            for record in &mut other {
+                record["group_id"] = json!(other_group);
+            }
+            let body = serde_json::to_string(&other).unwrap();
+            assert_eq!(
+                mock.sync_json(&mut store, other_group, &body).unwrap(),
+                AssignmentImportSummary {
+                    created: 3,
+                    ..Default::default()
+                }
+            );
+            assert_ne!(
+                stored(&store, GROUP, "fixture-content-001").id,
+                stored(&store, other_group, "fixture-content-001").id
+            );
+            let before = snapshot(&observer);
+            assert_eq!(
+                mock.sync_json(&mut store, other_group, &body).unwrap(),
+                AssignmentImportSummary {
+                    unchanged: 3,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(snapshot(&observer), before);
+            assert!(before[2].is_empty());
+        }
+
+        #[test]
+        fn sync_absent_hidden_unsupported_and_empty_candidates_preserve_database() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+            let first = stored(&store, GROUP, "fixture-content-001");
+            store
+                .set_completion(&first.id, CompletionState::Completed)
+                .unwrap();
+            let before = snapshot(&observer);
+            let mut filtered = records();
+            filtered[0]["hidden_content"] = json!(true);
+            filtered[1]["contents_kind"] = json!("Other");
+            filtered.pop();
+            for body in [EMPTY.to_owned(), serde_json::to_string(&filtered).unwrap()] {
+                assert_eq!(
+                    mock.sync_json(&mut store, GROUP, &body).unwrap(),
+                    AssignmentImportSummary::default()
+                );
+                assert_eq!(snapshot(&observer), before);
+            }
+            filtered[0]["hidden_content"] = json!(false);
+            assert_eq!(
+                mock.sync_json(
+                    &mut store,
+                    GROUP,
+                    &serde_json::to_string(&filtered).unwrap()
+                )
+                .unwrap(),
+                AssignmentImportSummary {
+                    unchanged: 1,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(snapshot(&observer), before);
+        }
+
+        #[test]
+        fn sync_distinguishes_fetch_failure_and_auth_expiry_without_database_changes_or_retry() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+            let before = snapshot(&observer);
+            let login_html = format!(
+                "<html>{SYNTHETIC_BODY}<a href='{LOGIN_PATH}?token={SYNTHETIC_TOKEN}'>{PRIVATE}</a></html>"
+            );
+            let login_redirect = format!("Location: {LOGIN_PATH}?token={SYNTHETIC_TOKEN}\r\n");
+            for (status, headers, body, expected) in [
+                (
+                    "500 Internal Server Error",
+                    "Content-Type: text/html\r\n",
+                    login_html.as_str(),
+                    WebClassSyncError::Fetch,
+                ),
+                (
+                    "302 Found",
+                    login_redirect.as_str(),
+                    "",
+                    WebClassSyncError::AuthExpired,
+                ),
+                (
+                    "200 OK",
+                    "Content-Type: text/html\r\n",
+                    login_html.as_str(),
+                    WebClassSyncError::AuthExpired,
+                ),
+            ] {
+                let error = mock
+                    .sync(&mut store, GROUP, status, headers, body)
+                    .unwrap_err();
+                assert_eq!(error, expected);
+                assert_safe(error, &db);
+                assert_eq!(snapshot(&observer), before);
+            }
+        }
+
+        #[test]
+        fn sync_parse_mapping_group_and_candidate_validation_failures_prevent_partial_import() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+            let first = stored(&store, GROUP, "fixture-content-001");
+            store
+                .set_completion(&first.id, CompletionState::Completed)
+                .unwrap();
+            let before = snapshot(&observer);
+            let mut changed = records();
+            changed[0]["contents_name"] = json!(PRIVATE);
+            let malformed = format!("{} {PRIVATE}", serde_json::to_string(&changed).unwrap());
+            let mut invalid_date = changed.clone();
+            invalid_date[2]["end_date"] = json!(PRIVATE);
+            let mut hidden_mismatch = changed.clone();
+            hidden_mismatch[2]["group_id"] = json!(PRIVATE);
+            hidden_mismatch[2]["hidden_content"] = json!(true);
+            let mut unsupported_mismatch = changed.clone();
+            unsupported_mismatch[2]["group_id"] = json!(PRIVATE);
+            unsupported_mismatch[2]["contents_kind"] = json!("Other");
+            let mut duplicate = changed.clone();
+            duplicate[0]["contents_id"] = json!(PRIVATE);
+            duplicate[2]["contents_id"] = json!(PRIVATE);
+            let mut blank_id = changed.clone();
+            blank_id[2]["contents_id"] = json!(" \t ");
+            let mut blank_group = changed;
+            for record in &mut blank_group {
+                record["group_id"] = json!(" \t ");
+            }
+            for (group, body, expected) in [
+                (GROUP, malformed, WebClassSyncError::Parse),
+                (
+                    GROUP,
+                    serde_json::to_string(&invalid_date).unwrap(),
+                    WebClassSyncError::Map,
+                ),
+                (
+                    GROUP,
+                    serde_json::to_string(&hidden_mismatch).unwrap(),
+                    WebClassSyncError::Validation,
+                ),
+                (
+                    GROUP,
+                    serde_json::to_string(&unsupported_mismatch).unwrap(),
+                    WebClassSyncError::Validation,
+                ),
+                (
+                    GROUP,
+                    serde_json::to_string(&duplicate).unwrap(),
+                    WebClassSyncError::Validation,
+                ),
+                (
+                    GROUP,
+                    serde_json::to_string(&blank_id).unwrap(),
+                    WebClassSyncError::Validation,
+                ),
+                (
+                    " \t ",
+                    serde_json::to_string(&blank_group).unwrap(),
+                    WebClassSyncError::Validation,
+                ),
+            ] {
+                let error = mock.sync_json(&mut store, group, &body).unwrap_err();
+                assert_eq!(error, expected);
+                assert_safe(error, &db);
+                assert_eq!(snapshot(&observer), before);
+            }
+        }
+
+        #[test]
+        fn sync_persistence_failure_rolls_back_prior_update_insert_and_source_bindings() {
+            let db = TestDatabase::new();
+            let (mut store, observer) = db.open();
+            let mock = SyncMock::new();
+            let mut changed = records();
+            mock.sync_json(
+                &mut store,
+                GROUP,
+                &serde_json::to_string(&changed[..1]).unwrap(),
+            )
+            .unwrap();
+            let original = stored(&store, GROUP, "fixture-content-001");
+            store
+                .set_completion(&original.id, CompletionState::Completed)
+                .unwrap();
+            age_updated_at(&observer, &original.id);
+            changed[0]["contents_name"] = json!(PRIVATE);
+            changed[2]["contents_id"] = json!(PRIVATE);
+            // Reject the third record's binding after an update and another new
+            // assignment/binding have succeeded inside the same transaction.
+            observer
+                .execute_batch(&format!(
+                    "CREATE TRIGGER reject_sync_binding BEFORE INSERT ON assignment_sources
+                 WHEN NEW.external_id = '{PRIVATE}'
+                 BEGIN SELECT RAISE(ABORT, NEW.scope || NEW.external_id); END;"
+                ))
+                .unwrap();
+            let before = snapshot(&observer);
+            let body = serde_json::to_string(&changed).unwrap();
+            let error = mock.sync_json(&mut store, GROUP, &body).unwrap_err();
+            assert_eq!(error, WebClassSyncError::Persistence);
+            assert_safe(error, &db);
+            assert_eq!(snapshot(&observer), before);
+            for id in ["fixture-content-002", PRIVATE] {
+                assert_eq!(
+                    store
+                        .find_assignment_by_external_key(&key(GROUP, id))
+                        .unwrap(),
+                    None
+                );
+            }
+            observer
+                .execute_batch("DROP TRIGGER reject_sync_binding")
+                .unwrap();
+            assert_eq!(
+                mock.sync_json(&mut store, GROUP, &body).unwrap(),
+                AssignmentImportSummary {
+                    created: 2,
+                    updated: 1,
+                    unchanged: 0
+                }
+            );
+            let recovered = stored(&store, GROUP, "fixture-content-001");
+            assert_eq!(recovered.id, original.id);
+            assert_eq!(recovered.completion, CompletionState::Completed);
+        }
+
+        #[test]
+        fn sync_does_not_hold_a_sqlite_transaction_during_http_fetch() {
+            let db = TestDatabase::new();
+            let (mut store, _observer) = db.open();
+            let path = db.path();
+            let mock = SyncMock::new();
+            let listener = mock.listener.try_clone().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request_headers(&mut stream);
+                let writer = Connection::open(path).unwrap();
+                writer.busy_timeout(Duration::ZERO).unwrap();
+                // HTTP is waiting for a response; another connection must be
+                // able to acquire the write lock without waiting for sync.
+                writer.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n{JSON_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    CONTENTS.len()
+                );
+                stream.write_all(headers.as_bytes()).unwrap();
+                stream.write_all(CONTENTS.as_bytes()).unwrap();
+                (request, listener)
+            });
+            assert_eq!(
+                sync_webclass_group_once(&mock.client, GROUP, &mut store).unwrap(),
+                AssignmentImportSummary {
+                    created: 3,
+                    ..Default::default()
+                }
+            );
+            mock.assert_request(&finish(server), GROUP);
         }
     }
 }

@@ -10,6 +10,8 @@ use crate::import::AssignmentCandidateBatch;
 use crate::moodle::{map_events, parse_calendar};
 use crate::moodle_http::{MoodleClient, MoodleFeed};
 use crate::persistence::{AssignmentImportSummary, SqliteStore};
+use crate::webclass::{WebClassMapError, map_contents_for_group, parse_contents};
+use crate::webclass_http::{WebClassClient, WebClassHttpError};
 
 /// Fixed stage classifications only; source payloads and underlying errors are discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +60,65 @@ pub fn sync_moodle_once(
         .map_err(|_| MoodleSyncError::Persistence)
 }
 
+/// Fixed stage classifications only; no group ID, payload, cookie or underlying error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebClassSyncError {
+    AuthExpired,
+    Fetch,
+    Parse,
+    Map,
+    Validation,
+    Persistence,
+}
+
+impl fmt::Display for WebClassSyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::AuthExpired => "WebClass sync authentication expired",
+            Self::Fetch => "WebClass sync fetch failed",
+            Self::Parse => "WebClass sync parse failed",
+            Self::Map => "WebClass sync mapping failed",
+            Self::Validation => "WebClass sync candidate validation failed",
+            Self::Persistence => "WebClass sync persistence failed",
+        })
+    }
+}
+
+// Discard causes rather than exposing source data through an error chain.
+impl Error for WebClassSyncError {}
+
+/// Synchronize contents for one exact, opaque group ID on the calling thread.
+///
+/// The authenticated client is borrowed; authentication expiry is returned without
+/// logging in or retrying. No course discovery request is made. The group mapper
+/// checks every record against the requested ID and calls
+/// [`AssignmentCandidateBatch::try_new`] before returning a validated batch.
+/// Only then does the store start its import transaction and resolve existing
+/// course bindings. Missing courses are not created. Pre-import failures leave
+/// the database untouched; import failures roll back the entire batch. Existing
+/// assignments absent from the batch are preserved, including filtered records.
+/// Empty batches return zero counts.
+pub fn sync_webclass_group_once(
+    client: &WebClassClient,
+    group_id: &str,
+    store: &mut SqliteStore,
+) -> Result<AssignmentImportSummary, WebClassSyncError> {
+    let raw = client
+        .fetch_contents_json(group_id)
+        .map_err(|error| match error {
+            WebClassHttpError::AuthExpired => WebClassSyncError::AuthExpired,
+            _ => WebClassSyncError::Fetch,
+        })?;
+    let contents = parse_contents(&raw).map_err(|_| WebClassSyncError::Parse)?;
+    let batch = map_contents_for_group(&contents, group_id).map_err(|error| match error {
+        WebClassMapError::InvalidEndDate => WebClassSyncError::Map,
+        WebClassMapError::Validation(_) => WebClassSyncError::Validation,
+    })?;
+    store
+        .import_assignment_batch(&batch)
+        .map_err(|_| WebClassSyncError::Persistence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +137,46 @@ mod tests {
                 MoodleSyncError::Persistence,
                 "Persistence",
                 "Moodle sync persistence failed",
+            ),
+        ] {
+            assert_eq!(format!("{error:?}"), debug);
+            assert_eq!(error.to_string(), display);
+            assert!(error.source().is_none());
+        }
+    }
+
+    #[test]
+    fn webclass_sync_errors_have_fixed_display_debug_and_no_source() {
+        for (error, debug, display) in [
+            (
+                WebClassSyncError::AuthExpired,
+                "AuthExpired",
+                "WebClass sync authentication expired",
+            ),
+            (
+                WebClassSyncError::Fetch,
+                "Fetch",
+                "WebClass sync fetch failed",
+            ),
+            (
+                WebClassSyncError::Parse,
+                "Parse",
+                "WebClass sync parse failed",
+            ),
+            (
+                WebClassSyncError::Map,
+                "Map",
+                "WebClass sync mapping failed",
+            ),
+            (
+                WebClassSyncError::Validation,
+                "Validation",
+                "WebClass sync candidate validation failed",
+            ),
+            (
+                WebClassSyncError::Persistence,
+                "Persistence",
+                "WebClass sync persistence failed",
             ),
         ] {
             assert_eq!(format!("{error:?}"), debug);
