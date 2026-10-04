@@ -1228,5 +1228,652 @@ mod tests {
             );
             mock.assert_request(&finish(server), GROUP);
         }
+
+        mod full_sync_tests {
+            use std::time::Instant;
+
+            use super::*;
+            use crate::domain::{ClassSlot, Course, DayOfWeek, ScheduleEntry};
+            use crate::sync::{WebClassSyncSummary, sync_webclass_all_once};
+
+            const COURSES_EDGE: &str = include_str!("../fixtures/webclass/courses_edge_cases.json");
+
+            struct Response {
+                group: Option<String>,
+                status: &'static str,
+                headers: String,
+                body: String,
+            }
+
+            impl Response {
+                fn courses(body: impl Into<String>) -> Self {
+                    Self {
+                        group: None,
+                        status: "200 OK",
+                        headers: JSON_HEADERS.into(),
+                        body: body.into(),
+                    }
+                }
+
+                fn contents(group: &str, body: impl Into<String>) -> Self {
+                    Self {
+                        group: Some(group.into()),
+                        ..Self::courses(body)
+                    }
+                }
+            }
+
+            impl SyncMock {
+                fn sync_all(
+                    &self,
+                    store: &mut SqliteStore,
+                    db: &TestDatabase,
+                    responses: Vec<Response>,
+                ) -> Result<WebClassSyncSummary, WebClassSyncError> {
+                    let expected: Vec<_> = responses.iter().map(|r| r.group.clone()).collect();
+                    let listener = self.listener.try_clone().unwrap();
+                    let path = db.path();
+                    let server = thread::spawn(move || {
+                        let probe = Connection::open(path).unwrap();
+                        probe.busy_timeout(Duration::ZERO).unwrap();
+                        listener.set_nonblocking(true).unwrap();
+                        let mut requests = Vec::new();
+                        for response in responses {
+                            // Bound accepts so an unexpected early stop fails the
+                            // test rather than leaving the mock thread blocked.
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            let mut stream = loop {
+                                match listener.accept() {
+                                    Ok((stream, _)) => break stream,
+                                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                        assert!(Instant::now() < deadline, "expected sync request");
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                    Err(error) => panic!("mock accept failed: {:?}", error.kind()),
+                                }
+                            };
+                            stream.set_nonblocking(false).unwrap();
+                            requests.push(read_request_headers(&mut stream));
+                            // Probe every /courses and /contents request while
+                            // the production fetch still waits for its response.
+                            probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+                            let headers = format!(
+                                "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                                response.status,
+                                response.headers,
+                                response.body.len()
+                            );
+                            stream.write_all(headers.as_bytes()).unwrap();
+                            stream.write_all(response.body.as_bytes()).unwrap();
+                        }
+                        (requests, listener)
+                    });
+                    let result = sync_webclass_all_once(&self.client, store);
+                    let (requests, listener) = server.join().unwrap();
+                    assert_eq!(requests.len(), expected.len());
+                    // Later groups, redirects, reauthentication and retries
+                    // must not produce any request beyond the expected sequence.
+                    assert_eq!(
+                        listener.accept().unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                    self.listener.set_nonblocking(false).unwrap();
+                    for (request, group) in requests.iter().zip(expected) {
+                        if let Some(group) = group {
+                            self.assert_request(request, &group);
+                        } else {
+                            assert!(
+                                request.starts_with(&format!("GET {COURSES_PATH} HTTP/1.1\r\n"))
+                            );
+                            let headers = request.to_ascii_lowercase();
+                            assert!(headers.contains("\r\naccept: application/json\r\n"));
+                            assert!(headers.contains(&format!(
+                                "\r\ncookie: test_session={SYNTHETIC_COOKIE}\r\n"
+                            )));
+                        }
+                    }
+                    result
+                }
+            }
+
+            fn course_records(raw: &str) -> Vec<JsonValue> {
+                serde_json::from_str(raw).unwrap()
+            }
+
+            fn contents_for(group: &str) -> String {
+                let mut contents = records();
+                for content in &mut contents {
+                    content["group_id"] = json!(group);
+                }
+                serde_json::to_string(&contents).unwrap()
+            }
+
+            fn success_responses(courses: &[JsonValue]) -> Vec<Response> {
+                let mut responses =
+                    vec![Response::courses(serde_json::to_string(courses).unwrap())];
+                for course in courses {
+                    let group = course["group_id"].as_str().unwrap();
+                    responses.push(Response::contents(group, contents_for(group)));
+                }
+                responses
+            }
+
+            fn discovered(store: &SqliteStore, group: &str) -> Course {
+                store
+                    .find_course_by_source(OriginKind::WebClass, group)
+                    .unwrap()
+                    .unwrap()
+            }
+
+            fn assert_full_safe(error: WebClassSyncError, db: &TestDatabase) {
+                assert_safe(error, db);
+                let rendered = format!("{error} {error:?}");
+                for forbidden in [
+                    "fixture-course-001",
+                    "fixture-course-003",
+                    "線形代数",
+                    "プログラミング演習",
+                    "group_name",
+                    "children",
+                    COURSES_PATH,
+                    "course_sources",
+                ] {
+                    assert!(!rendered.contains(forbidden));
+                }
+            }
+
+            #[test]
+            fn full_sync_discovers_multiple_courses_binds_assignments_and_is_idempotent() {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::new();
+                let mut courses = course_records(COURSES);
+                // Whitespace around a nonempty opaque ID is significant: these
+                // two IDs must not be normalized into a duplicate or one course.
+                courses[1]["group_id"] = json!(" fixture-course-001 ");
+                assert_eq!(
+                    mock.sync_all(&mut store, &db, success_responses(&courses))
+                        .unwrap(),
+                    WebClassSyncSummary {
+                        courses_discovered: 3,
+                        courses_created: 3,
+                        groups_synced: 3,
+                        assignments_created: 9,
+                        ..Default::default()
+                    }
+                );
+                for source in &courses {
+                    let group = source["group_id"].as_str().unwrap();
+                    let course = discovered(&store, group);
+                    assert!(course.id.as_str().starts_with("c_"));
+                    assert_ne!(course.id.as_str(), group);
+                    assert_eq!(course.name, source["group_name"].as_str().unwrap());
+                    assert!(course.schedule.is_empty());
+                    assert_eq!(
+                        store.find_webclass_course_id(group).unwrap(),
+                        Some(course.id.clone())
+                    );
+                    for id in [
+                        "fixture-content-001",
+                        "fixture-content-002",
+                        "fixture-content-003",
+                    ] {
+                        assert_eq!(stored(&store, group, id).course_id, Some(course.id.clone()));
+                    }
+                }
+                let rows = snapshot(&observer);
+                assert_eq!(rows[0].len(), 9);
+                assert_eq!(rows[1].len(), 9);
+                assert_eq!(rows[2].len(), 3);
+                assert_eq!(rows[3].len(), 3);
+                assert!(rows[4].is_empty());
+                let first = stored(&store, "fixture-course-001", "fixture-content-001");
+                store
+                    .set_completion(&first.id, CompletionState::Completed)
+                    .unwrap();
+                let before = snapshot(&observer);
+                assert_eq!(
+                    mock.sync_all(&mut store, &db, success_responses(&courses))
+                        .unwrap(),
+                    WebClassSyncSummary {
+                        courses_discovered: 3,
+                        groups_synced: 3,
+                        assignments_unchanged: 9,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(snapshot(&observer), before);
+
+                // Aggregate both updates and unchanged outcomes across groups.
+                let mut responses = success_responses(&courses);
+                responses[1].body = responses[1].body.replace("演習課題A", PRIVATE);
+                responses[2].body = responses[2]
+                    .body
+                    .replace("2026-10-31 23:59:59", "2026-11-10 09:00:00");
+                assert_eq!(
+                    mock.sync_all(&mut store, &db, responses).unwrap(),
+                    WebClassSyncSummary {
+                        courses_discovered: 3,
+                        groups_synced: 3,
+                        assignments_updated: 2,
+                        assignments_unchanged: 7,
+                        ..Default::default()
+                    }
+                );
+                let updated = stored(&store, "fixture-course-001", "fixture-content-001");
+                assert_eq!(updated.id, first.id);
+                assert_eq!(updated.title, PRIVATE);
+                assert_eq!(updated.completion, CompletionState::Completed);
+                assert_eq!(
+                    stored(&store, " fixture-course-001 ", "fixture-content-001").deadline,
+                    Some(Deadline::DateTime(utc("2026-11-10T00:00:00Z")))
+                );
+                assert_eq!(snapshot(&observer)[2..], before[2..]);
+            }
+
+            #[test]
+            fn full_sync_reuses_existing_course_without_name_schedule_or_metadata_refresh() {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::new();
+                let mut courses = course_records(COURSES_EDGE);
+                let group = courses[0]["group_id"].as_str().unwrap().to_owned();
+                let existing = store
+                    .create_course_with_source(
+                        "Local course name",
+                        vec![
+                            ScheduleEntry::Timetabled(ClassSlot {
+                                day: DayOfWeek::Tuesday,
+                                period: 4,
+                            }),
+                            ScheduleEntry::OnDemand,
+                        ],
+                        OriginKind::WebClass,
+                        &group,
+                    )
+                    .unwrap();
+                let original = snapshot(&observer);
+                courses[0]["group_name"] = json!(PRIVATE);
+                assert_eq!(
+                    mock.sync_all(&mut store, &db, success_responses(&courses))
+                        .unwrap(),
+                    WebClassSyncSummary {
+                        courses_discovered: 3,
+                        courses_created: 2,
+                        groups_synced: 3,
+                        assignments_created: 9,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(discovered(&store, &group), existing);
+                assert_eq!(
+                    stored(&store, &group, "fixture-content-001").course_id,
+                    Some(existing.id)
+                );
+                let after = snapshot(&observer);
+                assert!(after[2].contains(&original[2][0]));
+                assert_eq!(after[4], original[4]);
+                assert_eq!(after[2].len(), 3);
+                assert_eq!(after[3].len(), 3);
+                for source in &courses[1..] {
+                    let course = discovered(&store, source["group_id"].as_str().unwrap());
+                    assert_eq!(course.name, source["group_name"].as_str().unwrap());
+                    assert!(course.schedule.is_empty());
+                }
+                // 0/0 and serialized children created neither inferred schedule
+                // entries nor additional courses beyond the three source rows.
+            }
+
+            #[test]
+            fn full_sync_empty_or_reduced_courses_and_absent_candidates_preserve_all_rows() {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::new();
+                let courses = course_records(COURSES);
+                mock.sync_all(&mut store, &db, success_responses(&courses))
+                    .unwrap();
+                let first = stored(&store, "fixture-course-001", "fixture-content-001");
+                store
+                    .set_completion(&first.id, CompletionState::Completed)
+                    .unwrap();
+                let before = snapshot(&observer);
+                assert_eq!(
+                    mock.sync_all(&mut store, &db, vec![Response::courses("[]")])
+                        .unwrap(),
+                    WebClassSyncSummary::default()
+                );
+                assert_eq!(snapshot(&observer), before);
+                assert_eq!(
+                    mock.sync_all(
+                        &mut store,
+                        &db,
+                        vec![
+                            Response::courses(serde_json::to_string(&courses[..1]).unwrap()),
+                            Response::contents("fixture-course-001", EMPTY),
+                        ]
+                    )
+                    .unwrap(),
+                    WebClassSyncSummary {
+                        courses_discovered: 1,
+                        groups_synced: 1,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(snapshot(&observer), before);
+            }
+
+            #[test]
+            fn full_sync_course_list_failures_prevent_all_database_writes() {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::new();
+                store
+                    .create_course_with_source(
+                        "Existing course",
+                        vec![],
+                        OriginKind::WebClass,
+                        GROUP,
+                    )
+                    .unwrap();
+                mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+                let before = snapshot(&observer);
+                let login_html = format!(
+                    "<html>{PRIVATE} {SYNTHETIC_BODY} <a href='{LOGIN_PATH}?token={SYNTHETIC_TOKEN}'>Login</a></html>"
+                );
+                let mut cases = vec![
+                    (
+                        Response {
+                            status: "500 Internal Server Error",
+                            ..Response::courses(PRIVATE)
+                        },
+                        WebClassSyncError::Fetch,
+                    ),
+                    (
+                        Response {
+                            status: "302 Found",
+                            headers: format!("Location: {LOGIN_PATH}?token={SYNTHETIC_TOKEN}\r\n"),
+                            ..Response::courses("")
+                        },
+                        WebClassSyncError::AuthExpired,
+                    ),
+                    (
+                        Response {
+                            headers: "Content-Type: text/html\r\n".into(),
+                            ..Response::courses(login_html)
+                        },
+                        WebClassSyncError::AuthExpired,
+                    ),
+                    (
+                        Response::courses(format!("[{PRIVATE}")),
+                        WebClassSyncError::Parse,
+                    ),
+                ];
+                let mut courses = course_records(COURSES);
+                courses[0]["group_name"] = json!(PRIVATE);
+                // The first missing course is valid, but a later invalid ID
+                // must reject discovery before that first course can be created.
+                for empty in ["", " ", "\t\n", "\u{3000}"] {
+                    let mut invalid = courses.clone();
+                    invalid[2]["group_id"] = json!(empty);
+                    cases.push((
+                        Response::courses(serde_json::to_string(&invalid).unwrap()),
+                        WebClassSyncError::CourseValidation,
+                    ));
+                }
+                for different_name in [false, true] {
+                    let first = courses[0].clone();
+                    let mut second = first.clone();
+                    if different_name {
+                        second["group_name"] = json!("Different source name");
+                    }
+                    for duplicate in [
+                        vec![first.clone(), second.clone()],
+                        vec![second.clone(), first.clone()],
+                    ] {
+                        cases.push((
+                            Response::courses(serde_json::to_string(&duplicate).unwrap()),
+                            WebClassSyncError::CourseValidation,
+                        ));
+                    }
+                }
+                for (response, expected) in cases {
+                    let error = mock.sync_all(&mut store, &db, vec![response]).unwrap_err();
+                    assert_eq!(error, expected);
+                    assert_full_safe(error, &db);
+                    assert_eq!(snapshot(&observer), before);
+                }
+            }
+
+            #[test]
+            fn full_sync_contents_failures_keep_partial_progress_and_stop_then_allow_full_retry() {
+                let courses = course_records(COURSES);
+                let mut contents: Vec<JsonValue> =
+                    serde_json::from_str(&contents_for(GROUP)).unwrap();
+                let mut invalid_date = contents.clone();
+                invalid_date[2]["end_date"] = json!(PRIVATE);
+                let mut mismatch = contents.clone();
+                mismatch[2]["group_id"] = json!(PRIVATE);
+                mismatch[2]["hidden_content"] = json!(true);
+                let mut duplicate = contents.clone();
+                duplicate[2]["contents_id"] = duplicate[0]["contents_id"].clone();
+                contents[2]["contents_name"] = json!(PRIVATE);
+                let login_html =
+                    format!("<html>{PRIVATE}<a href='{LOGIN_PATH}'>{SYNTHETIC_BODY}</a></html>");
+                let cases = vec![
+                    (
+                        Response {
+                            status: "302 Found",
+                            headers: format!("Location: {LOGIN_PATH}?token={SYNTHETIC_TOKEN}\r\n"),
+                            ..Response::contents(GROUP, "")
+                        },
+                        WebClassSyncError::AuthExpired,
+                    ),
+                    (
+                        Response {
+                            headers: "Content-Type: text/html\r\n".into(),
+                            ..Response::contents(GROUP, login_html)
+                        },
+                        WebClassSyncError::AuthExpired,
+                    ),
+                    (
+                        Response {
+                            status: "500 Internal Server Error",
+                            ..Response::contents(GROUP, PRIVATE)
+                        },
+                        WebClassSyncError::Fetch,
+                    ),
+                    (
+                        Response::contents(GROUP, format!("[{PRIVATE}")),
+                        WebClassSyncError::Parse,
+                    ),
+                    (
+                        Response::contents(GROUP, serde_json::to_string(&invalid_date).unwrap()),
+                        WebClassSyncError::Map,
+                    ),
+                    (
+                        Response::contents(GROUP, serde_json::to_string(&mismatch).unwrap()),
+                        WebClassSyncError::Validation,
+                    ),
+                    (
+                        Response::contents(GROUP, serde_json::to_string(&duplicate).unwrap()),
+                        WebClassSyncError::Validation,
+                    ),
+                    (
+                        Response::contents(GROUP, serde_json::to_string(&contents).unwrap()),
+                        WebClassSyncError::Persistence,
+                    ),
+                ];
+                for (failure, expected) in cases {
+                    let db = TestDatabase::new();
+                    let (mut store, observer) = db.open();
+                    let mock = SyncMock::new();
+                    // Existing assignments without a course binding must stay
+                    // untouched when B discovery succeeds but its import fails.
+                    mock.sync_json(&mut store, GROUP, CONTENTS).unwrap();
+                    let mut completed = stored(&store, GROUP, "fixture-content-001");
+                    store
+                        .set_completion(&completed.id, CompletionState::Completed)
+                        .unwrap();
+                    completed.completion = CompletionState::Completed;
+                    let before = snapshot(&observer);
+                    if expected == WebClassSyncError::Persistence {
+                        observer
+                            .execute_batch(&format!(
+                                "CREATE TRIGGER reject_full_import BEFORE UPDATE ON assignments
+                             WHEN NEW.title = '{PRIVATE}'
+                             BEGIN SELECT RAISE(ABORT, NEW.title); END;"
+                            ))
+                            .unwrap();
+                    }
+                    let error = mock
+                        .sync_all(
+                            &mut store,
+                            &db,
+                            vec![
+                                Response::courses(COURSES),
+                                Response::contents(
+                                    "fixture-course-001",
+                                    contents_for("fixture-course-001"),
+                                ),
+                                failure,
+                            ],
+                        )
+                        .unwrap_err();
+                    assert_eq!(error, expected);
+                    assert_full_safe(error, &db);
+                    let a = discovered(&store, "fixture-course-001");
+                    let b = discovered(&store, GROUP);
+                    assert_eq!(
+                        stored(&store, "fixture-course-001", "fixture-content-001").course_id,
+                        Some(a.id.clone())
+                    );
+                    assert_ne!(a.id, b.id);
+                    assert_eq!(
+                        store
+                            .find_course_by_source(OriginKind::WebClass, "fixture-course-003")
+                            .unwrap(),
+                        None
+                    );
+                    let partial = snapshot(&observer);
+                    assert_eq!(partial[0].len(), 6);
+                    assert_eq!(partial[1].len(), 6);
+                    assert_eq!(partial[2].len(), 2);
+                    assert_eq!(partial[3].len(), 2);
+                    for row in &before[0] {
+                        assert!(partial[0].contains(row));
+                    }
+                    for row in &before[1] {
+                        assert!(partial[1].contains(row));
+                    }
+                    assert_eq!(stored(&store, GROUP, "fixture-content-001"), completed);
+                    if expected == WebClassSyncError::Persistence {
+                        observer
+                            .execute_batch("DROP TRIGGER reject_full_import")
+                            .unwrap();
+                    }
+                    // Explicitly invoke a fresh whole operation; production does
+                    // not retry automatically. A is reused, B attaches its old
+                    // assignments to the discovered course, and C is now created.
+                    assert_eq!(
+                        mock.sync_all(&mut store, &db, success_responses(&courses))
+                            .unwrap(),
+                        WebClassSyncSummary {
+                            courses_discovered: 3,
+                            courses_created: 1,
+                            groups_synced: 3,
+                            assignments_created: 3,
+                            assignments_updated: 3,
+                            assignments_unchanged: 3,
+                        }
+                    );
+                    assert_eq!(discovered(&store, "fixture-course-001"), a);
+                    let recovered = stored(&store, GROUP, "fixture-content-001");
+                    assert_eq!(recovered.id, completed.id);
+                    assert_eq!(recovered.course_id, Some(b.id));
+                    assert_eq!(recovered.completion, CompletionState::Completed);
+                    let recovered_rows = snapshot(&observer);
+                    assert_eq!(
+                        mock.sync_all(&mut store, &db, success_responses(&courses))
+                            .unwrap(),
+                        WebClassSyncSummary {
+                            courses_discovered: 3,
+                            groups_synced: 3,
+                            assignments_unchanged: 9,
+                            ..Default::default()
+                        }
+                    );
+                    assert_eq!(snapshot(&observer), recovered_rows);
+                }
+            }
+
+            #[test]
+            fn full_sync_course_creation_failure_is_atomic_and_preserves_earlier_group() {
+                let db = TestDatabase::new();
+                let (mut store, observer) = db.open();
+                let mock = SyncMock::new();
+                observer
+                    .execute_batch(&format!(
+                        "CREATE TRIGGER reject_full_course BEFORE INSERT ON course_sources
+                     WHEN NEW.external_id = '{GROUP}'
+                     BEGIN SELECT RAISE(ABORT, NEW.external_id); END;"
+                    ))
+                    .unwrap();
+                let error = mock
+                    .sync_all(
+                        &mut store,
+                        &db,
+                        vec![
+                            Response::courses(COURSES),
+                            Response::contents(
+                                "fixture-course-001",
+                                contents_for("fixture-course-001"),
+                            ),
+                        ],
+                    )
+                    .unwrap_err();
+                assert_eq!(error, WebClassSyncError::CoursePersistence);
+                assert_full_safe(error, &db);
+                let a = discovered(&store, "fixture-course-001");
+                for group in [GROUP, "fixture-course-003"] {
+                    assert_eq!(
+                        store
+                            .find_course_by_source(OriginKind::WebClass, group)
+                            .unwrap(),
+                        None
+                    );
+                    assert_eq!(
+                        store
+                            .find_assignment_by_external_key(&key(group, "fixture-content-001"))
+                            .unwrap(),
+                        None
+                    );
+                }
+                let partial = snapshot(&observer);
+                assert_eq!(partial[0].len(), 3);
+                assert_eq!(partial[1].len(), 3);
+                assert_eq!(partial[2].len(), 1);
+                assert_eq!(partial[3].len(), 1);
+                assert_eq!(
+                    stored(&store, "fixture-course-001", "fixture-content-001").course_id,
+                    Some(a.id.clone())
+                );
+                observer
+                    .execute_batch("DROP TRIGGER reject_full_course")
+                    .unwrap();
+                assert_eq!(
+                    mock.sync_all(&mut store, &db, success_responses(&course_records(COURSES)))
+                        .unwrap(),
+                    WebClassSyncSummary {
+                        courses_discovered: 3,
+                        courses_created: 2,
+                        groups_synced: 3,
+                        assignments_created: 6,
+                        assignments_unchanged: 3,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(discovered(&store, "fixture-course-001"), a);
+            }
+        }
     }
 }
