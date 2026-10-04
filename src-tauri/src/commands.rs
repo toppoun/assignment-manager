@@ -8,6 +8,8 @@ use crate::{
     settings::SettingsStatusDto,
     settings_worker::SettingsState,
     storage::DesktopState,
+    sync_service::SyncResultDto,
+    sync_worker::SyncState,
 };
 
 #[tauri::command]
@@ -16,6 +18,19 @@ pub async fn list_assignments(
     state: State<'_, DesktopState>,
 ) -> Result<AssignmentListDto, ApplicationError> {
     state.list(request).await
+}
+
+#[tauri::command]
+pub async fn sync_now(state: State<'_, SyncState>) -> Result<SyncResultDto, ApplicationError> {
+    state.sync_now().await
+}
+
+#[tauri::command]
+pub async fn set_startup_sync(
+    enabled: bool,
+    state: State<'_, SettingsState>,
+) -> Result<(), ApplicationError> {
+    state.set_startup_sync(enabled).await
 }
 
 #[tauri::command]

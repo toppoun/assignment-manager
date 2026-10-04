@@ -2,6 +2,10 @@ import {
   DEFAULT_CONTROLS, buildQueryRequest, courseOptionLabel, deadlineLabel, emptyState,
   groupAssignments, operationErrorMessage, originLabel, statusPresentation, submissionLabel,
 } from "./presentation.js";
+import { createListTaskRunner } from "./list_tasks.js";
+import { initializeSync } from "./sync.js";
+import { createSyncView } from "./sync_view.js";
+import { settingsModel } from "./settings_view.js";
 
 const list = document.querySelector("#assignments");
 const empty = document.querySelector("#empty");
@@ -21,6 +25,7 @@ let appliedControls = { ...DEFAULT_CONTROLS };
 let busy = false;
 let hasSnapshot = false;
 let needsRefresh = false;
+const runListTask = createListTaskRunner();
 
 function invoke(command, arguments_) {
   return window.__TAURI__.core.invoke(command, arguments_);
@@ -161,8 +166,9 @@ async function query(selected) {
   return invoke("list_assignments", { request: buildQueryRequest(selected) });
 }
 
-async function load() {
-  if (busy) return;
+function load() { return runListTask(loadNow); }
+
+async function loadNow() {
   const focus = rememberFocus();
   const selected = readControls();
   setBusy(true);
@@ -181,9 +187,13 @@ async function load() {
   }
 }
 
-async function toggle(assignment, checkbox) {
+function toggle(assignment, checkbox) {
   checkbox.checked = assignment.completion === "completed";
   if (busy || needsRefresh) return;
+  return runListTask(() => toggleNow(assignment));
+}
+
+async function toggleNow(assignment) {
   const focus = rememberFocus();
   setBusy(true);
   errorBanner.hidden = true;
@@ -217,4 +227,8 @@ reset.addEventListener("click", () => {
   writeControls({ ...DEFAULT_CONTROLS, completion: "all" });
   void load();
 });
-void load();
+const syncModel = createSyncView(invoke, load);
+void initializeSync(load, async () => {
+  await settingsModel.load();
+  return settingsModel.snapshot();
+}, syncModel);

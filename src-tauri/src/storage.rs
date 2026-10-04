@@ -35,7 +35,7 @@ impl DesktopState {
         Self::start_worker(directory).map(|(state, _worker)| state)
     }
 
-    fn start_worker(
+    pub(crate) fn start_worker(
         directory: Result<PathBuf, ApplicationError>,
     ) -> Result<(Self, JoinHandle<()>), ApplicationError> {
         let (requests, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
@@ -107,7 +107,7 @@ fn database_path(directory: &Path) -> Result<PathBuf, ApplicationError> {
     Ok(directory.join(DATABASE_FILENAME))
 }
 
-fn open_app_store(directory: &Path) -> Result<SqliteStore, ApplicationError> {
+pub(crate) fn open_app_store(directory: &Path) -> Result<SqliteStore, ApplicationError> {
     let path = database_path(directory)?;
     fs::create_dir_all(directory).map_err(|_| ApplicationError::DataDirectory)?;
     // The core alone owns schema v3 and migrations.

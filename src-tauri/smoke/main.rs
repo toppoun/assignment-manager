@@ -17,6 +17,14 @@ mod settings;
 mod settings_worker;
 #[path = "../src/storage.rs"]
 mod storage;
+// This executable deliberately substitutes transport; the production adapter is unused here.
+mod network;
+#[allow(dead_code)]
+#[path = "../src/sync_service.rs"]
+mod sync_service;
+#[allow(dead_code)]
+#[path = "../src/sync_worker.rs"]
+mod sync_worker;
 
 use std::path::PathBuf;
 
@@ -110,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|path| path.is_absolute())
         .ok_or("provide an absolute, dedicated smoke-test directory")?;
     seed(&directory)?;
+    let network_mode = std::env::args().nth(2).unwrap_or_default();
     let mut context = tauri::generate_context!();
     context.config_mut().identifier = "io.assignment-manager.list-smoke".into();
     // DB and webview data both stay in the supplied test root, outside production data.
@@ -117,20 +126,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(AppDirectoriesOverride::Root(directory.join("data")));
     context.config_mut().app.windows[0].title = "Assignment Manager — Smoke".into();
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             let directory = app
                 .path()
                 .app_data_dir()
                 .map_err(|_| error::ApplicationError::DataDirectory);
-            app.manage(storage::DesktopState::start(directory)?);
+            app.manage(storage::DesktopState::start(directory.clone())?);
             let config_directory = app
                 .path()
                 .app_config_dir()
                 .map_err(|_| error::ApplicationError::SettingsReadFailed);
-            app.manage(settings_worker::SettingsState::start(
+            let settings = settings_worker::SettingsState::start(
                 config_directory,
                 "io.assignment-manager.settings-smoke",
+            )?;
+            app.manage(sync_worker::SyncState::start_with_backend(
+                directory,
+                settings.clone(),
+                network::SmokeNetwork::new(&network_mode),
             )?);
+            app.manage(settings);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -140,7 +155,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commands::save_moodle_feed,
             commands::remove_moodle_feed,
             commands::save_webclass_credentials,
-            commands::remove_webclass_credentials
+            commands::remove_webclass_credentials,
+            commands::set_startup_sync,
+            commands::sync_now
         ])
         .run(context)?;
     Ok(())

@@ -9,6 +9,8 @@ mod list_query;
 mod settings;
 mod settings_worker;
 mod storage;
+mod sync_service;
+mod sync_worker;
 
 use error::ApplicationError;
 use storage::DesktopState;
@@ -22,17 +24,19 @@ fn main() {
                 .path()
                 .app_data_dir()
                 .map_err(|_| ApplicationError::DataDirectory);
-            // Creation, open/migration and all later SQLite work run on one worker.
+            // Creation, open/migration and local list/completion work run on this worker.
             // Commands wait for startup without blocking the window/event thread.
-            app.manage(DesktopState::start(directory)?);
+            app.manage(DesktopState::start(directory.clone())?);
             let config_directory = app
                 .path()
                 .app_config_dir()
                 .map_err(|_| ApplicationError::SettingsReadFailed);
-            app.manage(settings_worker::SettingsState::start(
+            let settings = settings_worker::SettingsState::start(
                 config_directory,
                 "io.assignment-manager.desktop",
-            )?);
+            )?;
+            app.manage(sync_worker::SyncState::start(directory, settings.clone())?);
+            app.manage(settings);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -42,7 +46,9 @@ fn main() {
             commands::save_moodle_feed,
             commands::remove_moodle_feed,
             commands::save_webclass_credentials,
-            commands::remove_webclass_credentials
+            commands::remove_webclass_credentials,
+            commands::set_startup_sync,
+            commands::sync_now
         ])
         .run(tauri::generate_context!());
 

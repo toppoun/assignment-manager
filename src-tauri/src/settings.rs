@@ -20,6 +20,8 @@ pub struct NonSecretSettings {
     version: u32,
     moodle_scope: String,
     moodle_export_kind: ExportKind,
+    #[serde(default)]
+    sync_on_startup: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,13 +36,17 @@ impl Default for NonSecretSettings {
             version: 1,
             moodle_scope: MOODLE_SCOPE.into(),
             moodle_export_kind: ExportKind::CourseRelated,
+            sync_on_startup: false,
         }
     }
 }
 
 impl NonSecretSettings {
     fn validate(&self) -> Result<(), ApplicationError> {
-        if self != &Self::default() {
+        if self.version != 1
+            || self.moodle_scope != MOODLE_SCOPE
+            || self.moodle_export_kind != ExportKind::CourseRelated
+        {
             return Err(ApplicationError::SettingsReadFailed);
         }
         Ok(())
@@ -103,6 +109,31 @@ impl SettingsFile {
             Err(_) => Err(ApplicationError::SettingsWriteFailed),
         }
     }
+
+    fn write(&self, settings: &NonSecretSettings) -> Result<(), ApplicationError> {
+        settings.validate()?;
+        // Do not overwrite an existing file that became corrupt after startup.
+        self.read()?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or(ApplicationError::SettingsWriteFailed)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|_| ApplicationError::SettingsWriteFailed)?;
+        serde_json::to_writer_pretty(&mut temporary, settings)
+            .map_err(|_| ApplicationError::SettingsWriteFailed)?;
+        temporary
+            .write_all(b"\n")
+            .map_err(|_| ApplicationError::SettingsWriteFailed)?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|_| ApplicationError::SettingsWriteFailed)?;
+        temporary
+            .persist(&self.path)
+            .map_err(|_| ApplicationError::SettingsWriteFailed)?;
+        Ok(())
+    }
 }
 
 /// Only these flags cross IPC. Loaded secrets are immediately dropped after inspection.
@@ -111,11 +142,13 @@ impl SettingsFile {
 pub struct SettingsStatusDto {
     pub moodle_configured: bool,
     pub webclass_configured: bool,
+    pub sync_on_startup: bool,
 }
 
 pub struct SettingsService<C> {
     config: NonSecretSettings,
     credentials: C,
+    webclass_revision: u64,
 }
 
 impl<C: CredentialStore> SettingsService<C> {
@@ -123,6 +156,7 @@ impl<C: CredentialStore> SettingsService<C> {
         Self {
             config,
             credentials,
+            webclass_revision: 0,
         }
     }
 
@@ -131,6 +165,7 @@ impl<C: CredentialStore> SettingsService<C> {
         Ok(SettingsStatusDto {
             moodle_configured: self.credentials.load_moodle_feed_secret()?.is_some(),
             webclass_configured: self.credentials.load_webclass_credentials()?.is_some(),
+            sync_on_startup: self.config.sync_on_startup,
         })
     }
 
@@ -141,10 +176,37 @@ impl<C: CredentialStore> SettingsService<C> {
         self.credentials.delete_moodle_feed_secret()
     }
     pub fn save_webclass(&mut self, value: WebClassCredentials) -> Result<(), ApplicationError> {
-        self.credentials.save_webclass_credentials(value)
+        self.credentials.save_webclass_credentials(value)?;
+        self.webclass_revision = self.webclass_revision.wrapping_add(1);
+        Ok(())
     }
     pub fn remove_webclass(&mut self) -> Result<(), ApplicationError> {
-        self.credentials.delete_webclass_credentials()
+        self.credentials.delete_webclass_credentials()?;
+        self.webclass_revision = self.webclass_revision.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn load_moodle(&self) -> Result<Option<SecretText>, ApplicationError> {
+        self.credentials.load_moodle_feed_secret()
+    }
+
+    pub fn load_webclass(&self) -> Result<(u64, Option<WebClassCredentials>), ApplicationError> {
+        Ok((
+            self.webclass_revision,
+            self.credentials.load_webclass_credentials()?,
+        ))
+    }
+
+    pub fn set_startup_sync(
+        &mut self,
+        file: &SettingsFile,
+        enabled: bool,
+    ) -> Result<(), ApplicationError> {
+        let mut next = self.config.clone();
+        next.sync_on_startup = enabled;
+        file.write(&next)?;
+        self.config = next;
+        Ok(())
     }
 }
 
@@ -152,6 +214,31 @@ impl<C: CredentialStore> SettingsService<C> {
 mod tests {
     use super::*;
     use crate::credential_store::tests::{ID, PASSWORD, URL, credentials, fake};
+
+    #[test]
+    fn old_config_defaults_off_and_startup_setting_is_atomic_and_persistent() {
+        let root = tempfile::tempdir().unwrap();
+        let file = SettingsFile::new(root.path()).unwrap();
+        let old = r#"{"version":1,"moodleScope":"default.course-related","moodleExportKind":"course_related"}"#;
+        fs::write(&file.path, old).unwrap();
+        let mut service = SettingsService::new(file.load_or_create().unwrap(), fake());
+        assert!(!service.status().unwrap().sync_on_startup);
+        assert_eq!(fs::read_to_string(&file.path).unwrap(), old);
+        service.set_startup_sync(&file, true).unwrap();
+        assert!(
+            SettingsService::new(file.load_or_create().unwrap(), fake())
+                .status()
+                .unwrap()
+                .sync_on_startup
+        );
+        fs::write(&file.path, "broken").unwrap();
+        assert_eq!(
+            service.set_startup_sync(&file, false),
+            Err(ApplicationError::SettingsReadFailed)
+        );
+        assert!(service.status().unwrap().sync_on_startup);
+        assert_eq!(fs::read_to_string(&file.path).unwrap(), "broken");
+    }
 
     #[test]
     fn non_secret_config_roundtrips_with_stable_scope_and_export_kind() {
@@ -219,7 +306,8 @@ mod tests {
             service.status().unwrap(),
             SettingsStatusDto {
                 moodle_configured: false,
-                webclass_configured: false
+                webclass_configured: false,
+                sync_on_startup: false
             }
         );
         let db_path = root.path().join("assignment-manager.db");
@@ -229,7 +317,7 @@ mod tests {
         let dto = service.status().unwrap();
         assert_eq!(
             serde_json::to_value(&dto).unwrap(),
-            serde_json::json!({"moodleConfigured":true,"webclassConfigured":true})
+            serde_json::json!({"moodleConfigured":true,"webclassConfigured":true,"syncOnStartup":false})
         );
         drop(db);
         let representations = [
@@ -252,7 +340,8 @@ mod tests {
             service.status().unwrap(),
             SettingsStatusDto {
                 moodle_configured: false,
-                webclass_configured: true
+                webclass_configured: true,
+                sync_on_startup: false
             }
         );
         service.remove_webclass().unwrap();

@@ -17,6 +17,7 @@ export function settingsErrorMessage(operation, error) {
     remove_moodle: "Moodle設定を削除できませんでした。",
     save_webclass: "WebClass認証情報を保存できませんでした。",
     remove_webclass: "WebClass認証情報を削除できませんでした。",
+    startup: "起動時の同期設定を保存できませんでした。",
   }[operation];
   return `${prefix} ${safeErrorMessage(error)}`;
 }
@@ -30,7 +31,7 @@ const mutations = {
 
 // Model state contains only booleans and fixed UI messages, never input/response secrets.
 export function createSettingsModel(invoke, onChange = () => {}) {
-  const state = { moodleConfigured: null, webclassConfigured: null, busy: false, error: null, message: "" };
+  const state = { moodleConfigured: null, webclassConfigured: null, syncOnStartup: null, busy: false, error: null, message: "" };
   const snapshot = () => ({ ...state });
   const notify = () => onChange(snapshot());
 
@@ -47,11 +48,13 @@ export function createSettingsModel(invoke, onChange = () => {}) {
       }
       state.moodleConfigured = response.moodleConfigured;
       state.webclassConfigured = response.webclassConfigured;
+      state.syncOnStartup = response.syncOnStartup === true;
       state.message = "";
       return true;
     } catch (error) {
       state.moodleConfigured = null;
       state.webclassConfigured = null;
+      state.syncOnStartup = null;
       state.error = settingsErrorMessage("status", error);
       state.message = "";
       return false;
@@ -99,5 +102,26 @@ export function createSettingsModel(invoke, onChange = () => {}) {
     }
   }
 
-  return { snapshot, load, mutate };
+  async function setStartupSync(enabled) {
+    if (state.busy || typeof enabled !== "boolean") return false;
+    state.busy = true;
+    state.error = null;
+    state.message = "保存しています…";
+    notify();
+    try {
+      await invoke("set_startup_sync", { enabled });
+      state.syncOnStartup = enabled;
+      state.message = "保存しました。";
+      return true;
+    } catch (error) {
+      state.error = settingsErrorMessage("startup", error);
+      state.message = "";
+      return false;
+    } finally {
+      state.busy = false;
+      notify();
+    }
+  }
+
+  return { snapshot, load, mutate, setStartupSync };
 }

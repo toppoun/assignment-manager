@@ -1,6 +1,6 @@
 # Assignment Manager
 
-Rust coreと、Phase 8D1のWindows/macOS向けTauri 2 desktop shellです。
+Rust coreと、Phase 8D2のWindows向けTauri 2 desktop shellです。macOS backendは未検証です。
 
 ## Development
 
@@ -29,7 +29,7 @@ directory作成と`SqliteStore::open`（schema v3 migration）は起動時に専
 coreはroot crateのまま、desktopは独立manifest/lockfileで依存します。
 
 初回DBは空です。「課題はまだありません」は正常な状態です。
-このPhaseには課題作成、同期、DB選択UIはありません。
+設定済みサービスから「同期」で課題を取得します。課題作成・DB選択UIはありません。
 
 ## Assignment list
 
@@ -58,17 +58,17 @@ query失敗時は前回成功した条件へ戻して前の一覧を表示しま
 ## Settings and secrets
 
 「設定」画面でMoodle calendar URL、WebClass大学ID/passwordを保存・置換・個別削除できます。
-保存してもMoodle fetch、WebClass login、startup syncは行いません。大学サーバーへの接続はありません。
+保存した直後は同期しません。「同期」button、または次回の起動時同期で利用します。
 保存後は「設定済み」だけを表示し、保存済みURL/ID/passwordをfrontendへ返しません。
 secret入力は送信時、command終了時、画面切り替え時にclearし、失敗時も再入力が必要です。
 localStorage/sessionStorage/IndexedDBやJS stateへのsecret保存はありません。
 WebViewはincognitoで起動し、Windowsのgeneral autofillも無効です。
 
 非secret設定は`app.path().app_config_dir()`の`settings.json`へ保存します。
-内容はversion、`moodleScope: default.course-related`、`moodleExportKind: course_related`のみです。
+内容はversion、`moodleScope: default.course-related`、`moodleExportKind: course_related`、`syncOnStartup`です。
 single university/profile/feedの固定contractで、token URLの置換・削除によってscopeは変わりません。
 `MoodleFeed::new`でHTTPS・host・userinfoを検証し、coreのscope/export-kind suffix contractを守ります。
-同じdirectoryのtemporary fileをsyncしてatomicに新規作成します。破損・未知version・変更されたidentity・
+同じdirectoryのtemporary fileをsyncしてatomicに作成・置換します。破損・未知version・変更されたidentity・
 未知fieldを含む既存設定は固定errorにし、上書きやsilent resetはしません。
 
 secretはdesktop内部の`CredentialStore`境界に集約しています。
@@ -87,8 +87,39 @@ libraryのraw error/causeやsecretのdeserialize errorは公開せず、固定�
 
 追加commands: `get_settings_status`、`save_moodle_feed`、`remove_moodle_feed`、
 `save_webclass_credentials`、`remove_webclass_credentials`。
-status DTOは`moodleConfigured`/`webclassConfigured`のbooleanのみです。
+status DTOは`moodleConfigured`/`webclassConfigured`/`syncOnStartup`のbooleanのみです。
 mutationはwrite/delete成功だけを返し、その後のstatus read失敗と保存失敗が混ざらないようにしています。
+
+## Desktop sync
+
+一覧画面の「同期」は設定済みsourceだけを実行します。未設定なら通信はありません。
+Moodle/WebClassは独立した結果を返し、一方の失敗でももう一方を実行します。
+結果は未設定・成功（新規/更新/変更なしの件数）・固定error分類だけです。
+scope、external identity、URL、HTTP body、credential、raw causeをIPC/logへ出しません。
+
+[async Tauri command](https://v2.tauri.app/develop/calling-rust/)は専用sync workerへ要求を送り、
+workerが同じ`app_data_dir / assignment-manager.db`を一度openします。
+一覧/toggle workerのConnectionとは別で、network待ちでもローカル操作を利用できます。
+coreの5秒busy timeoutと短い`BEGIN IMMEDIATE` transactionを再利用し、schema v3は変更しません。
+atomicなsingle-flight admissionによりstartup/manual/連打は重複実行せず、追加runをqueueへ積みません。
+IPC待ちがcancelされても実行中のsyncが終わるまでsingle-flightを維持します。
+
+secretは各sourceの処理直前にSettings worker経由でOS storeから読みます。
+Moodleは固定scope/`CourseRelated`を使い、`sync_moodle_once`へ接続します。
+URL rotationはsource identityを変えません。URLをrun間でcacheしません。
+WebClassは初回に`HoseiAuthenticator::login`し、以降はメモリだけにsessionを保持します。
+`sync_webclass_all_with_reauth`がAuthExpired時のcredential取得・再login・一度のretryを担当します。
+Settingsでcredentialを保存/削除した成功時だけrevisionを進め、次syncで旧sessionを破棄します。
+cookie jar/sessionをdiskへ保存しません。再起動後は次syncでloginします。
+
+設定の更新は[`NamedTempFile::persist`](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist)
+による同directory内のatomic置換を使用します。
+「起動時に同期する」は既定OFFで、旧settings fileのfield省略もOFFとして読めます。
+起動時は最初のローカル一覧取得→設定確認→background sync→一覧再queryの順です。
+同期失敗は起動を妨げません。完了操作もofflineで利用できます。
+実行したsourceがあれば失敗/partial failureでも現在のfilter/sortで一覧を再queryします。
+query/toggle中の同期完了によるreloadは処理終了後に実行します。
+同期はlocal user-owned CompletionStateを変更しません。
 
 ## Checks
 
@@ -113,7 +144,7 @@ cargo build --manifest-path src-tauri/Cargo.toml --locked --offline --features c
 Node.jsがある場合、外部test frameworkなしで表示helperも検証できます:
 
 ```sh
-node --test tests/frontend.test.mjs tests/settings.test.mjs
+node --test tests/frontend.test.mjs tests/settings.test.mjs tests/sync.test.mjs
 ```
 
 Rust testsはDTO、固定error境界、DB path/directory failure、request→core options、
@@ -124,6 +155,12 @@ partial/corrupt record、error分類、設定roundtripと破損保持を検証�
 literal secretが設定file、SQLite、status DTO、error、Debugへ出ないことも検証します。
 frontend testsはconfigured表示、save/remove request、入力clear、secretをstateへ残さないこと、固定errorを検証します。
 unit testが実OS credential storeへ書き込むことはありません。
+desktop sync testsはfake transport/providerのみを使用し、source選択、partial failure、
+初回login/session再利用、core reauth callbackへの接続、credential変更/削除、single-flight、
+network待ち中のlocal query/toggle、sync後・DB reopen後のcompletion保持を検証します。
+core HTTP testsがreauth protocol/retryをlocalhost mockで検証します。
+frontend testsは進行状態/連打、source別成功・失敗、reloadの順序、startup policyを検証します。
+通常test suiteは大学サーバーへ接続しません。
 
 Phase 8D1の依存追加時だけcrates.ioへ接続してdesktop lockfileを更新しました。
 以降のcore/desktop checksは`--locked --offline`で実行しています。
@@ -143,6 +180,9 @@ WebView2 dataもこのdirectory内に分離し、再起動で同じtest DBを使
 Settingsも同じRust実装・実OS credential backendを使用しますが、serviceは
 `io.assignment-manager.settings-smoke`に分離します。本番credential entryは変更しません。
 空DBを作成済みのdirectoryには課題を追加しません。大学サーバーへの接続はありません。
+同期transportもfakeに置換し、設定済みsourceからsynthetic課題だけをimportします。
+同期処理は各sourceで2秒待ち、進行表示とlocal操作を確認できます。
+上記commandのdirectoryの後に`partial`を付けるとWebClass認証失敗、`failure`なら両source失敗になります。
 WindowsのGUI resource/manifestが必要なため、Cargo exampleとして実行しないでください。
 
 確認項目: filter/sort変更、Course選択、同名Courseの別group、未所属group、
@@ -153,8 +193,19 @@ Settingsの確認項目: synthetic HTTPS URL/ID/passwordの保存、入力clear�
 
 Phase 8D1: Windowsで上記の実credential backend操作を検証。macOS実機/Keychainは未検証です。
 
+本番大学サーバーのmanual smokeは、通常のdesktop binaryでOS storeに保存した設定を使い、
+「同期」から個別/両source取得、再同期でduplicateなし、toggle→再同期でCompleted保持、
+再起動でローカル一覧即表示を確認します。URL/ID/passwordをcode、fixture、env fileへ書かないでください。
+実接続を通常testsやoffline smoke binaryへ組み込まないでください。
+
+Phase 8D2（Windows、2026-10-04）: 実server manual smokeでMoodle 15件、WebClass 146件を取得。
+再同期は全161件が変更なしで、toggle→sync→app restartでもCompletedを保持しました。
+検証用toggleは元に戻しました。初回Moodle通信失敗時もWebClass成功分を表示できました。
+起動時同期のON保存・再起動・自動実行は隔離したoffline smokeで確認済みです。
+本番startup policyはOFFのまま、synthetic OS credentialは削除済みです。macOSは未検証です。
+
 ## Remaining
 
-- Phase 8D2: Manual Sync now、Moodle sync、WebClass sync + automatic reauth、configured sourceごとのsync、progress/result/safe error UI、startup sync policy
-- After Phase 8D2: macOS smoke test、Keychain verification、macOS build / bundle verification
-- Later: timetable、sync status、Course management / merge
+- MVP stabilization: UI整理、source submission state / mismatch warning設計、sync status、timetable、Course management
+- macOS native: SwiftUI shell、Rust bridge、Keychain、Assignment UI、timetable、WidgetKit
+- macOS実機/Keychainは未検証。今回macOS固有UIやSwiftUI実装は追加していません。

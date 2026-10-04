@@ -7,6 +7,7 @@ const settingsButton = document.querySelector("#show-settings");
 const reload = document.querySelector("#settings-reload");
 const errorBanner = document.querySelector("#settings-error");
 const message = document.querySelector("#settings-message");
+const startupSync = document.querySelector("#startup-sync");
 const moodleInputs = { url: document.querySelector("#moodle-url") };
 const webclassInputs = {
   universityId: document.querySelector("#webclass-id"), password: document.querySelector("#webclass-password"),
@@ -18,6 +19,7 @@ const sources = {
 };
 let pendingFocus = null;
 const model = createSettingsModel((command, arguments_) => window.__TAURI__.core.invoke(command, arguments_), render);
+export const settingsModel = model;
 
 function render(state) {
   if (state.busy && pendingFocus === null) pendingFocus = document.activeElement;
@@ -26,6 +28,13 @@ function render(state) {
   message.textContent = state.message;
   errorBanner.hidden = state.error === null;
   errorBanner.textContent = state.error ?? "";
+  startupSync.checked = state.syncOnStartup === true;
+  startupSync.disabled = state.busy || state.syncOnStartup === null;
+  // Safe flags only; secret inputs/command arguments never enter this event.
+  document.dispatchEvent(new CustomEvent("settings-status-changed", { detail: {
+    moodleConfigured: state.moodleConfigured, webclassConfigured: state.webclassConfigured,
+    syncOnStartup: state.syncOnStartup,
+  } }));
   for (const [name, source] of Object.entries(sources)) {
     const configured = state[`${name}Configured`];
     const presentation = configuredPresentation(configured);
@@ -66,5 +75,10 @@ document.querySelector("#webclass-form").addEventListener("submit", event => {
 });
 sources.moodle.remove.addEventListener("click", () => { clearSecretInputs(moodleInputs); void model.mutate("remove_moodle"); });
 sources.webclass.remove.addEventListener("click", () => { clearSecretInputs(webclassInputs); void model.mutate("remove_webclass"); });
+startupSync.addEventListener("change", () => {
+  const enabled = startupSync.checked;
+  startupSync.checked = model.snapshot().syncOnStartup === true;
+  void model.setStartupSync(enabled);
+});
 window.addEventListener("pagehide", () => clearSecretInputs(allInputs));
 render(model.snapshot());

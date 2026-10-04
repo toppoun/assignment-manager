@@ -21,7 +21,10 @@
           <h1>課題一覧</h1>
           <p class="description">Courseごとに、いま取り組む課題を確認</p>
         </div>
-        <button id="reload" type="button">再読み込み</button>
+        <div class="header-actions">
+          <button id="sync-now" type="button" disabled>同期</button>
+          <button id="reload" type="button">再読み込み</button>
+        </div>
       </header>
       <form id="filters" class="toolbar" aria-label="課題の表示条件">
         <div class="field">
@@ -57,6 +60,11 @@
           </select>
         </div>
       </form>
+      <section id="sync-panel" class="sync-panel" aria-label="同期結果" aria-busy="false">
+        <p id="sync-message" class="status" role="status" aria-live="polite"></p>
+        <ul id="sync-results" aria-live="polite"></ul>
+        <p id="sync-error" class="error" role="alert" hidden></p>
+      </section>
       <div class="list-summary">
         <p id="count" class="count"></p>
         <p id="status" class="status" role="status" aria-live="polite">課題を読み込んでいます…</p>
@@ -81,6 +89,10 @@
         <p class="settings-note">URL・大学ID・passwordはOSの認証情報ストアへ保存します。保存済みの値は表示しません。ここで保存しても同期やログインは行いません。</p>
         <p id="settings-error" class="error" role="alert" hidden></p>
         <p id="settings-message" class="status" role="status" aria-live="polite"></p>
+        <div class="startup-setting">
+          <label for="startup-sync"><input id="startup-sync" type="checkbox" disabled />起動時に同期する</label>
+          <p class="input-help">最初にローカルの課題を表示してから同期します。初期設定はOFFです。</p>
+        </div>
         <div class="settings-cards">
           <section class="settings-card" aria-labelledby="moodle-title">
             <div class="settings-card-header">

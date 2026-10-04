@@ -8,6 +8,8 @@ fn main() {
             "remove_moodle_feed",
             "save_webclass_credentials",
             "remove_webclass_credentials",
+            "set_startup_sync",
+            "sync_now",
         ]),
     ))
     .expect("could not build desktop application resources");
