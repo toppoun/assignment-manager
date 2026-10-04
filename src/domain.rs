@@ -56,12 +56,17 @@ pub enum SubmissionTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assignment {
     pub id: AssignmentId,
+    /// Import updates this relation only when an internal course is explicitly resolved.
+    /// Missing course information preserves an existing relation.
     pub course_id: Option<CourseId>,
+    /// Source-owned for imported assignments.
     pub title: String,
+    /// Source-owned for imported assignments, including an absent deadline.
     pub deadline: Option<Deadline>,
     pub submission: SubmissionTarget,
     /// The actual page where the user can submit or answer, not a source detail page.
     pub submission_url: Option<String>,
+    /// Local-owned: import never changes this from source scores or answer timestamps.
     pub completion: CompletionState,
 }
 

@@ -7,7 +7,10 @@ use chrono::{FixedOffset, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 
 use crate::domain::{Deadline, SubmissionTarget};
-use crate::import::{AssignmentCandidate, ExternalRecordKey, OriginKind};
+use crate::import::{
+    AssignmentCandidate, AssignmentCandidateBatch, ExternalRecordKey, ImportValidationError,
+    OriginKind,
+};
 
 /// WebClass course data. These external fields are not application course IDs or schedule entries.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -56,7 +59,12 @@ pub fn parse_contents(json: &str) -> Result<Vec<WebClassContent>, serde_json::Er
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebClassMapError {
-    InvalidEndDate { contents_id: String, value: String },
+    InvalidEndDate {
+        contents_id: String,
+        value: String,
+    },
+    /// Import validation carries a fixed classification only, with no source data.
+    Validation(ImportValidationError),
 }
 
 impl fmt::Display for WebClassMapError {
@@ -68,6 +76,7 @@ impl fmt::Display for WebClassMapError {
                     "WebClass content {contents_id}: invalid end_date: {value}"
                 )
             }
+            Self::Validation(error) => error.fmt(f),
         }
     }
 }
@@ -97,6 +106,10 @@ fn deadline(content: &WebClassContent) -> Result<Option<Deadline>, WebClassMapEr
 }
 
 /// Only `Question` is confirmed assignment-like by the supplied fixtures.
+///
+/// `group_id` / `contents_id` remain opaque external strings, not internal IDs.
+/// `link_to` has not been established as an actual submission page, so the URL is
+/// left unknown. Scores and answer timestamps do not determine local completion.
 pub fn map_content(
     content: &WebClassContent,
 ) -> Result<Option<AssignmentCandidate>, WebClassMapError> {
@@ -121,6 +134,11 @@ pub fn map_content(
     }))
 }
 
+/// Map assignment-like records, not a complete set of source identities.
+///
+/// Hidden or unsupported records can exist in `contents` without becoming
+/// candidates. Candidate absence must never be used to infer source disappearance.
+/// Use [`map_contents_for_group`] at the fetched-group import boundary.
 pub fn map_contents(
     contents: &[WebClassContent],
 ) -> Result<Vec<AssignmentCandidate>, WebClassMapError> {
@@ -129,6 +147,42 @@ pub fn map_contents(
         .map(map_content)
         .filter_map(|result| result.transpose())
         .collect()
+}
+
+/// Bind parsed contents to the exact group supplied to `fetch_contents_json`.
+///
+/// Check every source record before mapping, including hidden / unsupported
+/// records. Any mismatch rejects the entire batch, with no partial candidates.
+/// The comparison is exact; group IDs are never trimmed or otherwise normalized.
+/// Mapping then passes through the source-independent identity / duplicate
+/// validation boundary. HTTP and raw JSON parsing keep their existing roles.
+/// The returned batch is still not a source-presence snapshot.
+///
+/// ```
+/// use assignment_manager::webclass::{map_contents_for_group, parse_contents};
+///
+/// // After fetching raw JSON using this same requested group:
+/// let requested_group = "group-1";
+/// let raw = r#"[{"contents_id":"content-1","contents_kind":"Question",
+///     "contents_name":"Report","group_id":"group-1","hidden_content":false}]"#;
+/// let contents = parse_contents(raw)?;
+/// let batch = map_contents_for_group(&contents, requested_group)?;
+/// assert_eq!(batch.as_slice().len(), 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn map_contents_for_group(
+    contents: &[WebClassContent],
+    requested_group_id: &str,
+) -> Result<AssignmentCandidateBatch, WebClassMapError> {
+    if contents
+        .iter()
+        .any(|content| content.group_id != requested_group_id)
+    {
+        return Err(WebClassMapError::Validation(
+            ImportValidationError::WebClassGroupMismatch,
+        ));
+    }
+    AssignmentCandidateBatch::try_new(map_contents(contents)?).map_err(WebClassMapError::Validation)
 }
 
 #[cfg(test)]
@@ -315,5 +369,169 @@ mod tests {
             map_contents(&contents).unwrap()[0].deadline,
             Some(Deadline::DateTime(utc("2026-10-06T00:00:59Z")))
         );
+    }
+
+    #[test]
+    fn requested_group_matches_every_record_and_preserves_mapping() {
+        let contents = parse_contents(CONTENTS_BASIC).unwrap();
+        let batch = map_contents_for_group(&contents, "fixture-course-002").unwrap();
+        assert_eq!(batch.as_slice(), map_contents(&contents).unwrap());
+    }
+
+    #[test]
+    fn one_group_mismatch_rejects_the_whole_batch_without_partial_candidates() {
+        let mut contents = parse_contents(CONTENTS_BASIC).unwrap();
+        contents[2].group_id = "other-group".into();
+        for records in [
+            contents.clone(),
+            contents.into_iter().rev().collect::<Vec<_>>(),
+        ] {
+            // Valid records alone would produce candidates, but none escape on error.
+            assert!(!map_contents(&records[..2]).unwrap().is_empty());
+            assert_eq!(
+                map_contents_for_group(&records, "fixture-course-002"),
+                Err(WebClassMapError::Validation(
+                    ImportValidationError::WebClassGroupMismatch
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn group_validation_includes_records_that_mapping_would_filter_out() {
+        let original = parse_contents(CONTENTS_BASIC).unwrap();
+        for (kind, hidden) in [
+            ("Question", Some(true)),
+            ("Question", None),
+            ("Other", Some(false)),
+        ] {
+            let mut contents = original.clone();
+            contents[2].contents_kind = kind.into();
+            contents[2].hidden_content = hidden;
+            assert!(map_content(&contents[2]).unwrap().is_none());
+            contents[2].group_id = "other-group".into();
+            assert_eq!(
+                map_contents_for_group(&contents, "fixture-course-002"),
+                Err(WebClassMapError::Validation(
+                    ImportValidationError::WebClassGroupMismatch
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn requested_group_comparison_and_stored_identity_remain_opaque() {
+        let mut contents = parse_contents(CONTENTS_BASIC).unwrap();
+        for content in &mut contents {
+            content.group_id = " Group-001 ".into();
+        }
+        let batch = map_contents_for_group(&contents, " Group-001 ").unwrap();
+        assert_eq!(batch.as_slice()[0].external_key.scope, " Group-001 ");
+        for different in ["Group-001", " group-001 "] {
+            assert_eq!(
+                map_contents_for_group(&contents, different),
+                Err(WebClassMapError::Validation(
+                    ImportValidationError::WebClassGroupMismatch
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn group_import_rejects_duplicate_and_blank_candidate_identities() {
+        let original = parse_contents(CONTENTS_BASIC).unwrap();
+        let mut contents = original.clone();
+        contents[2].contents_id = contents[0].contents_id.clone();
+        assert_eq!(
+            map_contents_for_group(&contents, "fixture-course-002"),
+            Err(WebClassMapError::Validation(
+                ImportValidationError::DuplicateExternalIdentity
+            ))
+        );
+
+        contents = original.clone();
+        contents[2].contents_id = "\t".into();
+        assert_eq!(
+            map_contents_for_group(&contents, "fixture-course-002"),
+            Err(WebClassMapError::Validation(
+                ImportValidationError::EmptyExternalId
+            ))
+        );
+
+        contents = original;
+        for content in &mut contents {
+            content.group_id = " \n".into();
+        }
+        assert_eq!(
+            map_contents_for_group(&contents, " \n"),
+            Err(WebClassMapError::Validation(
+                ImportValidationError::EmptyExternalScope
+            ))
+        );
+    }
+
+    #[test]
+    fn group_validation_errors_do_not_retain_or_render_source_data() {
+        let mut contents = parse_contents(CONTENTS_BASIC).unwrap();
+        contents[2].group_id = "synthetic-private-group".into();
+        contents[2].contents_id = "synthetic-private-id".into();
+        contents[2].link_to = Some("https://example.invalid/?token=synthetic-private-token".into());
+        // Mismatch is checked before even an unrelated malformed date is mapped.
+        contents[2].end_date = Some("synthetic-private-response".into());
+        let error = map_contents_for_group(&contents, "synthetic-requested-group").unwrap_err();
+        assert_eq!(
+            error,
+            WebClassMapError::Validation(ImportValidationError::WebClassGroupMismatch)
+        );
+        assert_eq!(format!("{error:?}"), "Validation(WebClassGroupMismatch)");
+        assert_eq!(
+            error.to_string(),
+            "WebClass response group does not match requested group"
+        );
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn filtered_contents_remain_in_source_model_but_not_in_candidate_batch() {
+        let mut contents = parse_contents(CONTENTS_BASIC).unwrap();
+        let mut hidden = contents[0].clone();
+        hidden.contents_id = "hidden-content".into();
+        hidden.hidden_content = Some(true);
+        let mut unsupported = contents[0].clone();
+        unsupported.contents_id = "unsupported-content".into();
+        unsupported.contents_kind = "Other".into();
+        contents.extend([hidden, unsupported]);
+
+        let batch = map_contents_for_group(&contents, "fixture-course-002").unwrap();
+        assert_eq!(contents.len(), 5);
+        assert_eq!(batch.as_slice().len(), 3);
+        for observed in &contents[3..] {
+            assert!(
+                batch
+                    .as_slice()
+                    .iter()
+                    .all(|candidate| candidate.external_key.id != observed.contents_id)
+            );
+        }
+        // These identities are still observed in the source; absence cannot mean deletion.
+    }
+
+    #[test]
+    fn answered_and_scored_contents_do_not_complete_or_reopen_local_assignments() {
+        use crate::domain::{AssignmentId, CompletionState};
+
+        let contents = parse_contents(CONTENTS_STATES).unwrap();
+        let batch = map_contents_for_group(&contents, "fixture-course-002").unwrap();
+        for candidate in batch.as_slice() {
+            let mut assignment = candidate
+                .clone()
+                .into_assignment(AssignmentId::new("application-id"), None);
+            assert_eq!(assignment.completion, CompletionState::Incomplete);
+            candidate.apply_source_update(&mut assignment, None);
+            assert_eq!(assignment.completion, CompletionState::Incomplete);
+            assignment.completion = CompletionState::Completed;
+            candidate.apply_source_update(&mut assignment, None);
+            assert_eq!(assignment.completion, CompletionState::Completed);
+        }
     }
 }

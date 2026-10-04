@@ -310,6 +310,12 @@ pub fn map_event(event: &MoodleEvent, scope: &str) -> Option<AssignmentCandidate
     })
 }
 
+/// Map deadline-like events only; the result is not a source-presence snapshot.
+///
+/// Unmapped events still exist in `events`. Candidate absence must not trigger
+/// deletion. Wrap the returned candidates in
+/// [`crate::import::AssignmentCandidateBatch`] before persistence to validate
+/// identity and duplicates independently of the source parser.
 pub fn map_events(events: &[MoodleEvent], scope: &str) -> Vec<AssignmentCandidate> {
     events
         .iter()
@@ -395,6 +401,46 @@ mod tests {
         let events = parse_calendar(EMPTY).unwrap();
         assert!(events.is_empty());
         assert!(map_events(&events, SCOPE).is_empty());
+    }
+
+    #[test]
+    fn unmapped_event_is_still_observed_in_source_not_disappeared() {
+        let events = parse_calendar(MULTIPLE).unwrap();
+        let batch =
+            crate::import::AssignmentCandidateBatch::try_new(map_events(&events, SCOPE)).unwrap();
+        let observed = &events[0];
+        assert_eq!(classify_event(observed), MoodleEventKind::AvailabilityStart);
+        assert_eq!(events.len(), 3);
+        assert_eq!(batch.as_slice().len(), 2);
+        assert!(
+            batch
+                .as_slice()
+                .iter()
+                .all(|candidate| candidate.external_key.id != observed.uid)
+        );
+        // Presence tracking must use the source event UID even though it is not a candidate.
+    }
+
+    #[test]
+    fn mapped_events_pass_through_shared_identity_and_duplicate_validation() {
+        use crate::import::{AssignmentCandidateBatch, ImportValidationError};
+
+        let events = parse_calendar(BASIC).unwrap();
+        assert_eq!(
+            AssignmentCandidateBatch::try_new(map_events(&events, "\t")),
+            Err(ImportValidationError::EmptyExternalScope)
+        );
+        let mut blank_uid = events.clone();
+        blank_uid[0].uid = "\n".into();
+        assert_eq!(
+            AssignmentCandidateBatch::try_new(map_events(&blank_uid, SCOPE)),
+            Err(ImportValidationError::EmptyExternalId)
+        );
+        let duplicate = vec![events[0].clone(), events[0].clone()];
+        assert_eq!(
+            AssignmentCandidateBatch::try_new(map_events(&duplicate, SCOPE)),
+            Err(ImportValidationError::DuplicateExternalIdentity)
+        );
     }
 
     #[test]
