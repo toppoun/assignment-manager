@@ -1,7 +1,8 @@
-//! SQLite schema v1, domain readers and explicit entity creation/source binding.
+//! SQLite schema v1, entity creation/binding, validated import and local completion.
 //!
 //! Bindings accept non-secret logical identifiers only. Authentication values and
-//! feed URLs must never be passed as identities. Candidate import/merge is separate.
+//! feed URLs must never be passed as identities. Import batches are not source
+//! snapshots: absent candidates never trigger deletion or presence updates.
 
 use std::error::Error;
 use std::fmt;
@@ -15,7 +16,7 @@ use crate::domain::{
     Assignment, AssignmentId, ClassSlot, CompletionState, Course, CourseId, DayOfWeek, Deadline,
     ScheduleEntry, SubmissionTarget,
 };
-use crate::import::{ExternalRecordKey, OriginKind};
+use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
 
 const SCHEMA_VERSION: i64 = 1;
 const ID_INSERT_ATTEMPTS: usize = 4;
@@ -142,6 +143,14 @@ pub struct ManualAssignmentInput {
     pub submission_url: Option<String>,
 }
 
+/// Domain outcomes from a committed batch, without entity data or identities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssignmentImportSummary {
+    pub created: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
 /// Concrete synchronous SQLite store. The caller chooses the database path.
 pub struct SqliteStore {
     conn: Connection,
@@ -172,18 +181,7 @@ impl SqliteStore {
         &self,
         id: &AssignmentId,
     ) -> Result<Option<Assignment>, PersistenceError> {
-        let stored = self
-            .conn
-            .query_row(
-                "SELECT id, course_id, title, deadline_kind, deadline_value, submission,
-                        submission_url, completion, created_at, updated_at
-                 FROM assignments WHERE id = ?1",
-                [id.as_str()],
-                StoredAssignment::from_row,
-            )
-            .optional()
-            .map_err(database_error)?;
-        stored.map(StoredAssignment::decode).transpose()
+        get_assignment_tx(&self.conn, id)
     }
 
     /// Read a course and its ordered schedule from one consistent database snapshot.
@@ -232,16 +230,7 @@ impl SqliteStore {
             submission_url: input.submission_url,
             completion: CompletionState::Incomplete,
         };
-        insert_with_generated_id(
-            || generate_internal_id(&tx, "a_"),
-            |id| {
-                assignment.id = AssignmentId::new(id);
-                insert_assignment_row(&tx, &assignment, &timestamp)
-            },
-        )?;
-        if let Some(key) = source {
-            insert_assignment_binding(&tx, &assignment.id, key)?;
-        }
+        insert_new_assignment_tx(&tx, &mut assignment, source, &timestamp)?;
         tx.commit().map_err(database_error)?;
         Ok(assignment)
     }
@@ -322,19 +311,7 @@ impl SqliteStore {
         key: &ExternalRecordKey,
     ) -> Result<Option<Assignment>, PersistenceError> {
         validate_external_key(key)?;
-        let stored = self
-            .conn
-            .query_one(
-                "SELECT a.id, a.course_id, a.title, a.deadline_kind, a.deadline_value,
-                    a.submission, a.submission_url, a.completion, a.created_at, a.updated_at
-             FROM assignment_sources s JOIN assignments a ON a.id = s.assignment_id
-             WHERE s.origin = ?1 AND s.scope = ?2 AND s.external_id = ?3",
-                params![encode_origin(key.origin), key.scope, key.id],
-                StoredAssignment::from_row,
-            )
-            .optional()
-            .map_err(database_error)?;
-        stored.map(StoredAssignment::decode).transpose()
+        find_assignment_by_external_key_tx(&self.conn, key)
     }
 
     /// Bind an explicitly selected existing course to a non-secret logical ID.
@@ -359,17 +336,7 @@ impl SqliteStore {
     ) -> Result<Option<Course>, PersistenceError> {
         validate_external_identity(external_id)?;
         let tx = self.conn.unchecked_transaction().map_err(database_error)?;
-        let stored = tx
-            .query_one(
-                "SELECT c.id, c.name, c.created_at, c.updated_at
-             FROM course_sources s JOIN courses c ON c.id = s.course_id
-             WHERE s.origin = ?1 AND s.external_id = ?2",
-                params![encode_origin(origin), external_id],
-                StoredCourse::from_row,
-            )
-            .optional()
-            .map_err(database_error)?;
-        let course = stored.map(|row| row.decode(&tx)).transpose()?;
+        let course = find_course_by_source_tx(&tx, origin, external_id)?;
         tx.commit().map_err(database_error)?;
         Ok(course)
     }
@@ -383,6 +350,208 @@ impl SqliteStore {
             .find_course_by_source(OriginKind::WebClass, group_id)?
             .map(|course| course.id))
     }
+
+    /// Atomically persist a validated batch using its complete external keys.
+    /// WebClass scopes resolve through existing group/course bindings; Moodle feed
+    /// labels and manual scopes do not imply courses. Unresolved existing courses
+    /// are retained by the domain merge helper. Absent candidates are untouched.
+    /// The summary is returned only after the whole batch commits.
+    ///
+    /// Unchecked candidate vectors do not cross this boundary:
+    /// ```compile_fail
+    /// use assignment_manager::import::AssignmentCandidate;
+    /// use assignment_manager::persistence::SqliteStore;
+    /// let mut store = SqliteStore::open(":memory:").unwrap();
+    /// let unchecked = Vec::<AssignmentCandidate>::new();
+    /// store.import_assignment_batch(&unchecked);
+    /// ```
+    pub fn import_assignment_batch(
+        &mut self,
+        batch: &AssignmentCandidateBatch,
+    ) -> Result<AssignmentImportSummary, PersistenceError> {
+        if batch.as_slice().is_empty() {
+            return Ok(AssignmentImportSummary::default());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let timestamp = encode_timestamp(&Utc::now());
+        let mut summary = AssignmentImportSummary::default();
+        for candidate in batch.as_slice() {
+            let resolved_course_id = match candidate.external_key.origin {
+                OriginKind::WebClass => {
+                    find_webclass_course_id_tx(&tx, &candidate.external_key.scope)?
+                }
+                OriginKind::Moodle | OriginKind::Manual => None,
+            };
+            if let Some(mut assignment) =
+                find_assignment_by_external_key_tx(&tx, &candidate.external_key)?
+            {
+                let before = assignment.clone();
+                candidate.apply_source_update(&mut assignment, resolved_course_id);
+                if assignment == before {
+                    summary.unchanged += 1;
+                } else {
+                    update_assignment_source_fields_tx(&tx, &assignment, &timestamp)?;
+                    summary.updated += 1;
+                }
+            } else {
+                let mut assignment = candidate
+                    .clone()
+                    .into_assignment(AssignmentId::new(""), resolved_course_id);
+                insert_new_assignment_tx(
+                    &tx,
+                    &mut assignment,
+                    Some(&candidate.external_key),
+                    &timestamp,
+                )?;
+                summary.created += 1;
+            }
+        }
+        tx.commit().map_err(database_error)?;
+        Ok(summary)
+    }
+
+    /// Change local completion independently of source import. Identical state is
+    /// a no-op, including `updated_at`; a missing assignment returns `NotFound`.
+    pub fn set_completion(
+        &mut self,
+        id: &AssignmentId,
+        completion: CompletionState,
+    ) -> Result<(), PersistenceError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let assignment = get_assignment_tx(&tx, id)?.ok_or(PersistenceError::NotFound)?;
+        if assignment.completion != completion {
+            let timestamp = encode_timestamp(&Utc::now());
+            let changed = tx
+                .execute(
+                    "UPDATE assignments SET completion = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![encode_completion(completion), timestamp, id.as_str()],
+                )
+                .map_err(database_error)?;
+            if changed != 1 {
+                return Err(PersistenceError::InvalidStoredData);
+            }
+        }
+        tx.commit().map_err(database_error)
+    }
+}
+
+// These helpers reuse the caller's connection/transaction without starting one.
+fn get_assignment_tx(
+    conn: &Connection,
+    id: &AssignmentId,
+) -> Result<Option<Assignment>, PersistenceError> {
+    let stored = conn
+        .query_row(
+            "SELECT id, course_id, title, deadline_kind, deadline_value, submission,
+                submission_url, completion, created_at, updated_at
+         FROM assignments WHERE id = ?1",
+            [id.as_str()],
+            StoredAssignment::from_row,
+        )
+        .optional()
+        .map_err(database_error)?;
+    stored.map(StoredAssignment::decode).transpose()
+}
+
+fn find_assignment_by_external_key_tx(
+    conn: &Connection,
+    key: &ExternalRecordKey,
+) -> Result<Option<Assignment>, PersistenceError> {
+    // LEFT JOIN exposes orphan bindings as invalid NULL domain columns rather
+    // than treating the occupied key as a new assignment. query_one rejects duplicates.
+    let stored = conn
+        .query_one(
+            "SELECT a.id, a.course_id, a.title, a.deadline_kind, a.deadline_value,
+                a.submission, a.submission_url, a.completion, a.created_at, a.updated_at
+         FROM assignment_sources s LEFT JOIN assignments a ON a.id = s.assignment_id
+         WHERE s.origin = ?1 AND s.scope = ?2 AND s.external_id = ?3",
+            params![encode_origin(key.origin), key.scope, key.id],
+            StoredAssignment::from_row,
+        )
+        .optional()
+        .map_err(database_error)?;
+    stored.map(StoredAssignment::decode).transpose()
+}
+
+fn find_course_by_source_tx(
+    conn: &Connection,
+    origin: OriginKind,
+    external_id: &str,
+) -> Result<Option<Course>, PersistenceError> {
+    let stored = conn
+        .query_one(
+            "SELECT c.id, c.name, c.created_at, c.updated_at
+         FROM course_sources s LEFT JOIN courses c ON c.id = s.course_id
+         WHERE s.origin = ?1 AND s.external_id = ?2",
+            params![encode_origin(origin), external_id],
+            StoredCourse::from_row,
+        )
+        .optional()
+        .map_err(database_error)?;
+    stored.map(|row| row.decode(conn)).transpose()
+}
+
+fn find_webclass_course_id_tx(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<Option<CourseId>, PersistenceError> {
+    Ok(find_course_by_source_tx(conn, OriginKind::WebClass, group_id)?.map(|course| course.id))
+}
+
+fn insert_new_assignment_tx(
+    conn: &Connection,
+    assignment: &mut Assignment,
+    source: Option<&ExternalRecordKey>,
+    timestamp: &str,
+) -> Result<(), PersistenceError> {
+    insert_with_generated_id(
+        || generate_internal_id(conn, "a_"),
+        |id| {
+            assignment.id = AssignmentId::new(id);
+            insert_assignment_row(conn, assignment, timestamp)
+        },
+    )?;
+    if let Some(key) = source {
+        insert_assignment_binding(conn, &assignment.id, key)?;
+    }
+    Ok(())
+}
+
+fn update_assignment_source_fields_tx(
+    conn: &Connection,
+    assignment: &Assignment,
+    timestamp: &str,
+) -> Result<(), PersistenceError> {
+    let (kind, value) = encode_deadline(assignment.deadline.as_ref());
+    // Values are already merged by AssignmentCandidate::apply_source_update.
+    // Local completion, created_at and the internal ID are never assigned here.
+    let changed = conn
+        .execute(
+            "UPDATE assignments SET course_id = ?1, title = ?2, deadline_kind = ?3,
+                deadline_value = ?4, submission = ?5, submission_url = ?6, updated_at = ?7
+         WHERE id = ?8",
+            params![
+                assignment.course_id.as_ref().map(CourseId::as_str),
+                assignment.title,
+                kind,
+                value,
+                encode_submission(assignment.submission),
+                assignment.submission_url,
+                timestamp,
+                assignment.id.as_str()
+            ],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(PersistenceError::InvalidStoredData);
+    }
+    Ok(())
 }
 
 fn generate_internal_id(conn: &Connection, prefix: &str) -> rusqlite::Result<String> {
@@ -840,6 +1009,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::import::AssignmentCandidate;
 
     const STAMP: &str = "2026-10-04T14:59:00.123456789Z";
     const PRIVATE: &str = "SYNTHETIC_PRIVATE_VALUE_6B1";
@@ -2716,5 +2886,829 @@ mod tests {
             ffi::Error::new(ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
             Some(PRIVATE.into()),
         )));
+    }
+
+    fn import_candidate(origin: OriginKind, scope: &str, id: &str) -> AssignmentCandidate {
+        AssignmentCandidate {
+            external_key: external_key(origin, scope, id),
+            title: "Source report 日本語 ' ?1".into(),
+            deadline: Some(Deadline::DateTime(decode_timestamp(STAMP).unwrap())),
+            submission: SubmissionTarget::WebClass,
+            submission_url: Some("https://submit.example.invalid/source".into()),
+        }
+    }
+
+    fn batch(candidates: Vec<AssignmentCandidate>) -> AssignmentCandidateBatch {
+        AssignmentCandidateBatch::try_new(candidates).unwrap()
+    }
+
+    fn assignment_metadata(store: &SqliteStore, id: &AssignmentId) -> (String, String) {
+        store
+            .conn
+            .query_row(
+                "SELECT created_at, updated_at FROM assignments WHERE id = ?1",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn age_updated_at(store: &SqliteStore, id: &AssignmentId) {
+        // A deterministic old timestamp avoids sleeps/clock-resolution assumptions.
+        store
+            .conn
+            .execute(
+                "UPDATE assignments SET updated_at = ?1 WHERE id = ?2",
+                params!["2000-01-01T00:00:00.000000001Z", id.as_str()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn validated_import_creates_bound_assignments_with_generated_ids_and_exact_fields() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let candidates = batch(vec![
+            import_candidate(OriginKind::Moodle, "cis-feed", "0001@calendar"),
+            import_candidate(OriginKind::WebClass, "group", "0001"),
+            import_candidate(OriginKind::Manual, "manual-logical-source", "0001"),
+        ]);
+        let before = Utc::now();
+        assert_eq!(
+            store.import_assignment_batch(&candidates).unwrap(),
+            AssignmentImportSummary {
+                created: 3,
+                ..Default::default()
+            }
+        );
+        let after = Utc::now();
+        for candidate in candidates.as_slice() {
+            let stored = store
+                .find_assignment_by_external_key(&candidate.external_key)
+                .unwrap()
+                .unwrap();
+            assert_generated_id(stored.id.as_str(), "a_");
+            assert_eq!(stored.title, candidate.title);
+            assert_eq!(stored.deadline, candidate.deadline);
+            assert_eq!(stored.submission, candidate.submission);
+            assert_eq!(stored.submission_url, candidate.submission_url);
+            assert_eq!(stored.completion, CompletionState::Incomplete);
+            assert_eq!(stored.course_id, None);
+            assert_eq!(
+                store.get_assignment(&stored.id).unwrap(),
+                Some(stored.clone())
+            );
+            let (created, updated) = assignment_metadata(&store, &stored.id);
+            assert_eq!(created, updated);
+            let instant = decode_timestamp(&created).unwrap();
+            assert!(before <= instant && instant <= after);
+        }
+        assert_eq!(count(&store.conn, "assignments"), 3);
+        assert_eq!(count(&store.conn, "assignment_sources"), 3);
+        assert_eq!(count(&store.conn, "courses"), 0);
+    }
+
+    #[test]
+    fn reimport_updates_source_fields_and_preserves_identity_created_at_and_completion() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut candidate = import_candidate(OriginKind::WebClass, "group", "id");
+        store
+            .import_assignment_batch(&batch(vec![candidate.clone()]))
+            .unwrap();
+        let original = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        store
+            .set_completion(&original.id, CompletionState::Completed)
+            .unwrap();
+        age_updated_at(&store, &original.id);
+        let metadata = assignment_metadata(&store, &original.id);
+        candidate.title = "Changed source title".into();
+        candidate.deadline = Some(Deadline::DateOnly(
+            NaiveDate::from_ymd_opt(2028, 2, 29).unwrap(),
+        ));
+        let before = Utc::now();
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![candidate.clone()]))
+                .unwrap(),
+            AssignmentImportSummary {
+                updated: 1,
+                ..Default::default()
+            }
+        );
+        let after = Utc::now();
+        let updated = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.id, original.id);
+        assert_eq!(updated.title, candidate.title);
+        assert_eq!(updated.deadline, candidate.deadline);
+        assert_eq!(updated.completion, CompletionState::Completed);
+        let current = assignment_metadata(&store, &updated.id);
+        assert_eq!(current.0, metadata.0);
+        assert_ne!(current.1, metadata.1);
+        let instant = decode_timestamp(&current.1).unwrap();
+        assert!(before <= instant && instant <= after);
+        assert_eq!(count(&store.conn, "assignments"), 1);
+        assert_eq!(count(&store.conn, "assignment_sources"), 1);
+    }
+
+    #[test]
+    fn unchanged_and_semantically_unchanged_imports_do_not_execute_update() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let candidate = import_candidate(OriginKind::WebClass, "group", "id");
+        store
+            .import_assignment_batch(&batch(vec![candidate.clone()]))
+            .unwrap();
+        let original = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        store
+            .set_completion(&original.id, CompletionState::Completed)
+            .unwrap();
+        age_updated_at(&store, &original.id);
+        let original = store.get_assignment(&original.id).unwrap().unwrap();
+        let metadata = assignment_metadata(&store, &original.id);
+        store.conn.execute_batch("CREATE TRIGGER reject_noop_updates BEFORE UPDATE ON assignments BEGIN SELECT RAISE(ABORT, 'an UPDATE should not execute'); END;").unwrap();
+        let changes = store.conn.total_changes();
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![candidate.clone()]))
+                .unwrap(),
+            AssignmentImportSummary {
+                unchanged: 1,
+                ..Default::default()
+            }
+        );
+        let mut unknown = candidate;
+        unknown.submission = SubmissionTarget::Unknown;
+        unknown.submission_url = None;
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![unknown]))
+                .unwrap(),
+            AssignmentImportSummary {
+                unchanged: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(store.conn.total_changes(), changes);
+        assert_eq!(
+            store.get_assignment(&original.id).unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(assignment_metadata(&store, &original.id), metadata);
+    }
+
+    #[test]
+    fn completion_local_update_changes_only_completion_and_timestamp_and_survives_import() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let candidate = import_candidate(OriginKind::WebClass, "group", "id");
+        let candidates = batch(vec![candidate.clone()]);
+        store.import_assignment_batch(&candidates).unwrap();
+        let mut expected = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected.completion, CompletionState::Incomplete);
+        age_updated_at(&store, &expected.id);
+        let metadata = assignment_metadata(&store, &expected.id);
+        let changes = store.conn.total_changes();
+        store
+            .set_completion(&expected.id, CompletionState::Incomplete)
+            .unwrap();
+        assert_eq!(store.conn.total_changes(), changes);
+        assert_eq!(assignment_metadata(&store, &expected.id), metadata);
+        let before = Utc::now();
+        store
+            .set_completion(&expected.id, CompletionState::Completed)
+            .unwrap();
+        let after = Utc::now();
+        expected.completion = CompletionState::Completed;
+        assert_eq!(
+            store.get_assignment(&expected.id).unwrap(),
+            Some(expected.clone())
+        );
+        let completed_metadata = assignment_metadata(&store, &expected.id);
+        assert_eq!(completed_metadata.0, metadata.0);
+        assert_ne!(completed_metadata.1, metadata.1);
+        let instant = decode_timestamp(&completed_metadata.1).unwrap();
+        assert!(before <= instant && instant <= after);
+        store.conn.execute_batch("CREATE TRIGGER reject_noop_completion BEFORE UPDATE ON assignments BEGIN SELECT RAISE(ABORT, 'an UPDATE should not execute'); END;").unwrap();
+        let changes = store.conn.total_changes();
+        store
+            .set_completion(&expected.id, CompletionState::Completed)
+            .unwrap();
+        assert_eq!(
+            store
+                .import_assignment_batch(&candidates)
+                .unwrap()
+                .unchanged,
+            1
+        );
+        assert_eq!(store.conn.total_changes(), changes);
+        assert_eq!(
+            assignment_metadata(&store, &expected.id),
+            completed_metadata
+        );
+        assert_eq!(
+            store.get_assignment(&expected.id).unwrap(),
+            Some(expected.clone())
+        );
+        let error = store
+            .set_completion(&AssignmentId::new(PRIVATE), CompletionState::Completed)
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::NotFound);
+        assert_safe(error);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_noop_completion")
+            .unwrap();
+        store
+            .set_completion(&expected.id, CompletionState::Incomplete)
+            .unwrap();
+        expected.completion = CompletionState::Incomplete;
+        assert_eq!(store.get_assignment(&expected.id).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn import_clears_deadline_but_preserves_unknown_submission_and_missing_url() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut candidate = import_candidate(OriginKind::WebClass, "group", "id");
+        store
+            .import_assignment_batch(&batch(vec![candidate.clone()]))
+            .unwrap();
+        let original = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        candidate.deadline = None;
+        candidate.submission = SubmissionTarget::Unknown;
+        candidate.submission_url = None;
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![candidate.clone()]))
+                .unwrap()
+                .updated,
+            1
+        );
+        let stored = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.deadline, None);
+        assert_eq!(stored.submission, SubmissionTarget::WebClass);
+        assert_eq!(stored.submission_url, original.submission_url);
+        candidate.submission = SubmissionTarget::None;
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![candidate.clone()]))
+                .unwrap()
+                .updated,
+            1
+        );
+        let stored = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.submission, SubmissionTarget::None);
+        assert_eq!(stored.submission_url, original.submission_url);
+        candidate.submission = SubmissionTarget::Unknown;
+        candidate.submission_url = Some("https://submit.example.invalid/new-answer".into());
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![candidate.clone()]))
+                .unwrap()
+                .updated,
+            1
+        );
+        let stored = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.submission, SubmissionTarget::None);
+        assert_eq!(stored.submission_url, candidate.submission_url);
+        assert_eq!(stored.id, original.id);
+    }
+
+    #[test]
+    fn webclass_course_resolution_is_per_exact_scope_and_preserves_unresolved_relations() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .create_course_with_source("Same name", vec![], OriginKind::WebClass, " Group-01 ")
+            .unwrap();
+        let second = store
+            .create_course_with_source("Same name", vec![], OriginKind::WebClass, "other-group")
+            .unwrap();
+        let candidate = import_candidate(OriginKind::WebClass, " Group-01 ", "id");
+        let other = import_candidate(OriginKind::WebClass, "other-group", "id");
+        let unresolved = import_candidate(OriginKind::WebClass, "Group-01", "id");
+        store
+            .import_assignment_batch(&batch(vec![
+                candidate.clone(),
+                other.clone(),
+                unresolved.clone(),
+            ]))
+            .unwrap();
+        let bound = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.course_id, Some(first.id.clone()));
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&other.external_key)
+                .unwrap()
+                .unwrap()
+                .course_id,
+            Some(second.id)
+        );
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&unresolved.external_key)
+                .unwrap()
+                .unwrap()
+                .course_id,
+            None
+        );
+        age_updated_at(&store, &bound.id);
+        let metadata = assignment_metadata(&store, &bound.id);
+        // Simulate an explicitly absent binding, not source-disappearance deletion.
+        store
+            .conn
+            .execute(
+                "DELETE FROM course_sources WHERE course_id = ?1",
+                [first.id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(store.find_webclass_course_id(" Group-01 ").unwrap(), None);
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![candidate.clone()]))
+                .unwrap()
+                .unchanged,
+            1
+        );
+        assert_eq!(
+            store.get_assignment(&bound.id).unwrap().unwrap().course_id,
+            Some(first.id)
+        );
+        assert_eq!(assignment_metadata(&store, &bound.id), metadata);
+        let new_unresolved = import_candidate(OriginKind::WebClass, " Group-01 ", "new-id");
+        store
+            .import_assignment_batch(&batch(vec![new_unresolved.clone()]))
+            .unwrap();
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&new_unresolved.external_key)
+                .unwrap()
+                .unwrap()
+                .course_id,
+            None
+        );
+        let replacement = store
+            .create_course_with_source("Same name", vec![], OriginKind::WebClass, " Group-01 ")
+            .unwrap();
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![candidate.clone()]))
+                .unwrap()
+                .updated,
+            1
+        );
+        assert_eq!(
+            store.get_assignment(&bound.id).unwrap().unwrap().course_id,
+            Some(replacement.id)
+        );
+    }
+
+    #[test]
+    fn moodle_feed_scopes_never_imply_courses_and_unresolved_import_preserves_an_existing_course() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let course = store.create_course("Course", vec![]).unwrap();
+        let existing = import_candidate(OriginKind::Moodle, course.id.as_str(), "existing");
+        let mut input = manual_input();
+        input.course_id = Some(course.id.clone());
+        let stored = store.create_manual_assignment(input).unwrap();
+        store
+            .bind_assignment_source(&stored.id, &existing.external_key)
+            .unwrap();
+        let new = import_candidate(OriginKind::Moodle, course.id.as_str(), "new");
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![existing.clone(), new.clone()]))
+                .unwrap(),
+            AssignmentImportSummary {
+                created: 1,
+                updated: 1,
+                unchanged: 0
+            }
+        );
+        assert_eq!(
+            store.get_assignment(&stored.id).unwrap().unwrap().course_id,
+            Some(course.id)
+        );
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&new.external_key)
+                .unwrap()
+                .unwrap()
+                .course_id,
+            None
+        );
+        assert_eq!(count(&store.conn, "courses"), 1);
+    }
+
+    #[test]
+    fn batch_binding_failure_rolls_back_prior_inserts_updates_and_all_bindings() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut existing = import_candidate(OriginKind::Manual, "scope", "existing");
+        store
+            .import_assignment_batch(&batch(vec![existing.clone()]))
+            .unwrap();
+        let before = store
+            .find_assignment_by_external_key(&existing.external_key)
+            .unwrap()
+            .unwrap();
+        store
+            .set_completion(&before.id, CompletionState::Completed)
+            .unwrap();
+        age_updated_at(&store, &before.id);
+        let before = store.get_assignment(&before.id).unwrap().unwrap();
+        let metadata = assignment_metadata(&store, &before.id);
+        store.conn.execute_batch("CREATE TRIGGER fail_batch_binding BEFORE INSERT ON assignment_sources WHEN NEW.external_id = 'fail' BEGIN SELECT RAISE(ABORT, NEW.scope || NEW.external_id); END;").unwrap();
+        let created = import_candidate(OriginKind::Manual, "scope", "created-first");
+        existing.title = "Updated then rolled back".into();
+        let fail = import_candidate(OriginKind::Manual, PRIVATE, "fail");
+        let error = store
+            .import_assignment_batch(&batch(vec![
+                created.clone(),
+                existing.clone(),
+                fail.clone(),
+            ]))
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::Constraint);
+        assert_safe(error);
+        assert!(store.conn.is_autocommit());
+        assert_eq!(count(&store.conn, "assignments"), 1);
+        assert_eq!(count(&store.conn, "assignment_sources"), 1);
+        assert_eq!(
+            store.get_assignment(&before.id).unwrap(),
+            Some(before.clone())
+        );
+        assert_eq!(assignment_metadata(&store, &before.id), metadata);
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&created.external_key)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&fail.external_key)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_external_binding_is_rejected_and_rolls_back_the_batch() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO assignment_sources VALUES ('absent', 'manual', ?1, 'orphan')",
+                [PRIVATE],
+            )
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        let created = import_candidate(OriginKind::Manual, "scope", "created");
+        let orphan = import_candidate(OriginKind::Manual, PRIVATE, "orphan");
+        let error = store
+            .import_assignment_batch(&batch(vec![created.clone(), orphan]))
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::InvalidStoredData);
+        assert_safe(error);
+        assert_eq!(count(&store.conn, "assignments"), 0);
+        assert_eq!(count(&store.conn, "assignment_sources"), 1);
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&created.external_key)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_and_partial_batches_never_delete_or_change_absent_candidates() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = import_candidate(OriginKind::Manual, "scope", "first");
+        let absent = import_candidate(OriginKind::Manual, "scope", "absent");
+        store
+            .import_assignment_batch(&batch(vec![first.clone(), absent.clone()]))
+            .unwrap();
+        let stored_first = store
+            .find_assignment_by_external_key(&first.external_key)
+            .unwrap()
+            .unwrap();
+        let stored_absent = store
+            .find_assignment_by_external_key(&absent.external_key)
+            .unwrap()
+            .unwrap();
+        store
+            .set_completion(&stored_absent.id, CompletionState::Completed)
+            .unwrap();
+        let stored_absent = store.get_assignment(&stored_absent.id).unwrap().unwrap();
+        let first_metadata = assignment_metadata(&store, &stored_first.id);
+        let absent_metadata = assignment_metadata(&store, &stored_absent.id);
+        let changes = store.conn.total_changes();
+        assert_eq!(
+            store.import_assignment_batch(&batch(vec![])).unwrap(),
+            AssignmentImportSummary::default()
+        );
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![first.clone()]))
+                .unwrap()
+                .unchanged,
+            1
+        );
+        assert_eq!(store.conn.total_changes(), changes);
+        assert_eq!(
+            assignment_metadata(&store, &stored_first.id),
+            first_metadata
+        );
+        let mut changed = first;
+        changed.title = "Changed present candidate".into();
+        assert_eq!(
+            store
+                .import_assignment_batch(&batch(vec![changed]))
+                .unwrap()
+                .updated,
+            1
+        );
+        assert_eq!(
+            store.get_assignment(&stored_absent.id).unwrap(),
+            Some(stored_absent.clone())
+        );
+        assert_eq!(
+            assignment_metadata(&store, &stored_absent.id),
+            absent_metadata
+        );
+        assert_eq!(count(&store.conn, "assignments"), 2);
+        assert_eq!(count(&store.conn, "assignment_sources"), 2);
+    }
+
+    #[test]
+    fn moodle_fixture_parse_map_and_persist_requires_no_http_client() {
+        let events =
+            crate::moodle::parse_calendar(include_str!("../fixtures/moodle/calendar_multiple.ics"))
+                .unwrap();
+        assert_eq!(events.len(), 3);
+        let candidates =
+            AssignmentCandidateBatch::try_new(crate::moodle::map_events(&events, "cis-feed"))
+                .unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(
+            store.import_assignment_batch(&candidates).unwrap().created,
+            2
+        );
+        let end = store
+            .find_assignment_by_external_key(&external_key(
+                OriginKind::Moodle,
+                "cis-feed",
+                "2002@cms.example.edu",
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(end.title, "課題（DFS/BFS）");
+        assert_eq!(
+            end.deadline,
+            Some(Deadline::DateTime(
+                decode_timestamp("2026-10-08T01:50:00.000000000Z").unwrap()
+            ))
+        );
+        let deadline = store
+            .find_assignment_by_external_key(&external_key(
+                OriginKind::Moodle,
+                "cis-feed",
+                "2003@cms.example.edu",
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(deadline.title, "CF-L01課題");
+        assert_eq!(
+            deadline.deadline,
+            Some(Deadline::DateTime(
+                decode_timestamp("2026-10-04T14:59:00.000000000Z").unwrap()
+            ))
+        );
+        for assignment in [end, deadline] {
+            assert_eq!(assignment.submission, SubmissionTarget::Unknown);
+            assert_eq!(assignment.submission_url, None);
+            assert_eq!(assignment.completion, CompletionState::Incomplete);
+            assert_eq!(assignment.course_id, None);
+            assert_eq!(
+                store.get_assignment(&assignment.id).unwrap(),
+                Some(assignment)
+            );
+        }
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&external_key(
+                    OriginKind::Moodle,
+                    "cis-feed",
+                    "2001@cms.example.edu"
+                ))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .import_assignment_batch(&candidates)
+                .unwrap()
+                .unchanged,
+            2
+        );
+        assert_eq!(count(&store.conn, "assignments"), 2);
+    }
+
+    #[test]
+    fn webclass_fixture_parse_map_and_persist_keeps_completion_local_and_filtered_records() {
+        let raw = include_str!("../fixtures/webclass/contents_states.json");
+        let group = "fixture-course-002";
+        let contents = crate::webclass::parse_contents(raw).unwrap();
+        let candidates = crate::webclass::map_contents_for_group(&contents, group).unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let course = store
+            .create_course_with_source("Synthetic course", vec![], OriginKind::WebClass, group)
+            .unwrap();
+        assert_eq!(
+            store.import_assignment_batch(&candidates).unwrap().created,
+            3
+        );
+        let mut stored = Vec::new();
+        for candidate in candidates.as_slice() {
+            let assignment = store
+                .find_assignment_by_external_key(&candidate.external_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(assignment.title, candidate.title);
+            assert_eq!(
+                assignment.deadline,
+                Some(Deadline::DateTime(
+                    decode_timestamp("2026-10-31T14:59:59.000000000Z").unwrap()
+                ))
+            );
+            assert_eq!(assignment.course_id, Some(course.id.clone()));
+            assert_eq!(assignment.submission, SubmissionTarget::WebClass);
+            assert_eq!(assignment.submission_url, None);
+            assert_eq!(assignment.completion, CompletionState::Incomplete);
+            assert_eq!(
+                store.get_assignment(&assignment.id).unwrap(),
+                Some(assignment.clone())
+            );
+            stored.push(assignment);
+        }
+        // Score/answer data in the fixture never sets local completion.
+        assert!(contents[1].scores[0].answer_datetime.is_some());
+        assert_eq!(contents[2].scores[0].max_score, Some(0));
+        store
+            .set_completion(&stored[1].id, CompletionState::Completed)
+            .unwrap();
+        let completed_metadata = assignment_metadata(&store, &stored[1].id);
+        let contents_again = crate::webclass::parse_contents(raw).unwrap();
+        let again = crate::webclass::map_contents_for_group(&contents_again, group).unwrap();
+        assert_eq!(store.import_assignment_batch(&again).unwrap().unchanged, 3);
+        assert_eq!(
+            store
+                .get_assignment(&stored[1].id)
+                .unwrap()
+                .unwrap()
+                .completion,
+            CompletionState::Completed
+        );
+        assert_eq!(
+            assignment_metadata(&store, &stored[1].id),
+            completed_metadata
+        );
+        let mut filtered = contents_again;
+        filtered[1].hidden_content = Some(true);
+        let filtered_batch = crate::webclass::map_contents_for_group(&filtered, group).unwrap();
+        assert_eq!(filtered_batch.as_slice().len(), 2);
+        assert_eq!(
+            store
+                .import_assignment_batch(&filtered_batch)
+                .unwrap()
+                .unchanged,
+            2
+        );
+        assert_eq!(
+            store
+                .get_assignment(&stored[1].id)
+                .unwrap()
+                .unwrap()
+                .completion,
+            CompletionState::Completed
+        );
+        assert_eq!(count(&store.conn, "assignments"), 3);
+        assert_eq!(count(&store.conn, "assignment_sources"), 3);
+    }
+
+    #[test]
+    fn imported_assignments_and_local_completion_survive_file_reopen() {
+        let temp = TempDb::new();
+        let candidate = import_candidate(OriginKind::Manual, "scope", "id");
+        let candidates = batch(vec![candidate.clone()]);
+        let expected;
+        let metadata;
+        {
+            let mut store = SqliteStore::open(&temp.path).unwrap();
+            store.import_assignment_batch(&candidates).unwrap();
+            let id = store
+                .find_assignment_by_external_key(&candidate.external_key)
+                .unwrap()
+                .unwrap()
+                .id;
+            store
+                .set_completion(&id, CompletionState::Completed)
+                .unwrap();
+            expected = store.get_assignment(&id).unwrap().unwrap();
+            metadata = assignment_metadata(&store, &id);
+        }
+        let mut store = SqliteStore::open(&temp.path).unwrap();
+        assert_eq!(
+            store
+                .find_assignment_by_external_key(&candidate.external_key)
+                .unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            store
+                .import_assignment_batch(&candidates)
+                .unwrap()
+                .unchanged,
+            1
+        );
+        assert_eq!(
+            store.get_assignment(&expected.id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(assignment_metadata(&store, &expected.id), metadata);
+        assert_eq!(pragma_number(&store.conn, "user_version"), 1);
+    }
+
+    #[test]
+    fn import_and_completion_failures_discard_candidate_values_and_driver_messages() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut candidate = import_candidate(OriginKind::Manual, PRIVATE, PRIVATE);
+        candidate.title = PRIVATE.into();
+        candidate.submission_url = Some(format!("https://submit.example.invalid/{PRIVATE}"));
+        store.conn.execute_batch("CREATE TRIGGER reject_import_insert BEFORE INSERT ON assignments BEGIN SELECT RAISE(ABORT, NEW.title || NEW.submission_url); END;").unwrap();
+        let error = store
+            .import_assignment_batch(&batch(vec![candidate.clone()]))
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::Constraint);
+        assert_safe(error);
+        assert_eq!(count(&store.conn, "assignments"), 0);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_import_insert")
+            .unwrap();
+        store
+            .import_assignment_batch(&batch(vec![candidate.clone()]))
+            .unwrap();
+        let stored = store
+            .find_assignment_by_external_key(&candidate.external_key)
+            .unwrap()
+            .unwrap();
+        let metadata = assignment_metadata(&store, &stored.id);
+        store.conn.execute_batch("CREATE TRIGGER reject_import_update BEFORE UPDATE ON assignments BEGIN SELECT RAISE(ABORT, NEW.title || NEW.submission_url); END;").unwrap();
+        candidate.title.push_str(" changed");
+        let error = store
+            .import_assignment_batch(&batch(vec![candidate]))
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::Constraint);
+        assert_safe(error);
+        let error = store
+            .set_completion(&stored.id, CompletionState::Completed)
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::Constraint);
+        assert_safe(error);
+        assert_eq!(
+            store.get_assignment(&stored.id).unwrap(),
+            Some(stored.clone())
+        );
+        assert_eq!(assignment_metadata(&store, &stored.id), metadata);
     }
 }
