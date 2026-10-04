@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local assignment list and completion actions in the main window.",
+  "windows": ["main"],
+  "permissions": ["allow-list-assignments", "allow-toggle-assignment-completion"]
+}

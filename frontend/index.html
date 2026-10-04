@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Assignment Manager</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <main>
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">Assignment Manager</p>
+          <h1>課題一覧</h1>
+          <p class="description">締切の早い順 · 完了した課題も表示</p>
+        </div>
+        <button id="reload" type="button">再読み込み</button>
+      </header>
+      <p id="error" class="error" role="alert" hidden></p>
+      <p id="status" class="status" role="status" aria-live="polite">課題を読み込んでいます…</p>
+      <section id="empty" class="empty" hidden>
+        <h2>課題はまだありません</h2>
+        <p>保存されている課題は0件です。</p>
+      </section>
+      <ul id="assignments" class="assignment-list" aria-label="課題一覧" aria-busy="true"></ul>
+    </main>
+  </body>
+</html>

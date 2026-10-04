@@ -1,6 +1,8 @@
 /target
+/src-tauri/target/
+/src-tauri/gen/
 
-# Runtime SQLite databases and sidecars (storage location is not decided yet).
+# Runtime SQLite databases and sidecars.
 *.db
 *.db-wal
 *.db-shm

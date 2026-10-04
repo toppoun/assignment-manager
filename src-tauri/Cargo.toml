@@ -1,0 +1,23 @@
+[package]
+name = "assignment-manager-desktop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+assignment-manager = { path = ".." }
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+
+[features]
+# Also permits `cargo run --features custom-protocol` without a frontend server.
+custom-protocol = ["tauri/custom-protocol"]

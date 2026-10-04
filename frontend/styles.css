@@ -1,0 +1,52 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Yu Gothic UI", sans-serif;
+  color: #263341;
+  background: #f3f5f7;
+  font-synthesis: none;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 960px; margin: 0 auto; padding: 36px 28px 48px; }
+.page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.eyebrow { margin: 0 0 6px; font-size: 13px; letter-spacing: .05em; color: #596878; }
+h1 { margin: 0; font-size: 28px; }
+.description, .status { color: #596878; font-size: 14px; }
+.description { margin: 10px 0; }
+.status { min-height: 22px; margin: 18px 0 12px; }
+button { border: 1px solid #bec9d3; border-radius: 8px; padding: 10px 14px; color: inherit; background: #fff; font: inherit; white-space: nowrap; cursor: pointer; }
+button:disabled, input:disabled { cursor: wait; opacity: .6; }
+button:hover:enabled { background: #e8eef3; }
+button:focus-visible, input:focus-visible { outline: 3px solid #2578ba; outline-offset: 3px; }
+.assignment-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.assignment { display: flex; align-items: flex-start; gap: 20px; padding: 22px; background: #fff; border: 1px solid #d9e0e6; border-radius: 12px; }
+.completion-control { display: grid; justify-items: center; gap: 8px; min-width: 44px; padding-top: 3px; cursor: pointer; }
+input[type="checkbox"] { width: 22px; height: 22px; margin: 0; accent-color: #286ba1; cursor: pointer; }
+.completion-text { font-size: 12px; color: #596878; }
+.assignment-content { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.assignment-title { margin: 0 0 10px; font-size: 18px; font-weight: 600; }
+.deadline { margin: 0 0 12px; font-size: 14px; }
+.course-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; color: #596878; }
+.origin { border: 1px solid #c6d5e1; border-radius: 5px; padding: 2px 7px; color: #355978; background: #edf4f9; white-space: nowrap; }
+.submission { margin: 10px 0 0; font-size: 12px; color: #596878; }
+.completed .assignment-title { color: #637181; text-decoration: line-through; }
+.error { background: #fff1ef; color: #9c342b; border: 1px solid #e8b6b0; padding: 14px 16px; border-radius: 8px; overflow-wrap: anywhere; }
+.empty { text-align: center; padding: 64px 20px; border: 1px dashed #c4cfd8; border-radius: 12px; background: #fff; }
+.empty h2 { font-size: 20px; margin: 0 0 12px; }
+.empty p { color: #596878; font-size: 14px; }
+[hidden] { display: none !important; }
+@media (max-width: 540px) {
+  main { padding: 24px 16px; }
+  h1 { font-size: 24px; }
+  .assignment { padding: 18px 14px; gap: 12px; }
+  button { padding: 9px 10px; font-size: 13px; }
+}
+@media (prefers-color-scheme: dark) {
+  :root { color: #e2e8ef; background: #171d24; }
+  .assignment, .empty, button { background: #232c35; border-color: #43515e; }
+  .description, .status, .eyebrow, .course-line, .submission, .completion-text, .empty p { color: #b2bfcd; }
+  .completed .assignment-title { color: #a0afbf; }
+  .origin { color: #bedaf0; background: #283f50; border-color: #4f718a; }
+  .error { background: #442923; color: #ffd1c8; border-color: #8d5144; }
+  button:hover:enabled { background: #354350; }
+}
