@@ -1,0 +1,27 @@
+[package]
+name = "assignment-manager-macos-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+assignment-manager-application = { path = "../application" }
+assignment-manager = { path = "../.." }
+chrono = "0.4"
+thiserror = "2"
+uniffi = { version = "=0.32.2" }
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "sync"] }

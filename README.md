@@ -1,11 +1,18 @@
 # Assignment Manager
 
-Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shellです。
-macOS Tauri版の起動・SQLite・Keychainは実機確認済みです。Swift bridge / SwiftUIはまだ実装していません。
+Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shell、
+Phase 10AのmacOS Swift bridge PoCです。
+
+macOS bridgeのarchitecture・公式仕様の確認・再現可能なSwift 6 smoke手順は
+[macos/BridgeSmoke/README.md](macos/BridgeSmoke/README.md)を参照してください。
+UniFFI 0.32.2を固定し、Apple Silicon上で共有ApplicationHandleのopen/query/toggle/shutdownを検証します。
+SwiftUI、native Keychain、Settings、Syncは後続phaseです。
+macOS Tauri版の起動・SQLite・Keychainは実機確認済みです。正式なSwiftUI shellは後続phaseです。
 
 ## Shared application architecture
 
-依存方向は`Tauri → assignment-manager-application → assignment-manager`です。
+依存方向は`Tauri → assignment-manager-application → assignment-manager`、
+macOS PoCは`Swift → macos-bridge → assignment-manager-application → assignment-manager`です。
 rootの`src/`はcoreのまま、共有applicationは`crates/application/`に置きます。
 coreへTauri、OS credential API、FFI依存を追加していません。SQLite schema v3も維持します。
 
@@ -43,7 +50,7 @@ cargo tauri dev
 identifierとfilenameを変更すると保存先が変わるため、継続して同じ値を使用してください。
 directory作成と`SqliteStore::open`（schema v3 migration）は起動時に専用workerで一度実行し、
 一覧取得・完了切り替えもそのworkerが同じstoreで順に処理します。
-coreはroot crateのまま、application/desktopはそれぞれ独立manifest/lockfileで依存します。
+coreはroot crateのまま、application/desktop/macos-bridgeはそれぞれ独立manifest/lockfileで依存します。
 
 初回DBは空です。「課題はまだありません」は正常な状態です。
 設定済みサービスから「同期」で課題を取得します。課題作成・DB選択UIはありません。

@@ -1,5 +1,11 @@
 /target
 /crates/application/target/
+/crates/macos-bridge/target/
+/macos/BridgeSmoke/.build/
+/macos/BridgeSmoke/.swiftpm/
+/macos/BridgeSmoke/Native/
+/macos/BridgeSmoke/Sources/AssignmentManagerBridge/
+/macos/BridgeSmoke/Sources/AssignmentManagerBridgeFFI/
 /src-tauri/target/
 /src-tauri/gen/
 
