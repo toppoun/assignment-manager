@@ -6,6 +6,10 @@
 /macos/BridgeSmoke/Native/
 /macos/BridgeSmoke/Sources/AssignmentManagerBridge/
 /macos/BridgeSmoke/Sources/AssignmentManagerBridgeFFI/
+/macos/AssignmentManager/.build/
+/macos/AssignmentManager/.swiftpm/
+/macos/AssignmentManager/build/
+xcuserdata/
 /src-tauri/target/
 /src-tauri/gen/
 

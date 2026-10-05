@@ -9,3 +9,9 @@ Swift向けにshared application/coreの公開contractを変更しません。
 
 settings/credential adaptersはprivate PoC専用です。Settings/Keychain/Sync APIはexportしません。
 `examples/prepare-smoke.rs`は一時DB専用helperで、production libraryの公開APIではありません。
+
+Phase 10Bの[SwiftUI shell](../../macos/AssignmentManager/README.md)も同じbridgeを利用します。
+既存`QueryOptions`のcompletion/course/deadline/sort mappingを再利用し、
+application/coreとTauriのproduction sourceは変更していません。
+`examples/prepare-native-smoke.rs`は10B用の相対期限・同名Course・長いtitleを含む
+一時DB専用helperです。入力pathを受け取らず、大学serverにも接続しません。

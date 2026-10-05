@@ -1,0 +1,29 @@
+// !$*UTF8*$!
+{ archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+7686C7DB9B489347A59DA3F5 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/AssignmentManagerApp.swift"; sourceTree = "<group>"; };
+F3AE9B9F1DD624C9D7224D2A = { isa = PBXBuildFile; fileRef = 7686C7DB9B489347A59DA3F5; };
+FD50DD6C45F9A04EB9863A76 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Views/AssignmentShell.swift"; sourceTree = "<group>"; };
+126DAD63782DEACA5131A4C4 = { isa = PBXBuildFile; fileRef = FD50DD6C45F9A04EB9863A76; };
+C61CA5E6A44A300F14F4A440 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Views/AssignmentFilters.swift"; sourceTree = "<group>"; };
+19CDD8EBC54F67CD04A7ADFB = { isa = PBXBuildFile; fileRef = C61CA5E6A44A300F14F4A440; };
+3B2FDF0EFB519A84C12A6916 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Views/AssignmentRow.swift"; sourceTree = "<group>"; };
+B7F59CD1012934A4D3E475CB = { isa = PBXBuildFile; fileRef = 3B2FDF0EFB519A84C12A6916; };
+59BD0A3FF43B32849B319E64 = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Resources/Info.plist; sourceTree = "<group>"; };
+38A007151ABE87CC01A5B6E9 = { isa = PBXFileReference; explicitFileType = wrapper.application; path = "Assignment Manager.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+DC76E9F0C0006E8F919E0C51 = { isa = PBXGroup; children = (7686C7DB9B489347A59DA3F5,FD50DD6C45F9A04EB9863A76,C61CA5E6A44A300F14F4A440,3B2FDF0EFB519A84C12A6916, 59BD0A3FF43B32849B319E64, FBDC4F23F93125BBEEAE800C); sourceTree = "<group>"; };
+FBDC4F23F93125BBEEAE800C = { isa = PBXGroup; children = (38A007151ABE87CC01A5B6E9); name = Products; sourceTree = "<group>"; };
+BCE16DD0260827ECF338C787 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (F3AE9B9F1DD624C9D7224D2A,126DAD63782DEACA5131A4C4,19CDD8EBC54F67CD04A7ADFB,B7F59CD1012934A4D3E475CB); runOnlyForDeploymentPostprocessing = 0; };
+7561BFB015D8F536760CB671 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (1C2ED28A3BCBAE5D763936A4); runOnlyForDeploymentPostprocessing = 0; };
+0189424A5A60FED329FA868E = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+582681C2EAE02B3F3D399C0C = { isa = XCLocalSwiftPackageReference; relativePath = .; };
+B17EB192F8D22D50442F606B = { isa = XCSwiftPackageProductDependency; package = 582681C2EAE02B3F3D399C0C; productName = AssignmentManagerKit; };
+1C2ED28A3BCBAE5D763936A4 = { isa = PBXBuildFile; productRef = B17EB192F8D22D50442F606B; };
+0E8A3AD980EC179856012B7E = { isa = PBXNativeTarget; buildConfigurationList = 976B52545947CA66FD9EF2A4; buildPhases = (BCE16DD0260827ECF338C787, 7561BFB015D8F536760CB671, 0189424A5A60FED329FA868E); buildRules = (); dependencies = (); name = AssignmentManager; packageProductDependencies = (B17EB192F8D22D50442F606B); productName = "Assignment Manager"; productReference = 38A007151ABE87CC01A5B6E9; productType = "com.apple.product-type.application"; };
+ED8772ADEC3A6C25161BC957 = { isa = XCBuildConfiguration; buildSettings = { ARCHS = arm64; SDKROOT = macosx; MACOSX_DEPLOYMENT_TARGET = 14.0; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; CLANG_ENABLE_MODULES = YES; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; DEBUG_INFORMATION_FORMAT = dwarf; }; name = Debug; };
+4D8F54E7CBAF670D9F6C230D = { isa = XCBuildConfiguration; buildSettings = { PRODUCT_NAME = "Assignment Manager"; PRODUCT_BUNDLE_IDENTIFIER = org.assignmentmanager.native; INFOPLIST_FILE = Resources/Info.plist; GENERATE_INFOPLIST_FILE = NO; CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = NO; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; }; name = Debug; };
+00F209874A1F7309F6DCEAA7 = { isa = XCBuildConfiguration; buildSettings = { ARCHS = arm64; SDKROOT = macosx; MACOSX_DEPLOYMENT_TARGET = 14.0; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; CLANG_ENABLE_MODULES = YES; SWIFT_OPTIMIZATION_LEVEL = "-O"; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; }; name = Release; };
+1A6EFC2CD0AF63DD14BE0438 = { isa = XCBuildConfiguration; buildSettings = { PRODUCT_NAME = "Assignment Manager"; PRODUCT_BUNDLE_IDENTIFIER = org.assignmentmanager.native; INFOPLIST_FILE = Resources/Info.plist; GENERATE_INFOPLIST_FILE = NO; CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = NO; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; }; name = Release; };
+640DC9EFD529235A8D9E2727 = { isa = XCConfigurationList; buildConfigurations = (ED8772ADEC3A6C25161BC957, 00F209874A1F7309F6DCEAA7); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+976B52545947CA66FD9EF2A4 = { isa = XCConfigurationList; buildConfigurations = (4D8F54E7CBAF670D9F6C230D, 1A6EFC2CD0AF63DD14BE0438); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+98F54143AB4E86B28C3AFEE0 = { isa = PBXProject; attributes = { LastUpgradeCheck = 2700; }; buildConfigurationList = 640DC9EFD529235A8D9E2727; compatibilityVersion = "Xcode 14.0"; developmentRegion = ja; knownRegions = (ja, en, Base); mainGroup = DC76E9F0C0006E8F919E0C51; productRefGroup = FBDC4F23F93125BBEEAE800C; packageReferences = (582681C2EAE02B3F3D399C0C); projectDirPath = ""; projectRoot = ""; targets = (0E8A3AD980EC179856012B7E); };
+}; rootObject = 98F54143AB4E86B28C3AFEE0; }

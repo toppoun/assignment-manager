@@ -13,6 +13,13 @@ private func requireOffMainThread() throws {
     try require(!Thread.isMainThread, "bridge work ran on the main thread")
 }
 
+// Stored weak reference keeps this lifetime probe compatible with Swift 6.0–6.4.
+// Swift 6.4 warns on an unmutated local `weak var` under warnings-as-errors.
+private final class WeakApplicationReference {
+    weak var value: MacApplication?
+    init(_ value: MacApplication?) { self.value = value }
+}
+
 /// PoC owner of the generated proxy. Actor work runs off MainActor; Rust async calls
 /// only enqueue/poll worker replies. No handwritten Sendable exemptions are needed.
 private actor SmokeSession {
@@ -222,10 +229,10 @@ public actor SmokeChecks {
         var original: MacApplication? = try await MacApplication.open(
             databasePath: root.appendingPathComponent("seeded.db").path
         )
-        weak var released = original
+        let released = WeakApplicationReference(original)
         var alias: MacApplication? = original
         original = nil
-        try require(released != nil, "alias did not retain proxy")
+        try require(released.value != nil, "alias did not retain proxy")
         do {
             let response = try await alias!.queryAssignments()
             let id = response.items[0].id
@@ -247,7 +254,7 @@ public actor SmokeChecks {
             }
             try require(committed == .completed, "refresh failure changed write outcome")
             alias = nil
-            try require(released == nil, "last Swift reference not released")
+            try require(released.value == nil, "last Swift reference not released")
 
             let reopened = try await MacApplication.open(databasePath: root.appendingPathComponent("seeded.db").path)
             do {

@@ -118,10 +118,11 @@ bridgeのnamed async constructorは初回default queryをawaitし、失敗時は
 typed errorを返します。成功したopenはlocal DBがquery可能であることを意味します。
 shared construction contractは変更しません。
 
-`QueryOptions`はcompletion selectionだけを持ちます。nilではshared default
+`QueryOptions`はcompletion、course、deadline、sort selectionを持ちます。nilではshared default
 （Incomplete、全Course、全deadline、deadline sort）を使います。
-All/Completedはcompleted read modelとtoggle後の再取得を確認するために追加しています。
-今後fieldを増やす際もshared `AssignmentQuery`へ変換する方針で、Swift側のfilter/sortはありません。
+全selectionをshared `AssignmentQuery`へ変換し、Swift側のfilter/sortはありません。
+Phase 10B shellもこの既存APIを利用します。CourseはAll/Unassigned/opaque ID、
+deadlineはAll/Overdue/WithinSevenDays、sortはDeadline/Course/Titleです。
 UniFFI ABI/checksumは変更時に再生成が必要で、record追加がbinary互換であるという意味ではありません。
 
 ## DTO mapping
@@ -271,9 +272,10 @@ C ABIへの切替を必要とするBLOCKERは確認していません。
 
 ## Remaining
 
-Phase 10B: macOS SwiftUI shell — native app lifecycle、app data path、Assignment list、query/filter、completion。
+Phase 10Bの正式なSwiftUI shellは[AssignmentManager](../AssignmentManager/README.md)へ追加しました。
+本packageは今後もFFI regression smokeとして保持します。
 
 Phase 10C: macOS Settings/native Keychain/Sync — Moodle config、WebClass credentials、manual/startup sync。
 
 その後: academic term filter、source submission state、timetable、WidgetKit。
-このPoCはPhase 10Bへ進みません。
+このPoC自体にはUIを追加しません。

@@ -1,18 +1,24 @@
 # Assignment Manager
 
 Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shell、
-Phase 10AのmacOS Swift bridge PoCです。
+Phase 10BのmacOS native SwiftUI application shellです。
+
+macOS正式shellのXcode project、build/test手順、lifecycle、保存先、検証結果は
+[macos/AssignmentManager/README.md](macos/AssignmentManager/README.md)を参照してください。
+`bash macos/AssignmentManager/build.sh`でgenerated bridge、Swift tests、arm64 Debug `.app`をbuildします。
 
 macOS bridgeのarchitecture・公式仕様の確認・再現可能なSwift 6 smoke手順は
 [macos/BridgeSmoke/README.md](macos/BridgeSmoke/README.md)を参照してください。
 UniFFI 0.32.2を固定し、Apple Silicon上で共有ApplicationHandleのopen/query/toggle/shutdownを検証します。
-SwiftUI、native Keychain、Settings、Syncは後続phaseです。
-macOS Tauri版の起動・SQLite・Keychainは実機確認済みです。正式なSwiftUI shellは後続phaseです。
+BridgeSmokeは引き続き独立したFFI regression smokeです。
+native Keychain、Settings、SyncはPhase 10Cです。
+macOS Tauri版の起動・SQLite・Keychainは以前の実機確認済みです。
+SwiftUI版の実window smokeはComputer Use権限が未許可のため、今回のユーザー指定で未確認です。
 
 ## Shared application architecture
 
 依存方向は`Tauri → assignment-manager-application → assignment-manager`、
-macOS PoCは`Swift → macos-bridge → assignment-manager-application → assignment-manager`です。
+macOS正式版は`SwiftUI → Swift adapter → generated UniFFI proxy → macos-bridge → assignment-manager-application → assignment-manager`です。
 rootの`src/`はcoreのまま、共有applicationは`crates/application/`に置きます。
 coreへTauri、OS credential API、FFI依存を追加していません。SQLite schema v3も維持します。
 
