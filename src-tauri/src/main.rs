@@ -7,13 +7,10 @@ mod dto;
 mod error;
 mod list_query;
 mod settings;
-mod settings_worker;
 mod storage;
 mod sync_service;
-mod sync_worker;
 
 use error::ApplicationError;
-use storage::DesktopState;
 use tauri::Manager;
 
 fn main() {
@@ -26,17 +23,15 @@ fn main() {
                 .map_err(|_| ApplicationError::DataDirectory);
             // Creation, open/migration and local list/completion work run on this worker.
             // Commands wait for startup without blocking the window/event thread.
-            app.manage(DesktopState::start(directory.clone())?);
             let config_directory = app
                 .path()
                 .app_config_dir()
                 .map_err(|_| ApplicationError::SettingsReadFailed);
-            let settings = settings_worker::SettingsState::start(
+            app.manage(storage::open_application(
+                directory,
                 config_directory,
                 "io.assignment-manager.desktop",
-            )?;
-            app.manage(sync_worker::SyncState::start(directory, settings.clone())?);
-            app.manage(settings);
+            )?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -48,11 +43,14 @@ fn main() {
             commands::save_webclass_credentials,
             commands::remove_webclass_credentials,
             commands::set_startup_sync,
-            commands::sync_now
+            commands::sync_now,
+            commands::run_startup_sync
         ])
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
 
-    if result.is_err() {
+    if let Ok(app) = result {
+        app.run(|app, event| storage::handle_exit(app, &event));
+    } else {
         // Tauri's underlying startup error can include paths; never print it.
         eprintln!("アプリを起動できませんでした。");
         std::process::exit(1);

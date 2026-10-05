@@ -1,15 +1,15 @@
 //! Synthetic, offline transport for the smoke binary only. Never creates an HTTP client.
-use crate::{
-    credential_store::{SecretText, WebClassCredentials},
-    settings::MOODLE_SCOPE,
-    sync_service::{SyncBackend, SyncCounts, SyncFailure},
-};
 use assignment_manager::{
     domain::{Deadline, SubmissionTarget},
     import::{AssignmentCandidate, AssignmentCandidateBatch, ExternalRecordKey, OriginKind},
     observation::{AssignmentObservation, SyncScope},
     persistence::{MoodleCourseResolution, SqliteStore},
     sync::WebClassCredentialProvider,
+};
+use assignment_manager_application::settings::MOODLE_SCOPE;
+use assignment_manager_application::{
+    SyncBackend, SyncCounts, SyncFailure,
+    credentials::{SecretText, WebClassCredentials},
 };
 use std::{collections::HashMap, thread, time::Duration};
 

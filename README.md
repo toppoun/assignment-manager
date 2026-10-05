@@ -1,6 +1,23 @@
 # Assignment Manager
 
-Rust coreと、Phase 8D2のWindows向けTauri 2 desktop shellです。macOS backendは未検証です。
+Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shellです。
+macOS Tauri版の起動・SQLite・Keychainは実機確認済みです。Swift bridge / SwiftUIはまだ実装していません。
+
+## Shared application architecture
+
+依存方向は`Tauri → assignment-manager-application → assignment-manager`です。
+rootの`src/`はcoreのまま、共有applicationは`crates/application/`に置きます。
+coreへTauri、OS credential API、FFI依存を追加していません。SQLite schema v3も維持します。
+
+application lifetimeで一つの`ApplicationHandle`を所有します。cloneは同じruntimeを参照し、
+query/completion、sync、settingsの3 workerへrequestを送ります。前者2つは別Connectionを所有し、
+network待ちでもquery/completionを利用できます。ConnectionやHTTP clientはhandleから返しません。
+source別sync policy、session再利用/revision invalidation、single-flight、startup once、
+query optionと安全なread model/errorは共有層にあります。
+
+Tauri側はpath解決、JSON request/DTO、日本語message、JSON settings storage、OS credential backendを担当します。
+共通settings contractはJSONを要求せず、`SettingsStore` / `CredentialStore`のplatform portを利用します。
+詳細なAPI・lifecycle contractは[application README](crates/application/README.md)を参照してください。
 
 ## Development
 
@@ -26,7 +43,7 @@ cargo tauri dev
 identifierとfilenameを変更すると保存先が変わるため、継続して同じ値を使用してください。
 directory作成と`SqliteStore::open`（schema v3 migration）は起動時に専用workerで一度実行し、
 一覧取得・完了切り替えもそのworkerが同じstoreで順に処理します。
-coreはroot crateのまま、desktopは独立manifest/lockfileで依存します。
+coreはroot crateのまま、application/desktopはそれぞれ独立manifest/lockfileで依存します。
 
 初回DBは空です。「課題はまだありません」は正常な状態です。
 設定済みサービスから「同期」で課題を取得します。課題作成・DB選択UIはありません。
@@ -46,6 +63,7 @@ inclusive windowです。「今日」はOS local timezoneの今日の開始か�
 完了済みにはdeadline status badgeを付けません。frontendで期限の比較やAssignmentの再sortはしません。
 
 responseはfiltered itemsに加えて、filter前のtotal countと参照されている全Courseの選択肢を返します。
+DBを一度だけ読み、同じsnapshotとclockからitems・Course候補・件数・badgeを構成します。
 Courseの順序はcoreのCourse sort（表示ラベル→CourseId）、未所属は最後です。
 groupのidentityはCourseIdで、同名・同sourceでも別IDをmergeせず、group内は選択したcore sort順を保ちます。
 Moodleは「表示ラベル」と明示します。DateOnlyは日付のみ、DateTimeはlocal timezone、Noneは「期限なし」です。
@@ -71,7 +89,7 @@ single university/profile/feedの固定contractで、token URLの置換・削除
 同じdirectoryのtemporary fileをsyncしてatomicに作成・置換します。破損・未知version・変更されたidentity・
 未知fieldを含む既存設定は固定errorにし、上書きやsilent resetはしません。
 
-secretはdesktop内部の`CredentialStore`境界に集約しています。
+secret操作のcontractはshared applicationの`CredentialStore`へ集約し、OS実装はdesktop adapterに置きます。
 maintainedな[keyring-core](https://docs.rs/keyring-core/1.0.0/keyring_core/)とOS providerを使用します。
 Windowsは[Windows Credential Manager](https://docs.rs/windows-native-keyring-store/1.1.0/windows_native_keyring_store/)
 （Local persistence）、macOSは[login Keychain](https://docs.rs/apple-native-keyring-store/1.0.2/apple_native_keyring_store/keychain/)です。
@@ -82,7 +100,7 @@ missing entryは正常な未設定で、他appのentryを列挙する処理は�
 
 blockingな設定/credential操作は専用settings workerで順に実行します。既存SQLite workerとは独立し、
 core/schema v3にdesktop APIや設定/credential tableは追加していません。
-Rustのsecret wrapperはDebugをredactし、owned bufferをdrop時にzeroizeします。
+Rustのsecret wrapperはDebug/Clone/Serializeを実装せず、owned bufferをdrop時にzeroizeします。
 libraryのraw error/causeやsecretのdeserialize errorは公開せず、固定のapplication errorへ変換します。
 
 追加commands: `get_settings_status`、`save_moodle_feed`、`remove_moodle_feed`、
@@ -116,10 +134,16 @@ cookie jar/sessionをdiskへ保存しません。再起動後は次syncでlogin�
 による同directory内のatomic置換を使用します。
 「起動時に同期する」は既定OFFで、旧settings fileのfield省略もOFFとして読めます。
 起動時は最初のローカル一覧取得→設定確認→background sync→一覧再queryの順です。
+frontendの`run_startup_sync`要求に対し、application runtimeが設定とonce guardを判定します。
+View再生成・複数window・同じhandleのcloneでも、起動時policyの実行はapplication lifetimeで一度だけです。
 同期失敗は起動を妨げません。完了操作もofflineで利用できます。
 実行したsourceがあれば失敗/partial failureでも現在のfilter/sortで一覧を再queryします。
 query/toggle中の同期完了によるreloadは処理終了後に実行します。
 同期はlocal user-owned CompletionStateを変更しません。
+
+`Failed`でも既にcommit済みのgroupが存在し得ます。`Completed`はrunの終了であり全source成功ではありません。
+completion toggleの戻り値はcommit済み状態です。その後のrefresh失敗をtoggle失敗として再試行しません。
+終了時は新規requestを拒否し、accepted jobが終わってConnection/session/adapterがdropされるまで非blockingで待ちます。
 
 ## Checks
 
@@ -130,6 +154,15 @@ cargo fmt --check
 cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 cargo test --locked --offline
 cargo test --doc --locked --offline
+```
+
+shared application:
+
+```sh
+cargo fmt --manifest-path crates/application/Cargo.toml --check
+cargo clippy --manifest-path crates/application/Cargo.toml --locked --offline --all-targets --all-features -- -D warnings
+cargo test --manifest-path crates/application/Cargo.toml --locked --offline
+cargo test --doc --manifest-path crates/application/Cargo.toml --locked --offline
 ```
 
 desktop（初回は依存の取得が必要、以降は`--offline`を付けられます）:
@@ -155,11 +188,13 @@ partial/corrupt record、error分類、設定roundtripと破損保持を検証�
 literal secretが設定file、SQLite、status DTO、error、Debugへ出ないことも検証します。
 frontend testsはconfigured表示、save/remove request、入力clear、secretをstateへ残さないこと、固定errorを検証します。
 unit testが実OS credential storeへ書き込むことはありません。
-desktop sync testsはfake transport/providerのみを使用し、source選択、partial failure、
+shared application testsはfake transport/providerのみを使用し、source選択、partial failure、
 初回login/session再利用、core reauth callbackへの接続、credential変更/削除、single-flight、
 network待ち中のlocal query/toggle、sync後・DB reopen後のcompletion保持を検証します。
+startup once、shutdown/最後のhandle drop、settings thread ownership、別Connectionのcommitを挟んだ
+snapshot consistencyもshared applicationで検証します。desktopにはJSON/設定file/credential backendのadapter testsを残します。
 core HTTP testsがreauth protocol/retryをlocalhost mockで検証します。
-frontend testsは進行状態/連打、source別成功・失敗、reloadの順序、startup policyを検証します。
+frontend testsは進行状態/連打、source別成功・失敗、reloadの順序、startup policyへの委譲を検証します。
 通常test suiteは大学サーバーへ接続しません。
 
 Phase 8D1の依存追加時だけcrates.ioへ接続してdesktop lockfileを更新しました。

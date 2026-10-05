@@ -1,8 +1,11 @@
 use assignment_manager::{
     domain::{CompletionState, Deadline, SubmissionTarget},
     import::OriginKind,
-    query::{AssignmentListItem, CourseListInfo},
 };
+use assignment_manager_application::models::{
+    AssignmentListEntry, AssignmentListResponse, CourseOption, DeadlineStatus,
+};
+use assignment_manager_application::settings::SettingsStatus;
 use chrono::SecondsFormat;
 use serde::Serialize;
 
@@ -89,11 +92,11 @@ pub enum CourseOriginDto {
     Unbound,
 }
 
-impl From<CourseListInfo> for CourseDto {
-    fn from(course: CourseListInfo) -> Self {
+impl From<CourseOption> for CourseDto {
+    fn from(course: CourseOption) -> Self {
         Self {
-            id: course.id.as_str().to_owned(),
-            display_label: course.name,
+            id: course.id,
+            display_label: course.display_label,
             origin: match course.origin {
                 Some(OriginKind::Moodle) => CourseOriginDto::Moodle,
                 Some(OriginKind::WebClass) => CourseOriginDto::WebClass,
@@ -104,10 +107,10 @@ impl From<CourseListInfo> for CourseDto {
     }
 }
 
-impl From<AssignmentListItem> for AssignmentDto {
-    fn from(item: AssignmentListItem) -> Self {
+impl From<AssignmentListEntry> for AssignmentDto {
+    fn from(item: AssignmentListEntry) -> Self {
         Self {
-            id: item.id.as_str().to_owned(),
+            id: item.id,
             title: item.title,
             deadline: match item.deadline {
                 Some(Deadline::DateOnly(date)) => DeadlineDto::DateOnly(date.to_string()),
@@ -124,9 +127,9 @@ impl From<AssignmentListItem> for AssignmentDto {
                 SubmissionTarget::WebClass => SubmissionDto::WebClass,
                 SubmissionTarget::External => SubmissionDto::External,
             },
-            has_submission_url: item.submission_url.is_some(),
+            has_submission_url: item.has_submission_url,
             course: item.course.map(Into::into),
-            status: DeadlineStatusDto::None,
+            status: item.status.into(),
         }
     }
 }
@@ -134,18 +137,18 @@ impl From<AssignmentListItem> for AssignmentDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assignment_manager::domain::{AssignmentId, CourseId};
     use chrono::NaiveDate;
     use serde_json::json;
 
-    fn item() -> AssignmentListItem {
-        AssignmentListItem {
-            id: AssignmentId::new("internal-assignment"),
+    fn item() -> AssignmentListEntry {
+        AssignmentListEntry {
+            id: "internal-assignment".into(),
             title: "レポート".into(),
             deadline: None,
             completion: CompletionState::Incomplete,
             submission: SubmissionTarget::Unknown,
-            submission_url: None,
+            has_submission_url: false,
+            status: DeadlineStatus::None,
             course: None,
         }
     }
@@ -186,7 +189,7 @@ mod tests {
             let mut source = item();
             source.submission = target;
             source.completion = CompletionState::Completed;
-            source.submission_url = Some("https://example.invalid/?token=secret".into());
+            source.has_submission_url = true;
             let dto = serde_json::to_value(AssignmentDto::from(source)).unwrap();
             assert_eq!(dto["submission"], expected);
             assert_eq!(dto["completion"], "completed");
@@ -210,9 +213,9 @@ mod tests {
             (4, None, "unbound"),
         ] {
             let id = format!("internal-course-{index}");
-            let dto = CourseDto::from(CourseListInfo {
-                id: CourseId::new(&id),
-                name: "同じ表示ラベル".into(),
+            let dto = CourseDto::from(CourseOption {
+                id: id.clone(),
+                display_label: "同じ表示ラベル".into(),
                 origin,
             });
             let value = serde_json::to_value(dto).unwrap();
@@ -220,6 +223,42 @@ mod tests {
                 value,
                 json!({"id": id, "displayLabel": "同じ表示ラベル", "origin": expected})
             );
+        }
+    }
+}
+
+impl From<AssignmentListResponse> for AssignmentListDto {
+    fn from(value: AssignmentListResponse) -> Self {
+        Self {
+            items: value.items.into_iter().map(Into::into).collect(),
+            courses: value.courses.into_iter().map(Into::into).collect(),
+            total_count: value.total_count,
+        }
+    }
+}
+impl From<DeadlineStatus> for DeadlineStatusDto {
+    fn from(value: DeadlineStatus) -> Self {
+        match value {
+            DeadlineStatus::Overdue => Self::Overdue,
+            DeadlineStatus::Today => Self::Today,
+            DeadlineStatus::Upcoming => Self::Upcoming,
+            DeadlineStatus::None => Self::None,
+        }
+    }
+}
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsStatusDto {
+    pub moodle_configured: bool,
+    pub webclass_configured: bool,
+    pub sync_on_startup: bool,
+}
+impl From<SettingsStatus> for SettingsStatusDto {
+    fn from(value: SettingsStatus) -> Self {
+        Self {
+            moodle_configured: value.moodle_configured,
+            webclass_configured: value.webclass_configured,
+            sync_on_startup: value.sync_on_startup,
         }
     }
 }

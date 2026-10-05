@@ -1,10 +1,9 @@
 use super::*;
 use crate::{
-    credential_store::tests::{FakeBackend, ID, PASSWORD, URL, credentials, fake},
-    credential_store::{CredentialStore, CredentialVault},
-    dto::CompletionDto,
-    list_query::{CompletionSelection, ListRequest, QueryClock, list_from_store},
-    settings::{NonSecretSettings, SettingsService},
+    credentials::CredentialStore,
+    query::{AssignmentQuery, CompletionSelection, QueryClock, list_from_store},
+    settings::{Settings, SettingsService},
+    test_support::{FakeCredentials, ID, PASSWORD, URL, credentials, fake},
 };
 use assignment_manager::{
     domain::SubmissionTarget,
@@ -20,11 +19,8 @@ impl<C: CredentialStore> SyncSecrets for SettingsService<C> {
     }
 }
 
-pub(crate) fn secrets(
-    moodle: bool,
-    webclass: bool,
-) -> SettingsService<CredentialVault<FakeBackend>> {
-    let mut service = SettingsService::new(NonSecretSettings::default(), fake());
+pub(crate) fn secrets(moodle: bool, webclass: bool) -> SettingsService<FakeCredentials> {
+    let mut service = SettingsService::new(Settings::default(), fake());
     if moodle {
         service.save_moodle(SecretText::new(URL.into())).unwrap();
     }
@@ -63,6 +59,7 @@ struct FakeNetwork {
     webclass_failure: Option<SyncFailure>,
     expired: bool,
     reauth_failure: bool,
+    commit_before_webclass_failure: bool,
 }
 impl SyncBackend for FakeNetwork {
     type Session = usize;
@@ -104,25 +101,66 @@ impl SyncBackend for FakeNetwork {
             self.expired = false;
             *session += 1;
         }
+        if self.commit_before_webclass_failure {
+            import(store)?;
+        }
         match self.webclass_failure {
             Some(error) => Err(error),
             None => import(store),
         }
     }
 }
+
+#[test]
+fn failed_source_after_partial_commit_requires_reload_and_retains_committed_assignments() {
+    let mut service = service(false, true);
+    service.backend.commit_before_webclass_failure = true;
+    service.backend.webclass_failure = Some(SyncFailure::NetworkFailed);
+    let report = service.run();
+    assert!(report.should_reload());
+    assert!(matches!(
+        report,
+        SyncReport::Completed {
+            webclass: SourceSyncResult::Failed {
+                error: SyncFailure::NetworkFailed
+            },
+            ..
+        }
+    ));
+    let clock = QueryClock::from_local(chrono::Local::now()).unwrap();
+    assert_eq!(
+        list_from_store(
+            service.store.as_ref().unwrap(),
+            &AssignmentQuery::default(),
+            &clock
+        )
+        .unwrap()
+        .items
+        .len(),
+        1
+    );
+    assert!(!SyncReport::AlreadyRunning.should_reload());
+    assert!(
+        !SyncReport::Completed {
+            moodle: SourceSyncResult::NotConfigured,
+            webclass: SourceSyncResult::NotConfigured
+        }
+        .should_reload()
+    );
+}
 fn service(
     moodle: bool,
     webclass: bool,
-) -> SyncService<FakeNetwork, SettingsService<CredentialVault<FakeBackend>>> {
+) -> SyncService<FakeNetwork, SettingsService<FakeCredentials>> {
     SyncService::new(
         FakeNetwork::default(),
         secrets(moodle, webclass),
         Ok(SqliteStore::open(":memory:").unwrap()),
     )
 }
-fn report(result: SyncResultDto) -> (SourceSyncResult, SourceSyncResult) {
+fn report(result: SyncReport) -> (SourceSyncResult, SourceSyncResult) {
     match result {
-        SyncResultDto::Completed { moodle, webclass } => (moodle, webclass),
+        SyncReport::Completed { moodle, webclass } => (moodle, webclass),
         _ => panic!("not completed"),
     }
 }
@@ -165,7 +203,7 @@ fn source_failures_are_independent_and_committed_data_stays_visible() {
     assert_eq!(
         list_from_store(
             service.store.as_ref().unwrap(),
-            &ListRequest::default(),
+            &AssignmentQuery::default(),
             &clock
         )
         .unwrap()
@@ -246,7 +284,7 @@ fn stable_url_rotation_keeps_identity_and_local_completion_on_reimport_and_reope
     let clock = QueryClock::from_local(chrono::Local::now()).unwrap();
     let item = list_from_store(
         service.store.as_ref().unwrap(),
-        &ListRequest::default(),
+        &AssignmentQuery::default(),
         &clock,
     )
     .unwrap()
@@ -274,7 +312,7 @@ fn stable_url_rotation_keeps_identity_and_local_completion_on_reimport_and_reope
             }
         }
     ));
-    let safe = format!("{moodle:?} {}", serde_json::to_string(&moodle).unwrap());
+    let safe = format!("{moodle:?}");
     for marker in [
         URL,
         ID,
@@ -287,14 +325,17 @@ fn stable_url_rotation_keeps_identity_and_local_completion_on_reimport_and_reope
     }
     drop(service);
     let store = SqliteStore::open(&path).unwrap();
-    let all = ListRequest {
+    let all = AssignmentQuery {
         completion: CompletionSelection::All,
         ..Default::default()
     };
     let items = list_from_store(&store, &all, &clock).unwrap().items;
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id, item.id);
-    assert_eq!(items[0].completion, CompletionDto::Completed);
+    assert_eq!(
+        items[0].completion,
+        assignment_manager::domain::CompletionState::Completed
+    );
 }
 #[test]
 fn safe_core_error_mapping_covers_fetch_data_persistence_and_auth() {
@@ -389,7 +430,7 @@ fn initial_auth_failure_and_failed_credential_replacement_preserve_independent_s
 #[test]
 fn credential_read_errors_are_source_local_and_invalidate_cached_session() {
     struct ErrorSecrets {
-        inner: SettingsService<CredentialVault<FakeBackend>>,
+        inner: SettingsService<FakeCredentials>,
         fail_moodle: bool,
         fail_webclass: bool,
     }

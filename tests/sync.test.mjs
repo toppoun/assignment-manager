@@ -46,14 +46,14 @@ test("Every configured source result reloads the list, including partial and all
 test("Unconfigured sources do not call sync; removal raced with command gives normal missing result", async () => {
   let calls = 0;
   let reloads = 0;
-  const model = createSyncModel(async () => { calls += 1; return report(missing, missing); }, async () => { reloads += 1; });
+  const model = createSyncModel(async command => { calls += 1; return command === "run_startup_sync" ? null : report(missing, missing); }, async () => { reloads += 1; });
   model.configure({ moodleConfigured: false, webclassConfigured: false, syncOnStartup: true });
   await model.startup();
   await model.run();
-  assert.equal(calls, 0);
+  assert.equal(calls, 1); // Rust owns startup eligibility, even with no configured source
   model.configure(flags);
   await model.run();
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
   assert.equal(reloads, 0);
   assert.match(model.snapshot().message, /設定されていません/);
 });
@@ -83,15 +83,27 @@ test("Failure messages are fixed and never retain core/backend payloads or raw D
   assert.match(model.snapshot().message, /引き続き利用/);
 });
 
-test("Startup defaults off and starts once only after local list and settings are available", async () => {
+test("Startup delegates policy to Rust after local list/settings, including off and recreated models", async () => {
   for (const enabled of [false, true]) {
     const events = [];
-    const model = createSyncModel(async () => { events.push("sync"); return report(success, missing); }, async () => { events.push("reload"); });
+    let checked = false;
+    const invoke = async command => {
+      assert.equal(command, "run_startup_sync");
+      events.push("startup-policy");
+      if (checked) return null;
+      checked = true;
+      return enabled ? report(success, missing) : null;
+    };
+    const model = createSyncModel(invoke, async () => { events.push("reload"); });
     await initializeSync(async () => { events.push("local"); }, async () => { events.push("settings"); return { ...flags, syncOnStartup: enabled }; }, model);
-    assert.deepEqual(events, enabled ? ["local", "settings", "sync", "reload"] : ["local", "settings"]);
+    assert.deepEqual(events, enabled ? ["local", "settings", "startup-policy", "reload"] : ["local", "settings", "startup-policy"]);
     assert.equal(await model.startup(), false);
     model.configure({ ...flags, syncOnStartup: true });
     assert.equal(await model.startup(), false); // settings save never triggers a second startup sync
+    const recreated = createSyncModel(invoke, async () => { events.push("reload"); });
+    recreated.configure({ ...flags, syncOnStartup: true });
+    assert.equal(await recreated.startup(), false);
+    assert.equal(events.filter(event => event === "reload").length, enabled ? 1 : 0);
   }
 });
 

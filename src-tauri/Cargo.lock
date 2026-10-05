@@ -72,11 +72,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "assignment-manager-application"
+version = "0.1.0"
+dependencies = [
+ "assignment-manager",
+ "chrono",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "assignment-manager-desktop"
 version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
  "assignment-manager",
+ "assignment-manager-application",
  "chrono",
  "keyring-core",
  "serde",
@@ -84,7 +95,6 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tempfile",
- "tokio",
  "windows-native-keyring-store",
  "zeroize",
 ]

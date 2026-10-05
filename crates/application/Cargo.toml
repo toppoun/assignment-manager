@@ -1,0 +1,15 @@
+[package]
+name = "assignment-manager-application"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+assignment-manager = { path = "../.." }
+chrono = "0.4"
+tokio = { version = "1", features = ["sync"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "sync"] }

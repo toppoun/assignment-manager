@@ -188,6 +188,20 @@ pub fn query_assignments(
     time: QueryTimeContext,
 ) -> Result<Vec<AssignmentListItem>, PersistenceError> {
     let mut items = load_assignment_list(store)?;
+    filter_sort_assignment_list(&mut items, options, time);
+    Ok(items)
+}
+
+/// Apply the existing query semantics to an already loaded, validated snapshot.
+///
+/// This performs no database reads or clock sampling. Application callers can
+/// derive several projections from the same snapshot without duplicating the
+/// completion, course, deadline or ordering rules.
+pub fn filter_sort_assignment_list(
+    items: &mut Vec<AssignmentListItem>,
+    options: &AssignmentListOptions,
+    time: QueryTimeContext,
+) {
     items.retain(|item| matches_filters(item, options, time));
     items.sort_by(|a, b| {
         let order = match options.sort {
@@ -207,7 +221,6 @@ pub fn query_assignments(
         };
         order.then_with(|| a.id.as_str().cmp(b.id.as_str()))
     });
-    Ok(items)
 }
 
 fn matches_filters(

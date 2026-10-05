@@ -1,93 +1,43 @@
 //! The only OS credential boundary. No network clients, SQL, or public secret DTOs.
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 
-use assignment_manager::moodle_http::{MoodleExportKind, MoodleFeed};
+use assignment_manager_application::credentials::{
+    CredentialStore, SecretText, WebClassCredentials, validate_moodle,
+};
 use keyring_core::{Entry, Error as BackendError, api::CredentialStoreApi};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use zeroize::Zeroizing;
 
-use crate::{error::ApplicationError, settings::MOODLE_SCOPE};
+use crate::error::ApplicationError;
+#[cfg(test)]
+use assignment_manager_application::settings::MOODLE_SCOPE;
 
-/// Deliberately not Serialize or Clone. IPC inputs and loaded secrets redact Debug.
-pub struct SecretText(Zeroizing<String>);
-
-impl SecretText {
-    pub fn new(value: String) -> Self {
-        Self(Zeroizing::new(value))
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SecretText {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[redacted]")
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretText {
+/// Deserialize-only Tauri inputs. Never implement Debug or Serialize for secrets.
+pub struct SecretInput(pub SecretText);
+impl<'de> Deserialize<'de> for SecretInput {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer)
-            .map(Self::new)
+            .map(|value| Self(SecretText::new(value)))
             .map_err(|_| D::Error::custom("invalid secret input"))
     }
 }
 
-#[derive(Debug)]
-pub struct WebClassCredentials {
-    pub university_id: SecretText,
-    pub password: SecretText,
-}
-
-impl<'de> Deserialize<'de> for WebClassCredentials {
+pub struct WebClassCredentialsInput(pub WebClassCredentials);
+impl<'de> Deserialize<'de> for WebClassCredentialsInput {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Input {
-            university_id: SecretText,
-            password: SecretText,
+            university_id: SecretInput,
+            password: SecretInput,
         }
         let input = Input::deserialize(deserializer)
             .map_err(|_| D::Error::custom("invalid WebClass credentials input"))?;
-        Ok(Self {
-            university_id: input.university_id,
-            password: input.password,
-        })
+        Ok(Self(WebClassCredentials {
+            university_id: input.university_id.0,
+            password: input.password.0,
+        }))
     }
-}
-
-impl WebClassCredentials {
-    pub fn validate(&self) -> Result<(), ApplicationError> {
-        if self.university_id.expose().trim().is_empty() || self.password.expose().is_empty() {
-            return Err(ApplicationError::InvalidCredentials);
-        }
-        Ok(())
-    }
-}
-
-pub fn validate_moodle(secret: &SecretText) -> Result<(), ApplicationError> {
-    // Existing constructor validates HTTPS, host and userinfo without making a request.
-    MoodleFeed::new(
-        MOODLE_SCOPE,
-        MoodleExportKind::CourseRelated,
-        secret.expose(),
-    )
-    .map(|_| ())
-    .map_err(|_| ApplicationError::InvalidMoodleFeed)
-}
-
-pub trait CredentialStore {
-    fn load_moodle_feed_secret(&self) -> Result<Option<SecretText>, ApplicationError>;
-    fn save_moodle_feed_secret(&mut self, secret: SecretText) -> Result<(), ApplicationError>;
-    fn delete_moodle_feed_secret(&mut self) -> Result<(), ApplicationError>;
-    fn load_webclass_credentials(&self) -> Result<Option<WebClassCredentials>, ApplicationError>;
-    fn save_webclass_credentials(
-        &mut self,
-        value: WebClassCredentials,
-    ) -> Result<(), ApplicationError>;
-    fn delete_webclass_credentials(&mut self) -> Result<(), ApplicationError>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,12 +84,13 @@ impl<B: SecretBackend> CredentialStore for CredentialVault<B> {
         self.backend
             .read(Record::WebClass)?
             .map(|bytes| {
-                let value: WebClassCredentials = serde_json::from_slice(&bytes)
+                let value = serde_json::from_slice::<WebClassCredentialsInput>(&bytes)
                     .map_err(|_| ApplicationError::CredentialReadFailed)?;
                 value
+                    .0
                     .validate()
                     .map_err(|_| ApplicationError::CredentialReadFailed)?;
-                Ok(value)
+                Ok(value.0)
             })
             .transpose()
     }
@@ -439,15 +390,7 @@ pub mod tests {
     }
 
     #[test]
-    fn debug_and_backend_errors_never_expose_literal_secrets() {
-        let debug = format!(
-            "{:?} {:?}",
-            SecretText::new(URL.into()),
-            credentials(ID, PASSWORD)
-        );
-        for marker in [URL, ID, PASSWORD] {
-            assert!(!debug.contains(marker));
-        }
+    fn backend_errors_never_expose_literal_secrets() {
         for (operation, expected) in [
             (Operation::Read, ApplicationError::CredentialReadFailed),
             (Operation::Write, ApplicationError::CredentialWriteFailed),
@@ -460,7 +403,7 @@ pub mod tests {
             assert_eq!(error, expected);
             let public = format!(
                 "{error} {error:?} {}",
-                serde_json::to_string(&error).unwrap()
+                serde_json::to_string(&crate::error::CommandError::from(error)).unwrap()
             );
             for marker in [URL, ID, PASSWORD] {
                 assert!(!public.contains(marker));
@@ -486,15 +429,18 @@ pub mod tests {
     fn malformed_ipc_credentials_do_not_echo_secret_values_or_field_names() {
         let bad = serde_json::json!({"universityId":ID,"password":PASSWORD, (URL): PASSWORD});
         assert!(bad.get(URL).is_some());
-        let error = serde_json::from_value::<WebClassCredentials>(bad)
-            .unwrap_err()
+        let error = serde_json::from_value::<WebClassCredentialsInput>(bad)
+            .err()
+            .unwrap()
             .to_string();
         for marker in [URL, ID, PASSWORD] {
             assert!(!error.contains(marker));
         }
-        let secret_error = serde_json::from_value::<SecretText>(serde_json::json!({(PASSWORD):ID}))
-            .unwrap_err()
-            .to_string();
+        let secret_error =
+            serde_json::from_value::<SecretInput>(serde_json::json!({(PASSWORD):ID}))
+                .err()
+                .unwrap()
+                .to_string();
         for marker in [URL, ID, PASSWORD] {
             assert!(!secret_error.contains(marker));
         }

@@ -11,20 +11,13 @@ mod dto;
 mod error;
 #[path = "../src/list_query.rs"]
 mod list_query;
+mod network;
 #[path = "../src/settings.rs"]
 mod settings;
-#[path = "../src/settings_worker.rs"]
-mod settings_worker;
 #[path = "../src/storage.rs"]
 mod storage;
-// This executable deliberately substitutes transport; the production adapter is unused here.
-mod network;
-#[allow(dead_code)]
 #[path = "../src/sync_service.rs"]
 mod sync_service;
-#[allow(dead_code)]
-#[path = "../src/sync_worker.rs"]
-mod sync_worker;
 
 use std::path::PathBuf;
 
@@ -131,21 +124,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .path()
                 .app_data_dir()
                 .map_err(|_| error::ApplicationError::DataDirectory);
-            app.manage(storage::DesktopState::start(directory.clone())?);
             let config_directory = app
                 .path()
                 .app_config_dir()
                 .map_err(|_| error::ApplicationError::SettingsReadFailed);
-            let settings = settings_worker::SettingsState::start(
+            app.manage(storage::open_with_backend(
+                directory,
                 config_directory,
                 "io.assignment-manager.settings-smoke",
-            )?;
-            app.manage(sync_worker::SyncState::start_with_backend(
-                directory,
-                settings.clone(),
                 network::SmokeNetwork::new(&network_mode),
             )?);
-            app.manage(settings);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -157,8 +145,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commands::save_webclass_credentials,
             commands::remove_webclass_credentials,
             commands::set_startup_sync,
-            commands::sync_now
+            commands::sync_now,
+            commands::run_startup_sync
         ])
-        .run(context)?;
+        .build(context)?
+        .run(|app, event| storage::handle_exit(app, &event));
     Ok(())
 }

@@ -31,7 +31,6 @@ export function syncButtonState(state) {
 export function createSyncModel(invoke, reloadList, onChange = () => {}) {
   const state = { moodleConfigured: null, webclassConfigured: null, syncOnStartup: false,
     busy: false, results: [], message: "設定状態を確認しています…", error: null };
-  let startupChecked = false;
   const snapshot = () => ({ ...state, results: state.results.map(result => ({ ...result })) });
   const notify = () => onChange(snapshot());
 
@@ -46,9 +45,9 @@ export function createSyncModel(invoke, reloadList, onChange = () => {}) {
     notify();
   }
 
-  async function run() {
+  async function execute(command) {
     if (state.busy) return false;
-    if (syncButtonState(state).disabled) return false;
+    const idleMessage = state.message;
     state.busy = true;
     state.results = [];
     state.error = null;
@@ -56,7 +55,11 @@ export function createSyncModel(invoke, reloadList, onChange = () => {}) {
     notify();
     let reload = false;
     try {
-      const response = await invoke("sync_now");
+      const response = await invoke(command);
+      if (command === "run_startup_sync" && response === null) {
+        state.message = idleMessage;
+        return false;
+      }
       if (response?.status === "already_running") {
         state.message = "同期はすでに実行中です。";
         return false;
@@ -82,11 +85,12 @@ export function createSyncModel(invoke, reloadList, onChange = () => {}) {
     }
   }
 
-  async function startup() {
-    if (startupChecked) return false;
-    startupChecked = true;
-    return state.syncOnStartup ? run() : false;
+  async function run() {
+    if (syncButtonState(state).disabled) return false;
+    return execute("sync_now");
   }
+  // Eligibility and the once guard belong to the application handle, across views.
+  async function startup() { return execute("run_startup_sync"); }
   return { snapshot, configure, run, startup };
 }
 
