@@ -17,3 +17,7 @@ import Testing
 @Test func proxiesShutdownDropAndReopen() async throws {
     try await SmokeChecks().lifetimeAndRefreshFailure()
 }
+
+@Test func foreignTraitsRetainReleaseAndSanitizeCallbackFailures() async throws {
+    try await SmokeChecks().foreignStores()
+}

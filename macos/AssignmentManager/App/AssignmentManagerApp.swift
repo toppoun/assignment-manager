@@ -16,6 +16,9 @@ struct AssignmentManagerApp: App {
         .commands {
             AssignmentCommands(model: delegate.model)
         }
+        Settings {
+            SettingsView(model: delegate.settingsModel)
+        }
     }
 }
 
@@ -34,6 +37,7 @@ struct AssignmentCommands: Commands {
 @MainActor
 final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     let model: AssignmentAppModel
+    let settingsModel: SettingsModel
     private var terminating = false
 
     override init() {
@@ -41,7 +45,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         #if DEBUG
         // UI smoke runs use a temporary directory, never an existing Tauri/user database.
         do {
-            client = RustApplicationClient(database: try NativeStorage.smokeDatabase(arguments: ProcessInfo.processInfo.arguments))
+            if let database = try NativeStorage.smokeDatabase(arguments: ProcessInfo.processInfo.arguments) {
+                let namespace = "org.assignmentmanager.native.smoke." + database.deletingLastPathComponent().lastPathComponent
+                client = RustApplicationClient(database: database,
+                    settings: NativeSettingsStorage(suite: namespace), credentials: NativeKeychain(service: namespace))
+            } else { client = RustApplicationClient() }
         } catch {
             client = RustApplicationClient(startupFailure: SafeApplicationError(error))
         }
@@ -49,11 +57,13 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         client = RustApplicationClient()
         #endif
         model = AssignmentAppModel(client: client)
+        settingsModel = SettingsModel(client: client)
         super.init()
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if !terminating {
             terminating = true
+            settingsModel.clearInputs()
             Task {
                 await model.shutdown()
                 sender.reply(toApplicationShouldTerminate: true)

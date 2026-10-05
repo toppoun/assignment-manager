@@ -1,5 +1,7 @@
 // !$*UTF8*$!
 { archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+B16F1F36AE1237C16FEC1011 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Views/SettingsView.swift"; sourceTree = "<group>"; };
+B16F1F36AE1237C16FEC1012 = { isa = PBXBuildFile; fileRef = B16F1F36AE1237C16FEC1011; };
 7686C7DB9B489347A59DA3F5 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/AssignmentManagerApp.swift"; sourceTree = "<group>"; };
 F3AE9B9F1DD624C9D7224D2A = { isa = PBXBuildFile; fileRef = 7686C7DB9B489347A59DA3F5; };
 FD50DD6C45F9A04EB9863A76 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Views/AssignmentShell.swift"; sourceTree = "<group>"; };
@@ -10,9 +12,9 @@ C61CA5E6A44A300F14F4A440 = { isa = PBXFileReference; lastKnownFileType = sourcec
 B7F59CD1012934A4D3E475CB = { isa = PBXBuildFile; fileRef = 3B2FDF0EFB519A84C12A6916; };
 59BD0A3FF43B32849B319E64 = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Resources/Info.plist; sourceTree = "<group>"; };
 38A007151ABE87CC01A5B6E9 = { isa = PBXFileReference; explicitFileType = wrapper.application; path = "Assignment Manager.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-DC76E9F0C0006E8F919E0C51 = { isa = PBXGroup; children = (7686C7DB9B489347A59DA3F5,FD50DD6C45F9A04EB9863A76,C61CA5E6A44A300F14F4A440,3B2FDF0EFB519A84C12A6916, 59BD0A3FF43B32849B319E64, FBDC4F23F93125BBEEAE800C); sourceTree = "<group>"; };
+DC76E9F0C0006E8F919E0C51 = { isa = PBXGroup; children = (B16F1F36AE1237C16FEC1011,7686C7DB9B489347A59DA3F5,FD50DD6C45F9A04EB9863A76,C61CA5E6A44A300F14F4A440,3B2FDF0EFB519A84C12A6916, 59BD0A3FF43B32849B319E64, FBDC4F23F93125BBEEAE800C); sourceTree = "<group>"; };
 FBDC4F23F93125BBEEAE800C = { isa = PBXGroup; children = (38A007151ABE87CC01A5B6E9); name = Products; sourceTree = "<group>"; };
-BCE16DD0260827ECF338C787 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (F3AE9B9F1DD624C9D7224D2A,126DAD63782DEACA5131A4C4,19CDD8EBC54F67CD04A7ADFB,B7F59CD1012934A4D3E475CB); runOnlyForDeploymentPostprocessing = 0; };
+BCE16DD0260827ECF338C787 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B16F1F36AE1237C16FEC1012,F3AE9B9F1DD624C9D7224D2A,126DAD63782DEACA5131A4C4,19CDD8EBC54F67CD04A7ADFB,B7F59CD1012934A4D3E475CB); runOnlyForDeploymentPostprocessing = 0; };
 7561BFB015D8F536760CB671 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (1C2ED28A3BCBAE5D763936A4); runOnlyForDeploymentPostprocessing = 0; };
 0189424A5A60FED329FA868E = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 582681C2EAE02B3F3D399C0C = { isa = XCLocalSwiftPackageReference; relativePath = .; };

@@ -103,10 +103,10 @@ func snapshot(_ items: [AssignmentDto] = [assignment()], courses: [CourseDto] = 
     for (error, expected) in [(BridgeError.DataDirectory, SafeApplicationError.dataDirectory),
         (.DatabaseStartup, .databaseStartup), (.Storage, .storage), (.NotFound, .notFound),
         (.InvalidAssignmentId, .invalidAssignment), (.InvalidQuery, .invalidQuery), (.Busy, .busy),
-        (.Unavailable, .unavailable), (.CredentialUnavailable, .configuration), (.CredentialReadFailed, .configuration),
-        (.CredentialWriteFailed, .configuration), (.CredentialDeleteFailed, .configuration),
-        (.SettingsReadFailed, .configuration), (.SettingsWriteFailed, .configuration),
-        (.InvalidMoodleFeed, .configuration), (.InvalidCredentials, .configuration)] {
+        (.Unavailable, .unavailable), (.CredentialUnavailable, .credentialUnavailable), (.CredentialReadFailed, .credentialRead),
+        (.CredentialWriteFailed, .credentialWrite), (.CredentialDeleteFailed, .credentialDelete),
+        (.SettingsReadFailed, .settingsRead), (.SettingsWriteFailed, .settingsWrite),
+        (.InvalidMoodleFeed, .invalidMoodle), (.InvalidCredentials, .invalidCredentials)] {
         #expect(SafeApplicationError(error) == expected)
         #expect(!SafeApplicationError(error).message.isEmpty)
     }

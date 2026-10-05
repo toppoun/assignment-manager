@@ -40,28 +40,42 @@ public enum NativeStorage {
 }
 
 /// One application-lifetime actor owns the generated proxy. No blocking FFI on MainActor.
-public actor RustApplicationClient: ApplicationClient {
+public actor RustApplicationClient: ApplicationClient, SettingsClient {
     private let databaseOverride: URL?
     private let startupFailure: SafeApplicationError?
     private var application: MacApplication?
     private var opening: Task<MacApplication, any Error>?
     private var closed = false
+    private let settingsStore: (any NativeSettingsStore)?
+    private let credentialStore: (any NativeCredentialStore)?
 
     // Injection is for isolated tests. The shipping App uses the native storage resolver.
-    public init(database: URL? = nil, startupFailure: SafeApplicationError? = nil) {
+    public init(database: URL? = nil, startupFailure: SafeApplicationError? = nil,
+                settings: (any NativeSettingsStore)? = nil, credentials: (any NativeCredentialStore)? = nil) {
         databaseOverride = database; self.startupFailure = startupFailure
+        // Explicit database-only injection retains the offline BridgeSmoke path.
+        // The shipping app and Settings tests supply both native ports.
+        settingsStore = settings ?? (database == nil ? NativeSettingsStorage() : nil)
+        credentialStore = credentials ?? (database == nil ? NativeKeychain() : nil)
     }
 
     public func open() async throws {
         guard !closed else { throw SafeApplicationError.unavailable }
         if let startupFailure { throw startupFailure }
+        guard (settingsStore == nil) == (credentialStore == nil) else { throw SafeApplicationError.configuration }
         if application != nil { return }
         let task: Task<MacApplication, any Error>
         if let opening { task = opening }
         else {
             let override = databaseOverride
+            let settings = settingsStore
+            let credentials = credentialStore
             task = Task {
                 let database = try override ?? NativeStorage.databaseURL()
+                if let settings, let credentials {
+                    return try await MacApplication.openWithNativeStores(databasePath: database.path,
+                        settings: settings, credentials: credentials)
+                }
                 return try await MacApplication.open(databasePath: database.path)
             }
             opening = task
@@ -94,5 +108,34 @@ public actor RustApplicationClient: ApplicationClient {
         else { proxy = nil }
         try? await proxy?.shutdown()
         application = nil; opening = nil
+    }
+
+    private func settingsApplication() throws -> MacApplication {
+        guard let application, !closed else { throw SafeApplicationError.unavailable }
+        return application
+    }
+    public func settingsStatus() async throws -> SettingsSnapshot {
+        do { return SettingsSnapshot(try await settingsApplication().getSettingsStatus()) }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func saveMoodle(calendarURL: String) async throws {
+        do { try await settingsApplication().saveMoodleConfig(calendarUrl: calendarURL) }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func removeMoodle() async throws {
+        do { try await settingsApplication().removeMoodleConfig() }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func saveWebClass(universityID: String, password: String) async throws {
+        do { try await settingsApplication().saveWebclassCredentials(universityId: universityID, password: password) }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func removeWebClass() async throws {
+        do { try await settingsApplication().removeWebclassCredentials() }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func setSyncOnStartup(_ enabled: Bool) async throws {
+        do { try await settingsApplication().setSyncOnStartup(enabled: enabled) }
+        catch { throw SafeApplicationError(error) }
     }
 }

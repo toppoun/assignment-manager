@@ -7,7 +7,11 @@ Swift向けにshared application/coreの公開contractを変更しません。
 詳細なarchitecture、公式仕様の確認、再現手順、generated file方針、Swift smokeは
 [macos/BridgeSmoke](../../macos/BridgeSmoke/README.md)を参照してください。
 
-settings/credential adaptersはprivate PoC専用です。Settings/Keychain/Sync APIはexportしません。
+Phase 10C1でSettings operationsとNativeSettingsStore/NativeCredentialStore foreign traitsを追加しました。
+Swift native Keychainをshared CredentialStoreへ接続し、validation/revisionはapplicationへ委譲します。
+Settings read modelはbooleanのみ。network Sync APIはexportしません。
+詳細は[Phase 10C1 report](../../macos/AssignmentManager/PHASE-10C1.md)を参照してください。
+既存open(database_path)はKeychainを使わないoffline regression用constructorとして維持しています。
 `examples/prepare-smoke.rs`は一時DB専用helperで、production libraryの公開APIではありません。
 
 Phase 10Bの[SwiftUI shell](../../macos/AssignmentManager/README.md)も同じbridgeを利用します。

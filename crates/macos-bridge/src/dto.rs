@@ -222,3 +222,19 @@ impl From<QueryOptions> for query::AssignmentQuery {
         }
     }
 }
+/// Safe Settings projection; never carries saved inputs or credential revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SettingsStatusDto {
+    pub moodle_configured: bool,
+    pub webclass_configured: bool,
+    pub sync_on_startup: bool,
+}
+impl From<assignment_manager_application::settings::SettingsStatus> for SettingsStatusDto {
+    fn from(value: assignment_manager_application::settings::SettingsStatus) -> Self {
+        Self {
+            moodle_configured: value.moodle_configured,
+            webclass_configured: value.webclass_configured,
+            sync_on_startup: value.sync_on_startup,
+        }
+    }
+}

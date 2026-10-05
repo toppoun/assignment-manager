@@ -14,6 +14,8 @@ struct BridgeSmoke {
             print("PASS typed safe errors")
             try await checks.lifetimeAndRefreshFailure()
             print("PASS proxy lifetime / shutdown rejection / commit survives refresh failure and reopen")
+            try await checks.foreignStores()
+            print("PASS foreign stores / safe callback failure / worker thread / lifetime")
             print("PASS bridge operations ran off the main thread")
         } catch {
             // Unexpected errors may carry Rust panic/platform details: never print the cause.

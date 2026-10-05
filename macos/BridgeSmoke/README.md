@@ -279,3 +279,10 @@ Phase 10C: macOS Settings/native Keychain/Sync — Moodle config、WebClass cred
 
 その後: academic term filter、source submission state、timetable、WidgetKit。
 このPoC自体にはUIを追加しません。
+## Phase 10C1 foreign trait regression
+
+Swift→Rust→Swift NativeCredentialStore/NativeSettingsStore callbackを追加し、5 testsとCLI smokeが通過しました。
+callbackは共有settings worker上で実行し、MainActor外であること、Rust側でのretainとshutdown後のrelease、
+未知callback errorのCredentialWriteFailedへのsafe変換、configured status / shared defaultを確認します。
+memory storesのみを使い、OS Keychainや大学networkへアクセスしません。
+[Phase 10C1 report](../AssignmentManager/PHASE-10C1.md)にarchitectureと現在の検証状況を記載しています。

@@ -1,4 +1,10 @@
-# Phase 10B: macOS native SwiftUI shell
+# macOS native SwiftUI shell
+
+Phase 10C1でnative Settings scene / Swift Security.framework Keychain / syncOnStartup preferencesを接続しました。
+現在のarchitecture、変更file、検証結果、残るmanual smokeは[Phase 10C1 report](PHASE-10C1.md)を参照してください。
+network syncはPhase 10C2で、まだ接続していません。
+
+以下はPhase 10B時点のAssignment shell実装・検証記録です。
 
 Apple Silicon用の正式なmacOS application targetです。ローカルAssignment一覧、
 completion/deadline/Course filter、sort、completion toggleを提供します。

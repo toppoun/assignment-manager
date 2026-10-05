@@ -1,14 +1,22 @@
 //! Thin macOS transport boundary. Workers, storage and policy belong to application/core.
-//! No handwritten FFI, OS paths, settings, sync or credential exports.
+//! No handwritten FFI or OS API implementations. Native sync is not exported yet.
 
 mod dto;
 mod error;
+mod native_ports;
 mod ports;
 
 pub use dto::*;
 pub use error::BridgeError;
+pub use native_ports::{
+    CredentialEntry, NativeCredentialStore, NativeSettingsStore, NativeStoreError,
+};
 
-use assignment_manager_application::{ApplicationHandle, query::AssignmentQuery};
+use assignment_manager_application::{
+    ApplicationHandle,
+    credentials::{SecretText, WebClassCredentials},
+    query::AssignmentQuery,
+};
 use std::{path::PathBuf, sync::Arc};
 
 uniffi::setup_scaffolding!();
@@ -22,6 +30,72 @@ pub struct MacApplication {
 
 #[uniffi::export]
 impl MacApplication {
+    #[uniffi::constructor]
+    pub async fn open_with_native_stores(
+        database_path: String,
+        settings: Arc<dyn NativeSettingsStore>,
+        credentials: Arc<dyn NativeCredentialStore>,
+    ) -> Result<Arc<Self>, BridgeError> {
+        let application = ApplicationHandle::open(Ok(PathBuf::from(database_path)), move || {
+            Ok((
+                native_ports::NativeSettings(settings),
+                native_ports::NativeCredentials(credentials),
+            ))
+        })?;
+        if let Err(error) = application
+            .query_assignments(AssignmentQuery::default())
+            .await
+        {
+            application.shutdown().await;
+            return Err(error.into());
+        }
+        Ok(Arc::new(Self { application }))
+    }
+
+    pub async fn get_settings_status(&self) -> Result<SettingsStatusDto, BridgeError> {
+        self.application
+            .get_settings_status()
+            .await
+            .map(Into::into)
+            .map_err(Into::into)
+    }
+    pub async fn save_moodle_config(&self, calendar_url: String) -> Result<(), BridgeError> {
+        self.application
+            .save_moodle_config(SecretText::new(calendar_url))
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn remove_moodle_config(&self) -> Result<(), BridgeError> {
+        self.application
+            .remove_moodle_config()
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn save_webclass_credentials(
+        &self,
+        university_id: String,
+        password: String,
+    ) -> Result<(), BridgeError> {
+        self.application
+            .save_webclass_credentials(WebClassCredentials {
+                university_id: SecretText::new(university_id),
+                password: SecretText::new(password),
+            })
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn remove_webclass_credentials(&self) -> Result<(), BridgeError> {
+        self.application
+            .remove_webclass_credentials()
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn set_sync_on_startup(&self, enabled: bool) -> Result<(), BridgeError> {
+        self.application
+            .set_sync_on_startup(enabled)
+            .await
+            .map_err(Into::into)
+    }
     /// The native shell supplies an absolute database path. Validate worker initialization
     /// before returning a usable proxy; shared ApplicationHandle::open remains unchanged.
     #[uniffi::constructor]

@@ -30,6 +30,14 @@ mod tests {
         service.save_moodle(SecretText::new(URL.into())).unwrap();
         service.save_webclass(credentials(ID, PASSWORD)).unwrap();
         assert_eq!(service.load_webclass().unwrap().0, 1);
+        service
+            .save_webclass(credentials("replacement-id", "replacement-pass"))
+            .unwrap();
+        assert_eq!(service.load_webclass().unwrap().0, 2);
+        let (_, saved) = service.load_webclass().unwrap();
+        let saved = saved.unwrap();
+        assert_eq!(saved.university_id.expose(), "replacement-id");
+        assert_eq!(saved.password.expose(), "replacement-pass");
         assert!(service.status().unwrap().moodle_configured);
         assert!(service.status().unwrap().webclass_configured);
         service.credentials.failure = Some(ApplicationError::CredentialWriteFailed);
@@ -38,21 +46,24 @@ mod tests {
             Err(ApplicationError::CredentialWriteFailed)
         );
         service.credentials.failure = None;
-        assert_eq!(service.load_webclass().unwrap().0, 1);
+        assert_eq!(service.load_webclass().unwrap().0, 2);
+        let saved = service.load_webclass().unwrap().1.unwrap();
+        assert_eq!(saved.university_id.expose(), "replacement-id");
+        assert_eq!(saved.password.expose(), "replacement-pass");
         assert_eq!(
             service.save_webclass(credentials("", PASSWORD)),
             Err(ApplicationError::InvalidCredentials)
         );
-        assert_eq!(service.load_webclass().unwrap().0, 1);
+        assert_eq!(service.load_webclass().unwrap().0, 2);
         service.credentials.failure = Some(ApplicationError::CredentialDeleteFailed);
         assert_eq!(
             service.remove_webclass(),
             Err(ApplicationError::CredentialDeleteFailed)
         );
         service.credentials.failure = None;
-        assert_eq!(service.load_webclass().unwrap().0, 1);
-        service.remove_webclass().unwrap();
         assert_eq!(service.load_webclass().unwrap().0, 2);
+        service.remove_webclass().unwrap();
+        assert_eq!(service.load_webclass().unwrap().0, 3);
         assert!(!service.status().unwrap().webclass_configured);
         service.remove_moodle().unwrap();
         assert!(!service.status().unwrap().moodle_configured);
@@ -107,6 +118,48 @@ mod tests {
             service.status(),
             Err(ApplicationError::CredentialReadFailed)
         );
+    }
+
+    #[test]
+    fn moodle_replacement_failure_and_missing_delete_preserve_shared_contract() {
+        let mut service = SettingsService::new(Settings::default(), fake());
+        service.remove_moodle().unwrap();
+        assert!(!service.status().unwrap().moodle_configured);
+        service.save_moodle(SecretText::new(URL.into())).unwrap();
+        let replacement = format!("{URL}_replacement");
+        service
+            .save_moodle(SecretText::new(replacement.clone()))
+            .unwrap();
+        assert_eq!(
+            service.load_moodle().unwrap().unwrap().expose(),
+            replacement
+        );
+        service.credentials.failure = Some(ApplicationError::CredentialWriteFailed);
+        assert_eq!(
+            service.save_moodle(SecretText::new(URL.into())),
+            Err(ApplicationError::CredentialWriteFailed)
+        );
+        service.credentials.failure = None;
+        assert_eq!(
+            service.load_moodle().unwrap().unwrap().expose(),
+            replacement
+        );
+        // Replacing a token cannot replace the logical scope or export kind.
+        assert_eq!(MOODLE_SCOPE, "default.course-related");
+        let feed = assignment_manager::moodle_http::MoodleFeed::new(
+            MOODLE_SCOPE,
+            assignment_manager::moodle_http::MoodleExportKind::CourseRelated,
+            service.load_moodle().unwrap().unwrap().expose(),
+        )
+        .unwrap();
+        assert_eq!(feed.scope(), MOODLE_SCOPE);
+        assert_eq!(
+            feed.export_kind(),
+            assignment_manager::moodle_http::MoodleExportKind::CourseRelated
+        );
+        service.remove_moodle().unwrap();
+        service.remove_moodle().unwrap();
+        assert!(!service.status().unwrap().moodle_configured);
     }
 }
 
