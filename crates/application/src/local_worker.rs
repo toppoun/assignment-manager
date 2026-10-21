@@ -27,6 +27,7 @@ enum Request {
         Reply<AssignmentListResponse>,
     ),
     Toggle(String, Reply<CompletionState>),
+    SetCompletion(String, CompletionState, Reply<CompletionState>),
 }
 
 pub(crate) struct LocalWorker {
@@ -77,6 +78,13 @@ impl LocalWorker {
                             // Commit acknowledgement only. A later refresh is a separate operation.
                             let _ = reply.send(result);
                         }
+                        Request::SetCompletion(id, desired, reply) => {
+                            let result = store.as_mut().map_err(|e| *e).and_then(|store| {
+                                store.set_completion(&AssignmentId::new(id), desired)?;
+                                Ok(desired)
+                            });
+                            let _ = reply.send(result);
+                        }
                     }
                 }
             })
@@ -98,6 +106,18 @@ impl LocalWorker {
         }
         let (reply, response) = oneshot::channel();
         self.send(Request::Toggle(id, reply))?;
+        Ok(response)
+    }
+    pub fn set_completion(
+        &self,
+        id: String,
+        desired: CompletionState,
+    ) -> Result<Response<CompletionState>, ApplicationError> {
+        if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            return Err(ApplicationError::InvalidAssignmentId);
+        }
+        let (reply, response) = oneshot::channel();
+        self.send(Request::SetCompletion(id, desired, reply))?;
         Ok(response)
     }
     fn send(&self, request: Request) -> Result<(), ApplicationError> {

@@ -1,5 +1,7 @@
 import { clearSecretInputs, configuredPresentation, createSettingsModel } from "./settings.js";
 
+import { invokeTauri } from "./tauri_api.js";
+
 const listView = document.querySelector("#list-view");
 const settingsView = document.querySelector("#settings-view");
 const listButton = document.querySelector("#show-list");
@@ -18,7 +20,7 @@ const sources = {
   webclass: { status: document.querySelector("#webclass-status"), save: document.querySelector("#webclass-save"), remove: document.querySelector("#webclass-remove"), inputs: webclassInputs },
 };
 let pendingFocus = null;
-const model = createSettingsModel((command, arguments_) => window.__TAURI__.core.invoke(command, arguments_), render);
+const model = createSettingsModel(invokeTauri, render);
 export const settingsModel = model;
 
 function render(state) {

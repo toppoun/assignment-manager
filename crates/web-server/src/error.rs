@@ -16,6 +16,8 @@ pub enum WebError {
     CrossOrigin,
     NotFound,
     MethodNotAllowed,
+    UnsupportedMediaType,
+    PayloadTooLarge,
     Busy,
     Unavailable,
     Internal,
@@ -30,6 +32,8 @@ impl WebError {
             Self::CrossOrigin => "cross_origin",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::PayloadTooLarge => "payload_too_large",
             Self::Busy => "busy",
             Self::Unavailable => "unavailable",
             Self::Internal => "internal_error",
@@ -44,6 +48,8 @@ impl WebError {
             Self::CrossOrigin => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Busy | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -54,6 +60,8 @@ impl From<ApplicationError> for WebError {
     fn from(value: ApplicationError) -> Self {
         match value {
             ApplicationError::InvalidQuery => Self::InvalidQuery,
+            ApplicationError::InvalidAssignmentId => Self::InvalidRequest,
+            ApplicationError::NotFound => Self::NotFound,
             ApplicationError::Busy => Self::Busy,
             ApplicationError::Unavailable => Self::Unavailable,
             _ => Self::Internal,

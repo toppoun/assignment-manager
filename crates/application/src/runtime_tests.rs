@@ -168,6 +168,12 @@ fn single_flight_network_wait_keeps_query_toggle_available_and_completion_surviv
             block_on(local.toggle_completion(id.clone())).unwrap(),
             CompletionState::Completed
         );
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(local.set_completion(id.clone(), CompletionState::Completed)).unwrap(),
+                CompletionState::Completed
+            );
+        }
         reply.send(id).unwrap();
     });
     let id = response.recv_timeout(Duration::from_secs(5)).unwrap(); // network still paused
@@ -408,6 +414,79 @@ fn toggle_acknowledges_commit_independently_of_later_invalid_query_and_shutdown(
             .completion,
         CompletionState::Completed
     );
+}
+
+#[test]
+fn explicit_set_survives_lost_reply_and_restart_and_keeps_desktop_toggle() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("set.db");
+    let mut store = SqliteStore::open(&path).unwrap();
+    let id = store
+        .create_manual_assignment(ManualAssignmentInput {
+            title: "synthetic set".into(),
+            deadline: None,
+            course_id: None,
+            submission: SubmissionTarget::Unknown,
+            submission_url: None,
+        })
+        .unwrap()
+        .id;
+    drop(store);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = ApplicationHandle::open_with_backend(
+        Ok(path.clone()),
+        || Ok((MemorySettings::default(), configured())),
+        CountingNetwork(Arc::clone(&calls)),
+    )
+    .unwrap();
+    let lost = app
+        .admit(|w| {
+            w.local
+                .set_completion(id.as_str().into(), CompletionState::Completed)
+        })
+        .unwrap();
+    drop(lost);
+    for _ in 0..2 {
+        assert_eq!(
+            block_on(app.set_completion(id.as_str().into(), CompletionState::Completed)).unwrap(),
+            CompletionState::Completed
+        );
+    }
+    assert_eq!(
+        block_on(app.query_assignments(all())).unwrap().items[0].completion,
+        CompletionState::Completed
+    );
+    for invalid in ["", " ", "\0"] {
+        assert_eq!(
+            block_on(app.set_completion(invalid.into(), CompletionState::Completed)),
+            Err(ApplicationError::InvalidAssignmentId)
+        );
+    }
+    assert_eq!(
+        block_on(app.set_completion("absent".into(), CompletionState::Completed)),
+        Err(ApplicationError::NotFound)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0); // Local set never runs the network backend.
+    block_on(app.shutdown());
+    assert_eq!(
+        block_on(app.set_completion(id.as_str().into(), CompletionState::Incomplete)),
+        Err(ApplicationError::Unavailable)
+    );
+    let app =
+        ApplicationHandle::open(Ok(path), || Ok((MemorySettings::default(), fake()))).unwrap();
+    assert_eq!(
+        block_on(app.query_assignments(all())).unwrap().items[0].completion,
+        CompletionState::Completed
+    );
+    assert_eq!(
+        block_on(app.toggle_completion(id.as_str().into())).unwrap(),
+        CompletionState::Incomplete
+    );
+    assert_eq!(
+        block_on(app.set_completion(id.as_str().into(), CompletionState::Incomplete)).unwrap(),
+        CompletionState::Incomplete
+    );
+    block_on(app.shutdown());
 }
 
 #[test]

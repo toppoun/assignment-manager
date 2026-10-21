@@ -39,6 +39,10 @@ admitted operation, reset single-flight early, or undo a DB commit.
   Transport clients must not supply raw clock/calendar fields. The original query
   API retains its local-worker `Local::now()` behavior for desktop consumers.
 - `toggle_completion(internal_id)` -> committed `CompletionState`
+- `set_completion(internal_id, desired: CompletionState)` -> committed `CompletionState`.
+  Explicit set on the local worker calls `SqliteStore::set_completion` directly;
+  identical state preserves `updated_at`. It never emulates set through read/toggle.
+  Missing IDs return `NotFound`; invalid IDs return `InvalidAssignmentId`.
 - `get_settings_status()` -> configured flags and startup setting only
 - save/remove Moodle configuration and WebClass credentials
 - `set_sync_on_startup(bool)`
@@ -66,6 +70,10 @@ Transport adapters define wire tags, date serialization and localized error mess
 
 `toggle_completion` acknowledges the committed state only. If a later list refresh
 fails, the toggle remains successful; callers must not retry it as a failed write.
+`set_completion` likewise acknowledges commit independently of a later read. Losing
+its response does not undo the operation. HTTP consumers can repeat the same desired
+state safely and reconcile with a fresh query. Desktop toggle and source sync's
+user-owned completion contract remain unchanged; no schema migration is involved.
 
 Sources run independently. `Completed` means the run ended, not universal success.
 `Failed` does **not** mean unchanged DB: earlier WebClass groups may be committed.

@@ -50,9 +50,23 @@ enum DeadlineDto {
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
-enum CompletionDto {
+pub(crate) enum CompletionDto {
     Incomplete,
     Completed,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CompletionResponse {
+    pub id: String,
+    pub completion: CompletionDto,
+}
+impl From<CompletionState> for CompletionDto {
+    fn from(value: CompletionState) -> Self {
+        match value {
+            CompletionState::Incomplete => Self::Incomplete,
+            CompletionState::Completed => Self::Completed,
+        }
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]

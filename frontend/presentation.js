@@ -52,13 +52,16 @@ export function emptyState(response) {
   return null;
 }
 
-export function deadlineLabel(deadline) {
+export function deadlineLabel(deadline, timeZone) {
   switch (deadline.kind) {
     case "date_only":
       // Format only; never turn a calendar date into an instant or evaluate it.
       return `締切: ${deadline.value.replace(/^([+-]?\d+)-(\d{2})-(\d{2})$/, "$1/$2/$3")}（日付のみ）`;
     case "date_time":
-      return `締切: ${dateTimeFormat.format(new Date(deadline.value))}（日時）`;
+      return `締切: ${(timeZone ? new Intl.DateTimeFormat("ja-JP", {
+        year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+        timeZone, timeZoneName: "short", hourCycle: "h23",
+      }) : dateTimeFormat).format(new Date(deadline.value))}（日時）`;
     case "none":
       return "期限なし";
     default:
@@ -115,6 +118,10 @@ export function safeErrorMessage(error) {
     invalid_credentials: "大学IDとpasswordの両方を入力してください。",
     busy: "処理が混み合っています。少し待って再試行してください。",
     unavailable: "アプリの処理を実行できませんでした。再起動してください。",
+    network_failed: "通信できませんでした。serverの起動状態を確認してください。",
+    response_invalid: "serverの応答を確認できませんでした。",
+    cross_origin: "同一originからの要求だけを受け付けます。",
+    internal_error: "保存データの処理を完了できませんでした。",
   };
   return Object.hasOwn(messages, error?.code)
     ? messages[error.code]
@@ -126,6 +133,7 @@ export function operationErrorMessage(operation, error) {
     query: "一覧の取得に失敗しました。",
     toggle: "完了状態を変更できませんでした。",
     refresh_after_toggle: "完了状態は保存しましたが、一覧を更新できませんでした。再読み込みしてください。",
+    completion_unknown: "保存結果が不明です。保存されている可能性があります。状態を確認するため再読み込みしてください。",
   };
   return `${prefixes[operation]} ${safeErrorMessage(error)}`;
 }

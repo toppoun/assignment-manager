@@ -141,6 +141,15 @@ impl ApplicationHandle {
     pub async fn toggle_completion(&self, id: String) -> Result<CompletionState, ApplicationError> {
         receive(self.admit(|w| w.local.toggle(id))?).await
     }
+    /// Explicit, idempotent state setting. Acknowledges the SQLite commit only;
+    /// dropping the reply does not cancel an admitted operation. Desktop toggle stays separate.
+    pub async fn set_completion(
+        &self,
+        id: String,
+        desired: CompletionState,
+    ) -> Result<CompletionState, ApplicationError> {
+        receive(self.admit(|w| w.local.set_completion(id, desired))?).await
+    }
     pub async fn get_settings_status(&self) -> Result<SettingsStatus, ApplicationError> {
         receive(self.admit(|w| w.settings.status())?).await
     }

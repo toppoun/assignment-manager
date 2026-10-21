@@ -71,6 +71,21 @@ impl PocState {
     pub(crate) fn accepting(&self) -> bool {
         self.0.accepting.load(Ordering::Acquire)
     }
+    pub(crate) async fn set_completion(
+        &self,
+        id: String,
+        desired: assignment_manager::domain::CompletionState,
+    ) -> Result<crate::dto::CompletionResponse, WebError> {
+        let completion = self
+            .0
+            .application
+            .set_completion(id.clone(), desired)
+            .await?;
+        Ok(crate::dto::CompletionResponse {
+            id,
+            completion: completion.into(),
+        })
+    }
     /// Close HTTP admission, while requests already admitted may still finish.
     pub fn begin_shutdown(&self) {
         self.0.accepting.store(false, Ordering::Release);

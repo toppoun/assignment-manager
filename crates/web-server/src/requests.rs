@@ -3,6 +3,27 @@ use crate::WebError;
 use assignment_manager_application::query as app;
 use serde::Deserialize;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompletionRequest {
+    pub completion: DesiredCompletion,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesiredCompletion {
+    Incomplete,
+    Completed,
+}
+impl From<DesiredCompletion> for assignment_manager::domain::CompletionState {
+    fn from(value: DesiredCompletion) -> Self {
+        match value {
+            DesiredCompletion::Incomplete => Self::Incomplete,
+            DesiredCompletion::Completed => Self::Completed,
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ListRequest {

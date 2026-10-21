@@ -1,5 +1,6 @@
 //! Unauthenticated, synthetic-data-only, IPv4 loopback HTTP PoC.
 #![forbid(unsafe_code)]
+mod assets;
 mod dto;
 mod error;
 pub mod poc;

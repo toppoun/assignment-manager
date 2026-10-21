@@ -1,8 +1,9 @@
-# Web-1 local HTTP PoC
+# Web-2 local Browser UI + HTTP PoC
 
 既存shared applicationを利用する、合成データ専用・未認証のHTTP PoCです。
 **127.0.0.1:3000だけにlistenします。外部公開、reverse proxy、tunnel接続は行わないでください。**
-Web-2のHTML接続、完了変更API、認証、大学同期、PWAは含みません。
+同一originのvanilla HTML/CSS/JavaScriptで一覧・filter/sort・完了変更を利用できます。
+認証、credential保管、大学同期、公開運用、PWAは含みません。
 
 ## 起動
 
@@ -16,7 +17,12 @@ cargo run --manifest-path crates/web-server/Cargo.toml --locked
 CLI引数は受け付けません。host/bind/DBの選択や環境変数によるpublic bindはありません。
 port 3000が使用中なら固定code `unavailable` で終了します。
 
-Browserで次を開くとJSONを確認できます:
+Browser UI:
+
+[http://127.0.0.1:3000/](http://127.0.0.1:3000/)
+
+画面には「合成データを使ったローカルデモ」と表示し、Settings/Sync操作はありません。
+JSONも確認できます:
 
 [http://127.0.0.1:3000/api/v1/assignments](http://127.0.0.1:3000/api/v1/assignments)
 
@@ -70,13 +76,14 @@ foreign directory、marker不整合、symlink/reparse point、壊れたDBは安�
 再起動で保持します。締切は2026-10-21〜29付近の固定合成日付なので、実行日によりbadgeが変わります。
 synthetic submission URLとsource markerはDBにだけ存在し、JSONには返しません。
 
-再起動smokeはcompletion=allのJSONを取得→Ctrl+C→同じcommandで起動→再取得し、
-items/coursesのIDと件数が変わらないことを確認します。DBを選ぶHTTP/CLI機能はありません。
+Browserのcheckboxで変更→reload→Ctrl+C→同じcommandで起動→完了済みfilterで、
+状態とitems/coursesのID・件数が保持されることを確認できます。DBを選ぶHTTP/CLI機能はありません。
 
 ## API contract
 
-GET /api/v1/assignmentsとGET /health/liveだけです。他pathは404、GET以外は405です。
-request bodyは受け付けず、JSON bodyの不正入力も固定400 invalid_requestになります。
+GET /api/v1/assignments、GET /health/live、PUT /api/v1/assignments/{id}/completionです。
+GETはrequest bodyを受け付けません。completion routeのGET等は固定405です。
+static allowlist以外のpathは固定404で、HTTP toggle/settings/sync endpointはありません。
 
 | Query | 許可値 | 省略時 |
 | --- | --- | --- |
@@ -98,18 +105,66 @@ source identity、raw submission URL、credential、DB pathは返しません。
 errorは `{"error":{"code":"invalid_query"}}` 等の固定codeだけです。
 busy/unavailableは503 + Retry-After、内部storage失敗は500です。
 
+### Completion PUT
+
+```http
+PUT /api/v1/assignments/{id}/completion
+Origin: http://127.0.0.1:3000
+Content-Type: application/json
+X-Assignment-Manager: web-2
+
+{"completion":"completed"}
+```
+
+`incomplete`も指定できます。成功は200 + `{"id":"…","completion":"completed"}`。
+coreの明示setを呼び、SQLite commit後に応答します。同状態の再PUTは反転せずupdated_atも不変です。
+unknown field/重複field/不正JSON/不正値/空白・制御文字等の不正IDは400、存在しないIDは404、
+Content-Type不正は415、1024 bytes超のbodyは413です。Content-Lengthのないbodyにも上限を適用します。
+JSONはapplication/json、任意の`; charset=utf-8`だけを許可します。
+
+PowerShellでの合成データ操作例:
+
+```powershell
+$base = 'http://127.0.0.1:3000'
+$snapshot = Invoke-RestMethod "$base/api/v1/assignments?completion=all"
+$id = [uri]::EscapeDataString($snapshot.items[0].id)
+$headers = @{ Origin = $base; 'X-Assignment-Manager' = 'web-2' }
+Invoke-RestMethod "$base/api/v1/assignments/$id/completion" -Method Put `
+    -ContentType 'application/json' -Headers $headers -Body '{"completion":"completed"}'
+```
+
+PUTには実Hostと完全一致するOriginと専用headerが必須です。
+Fetch Metadataがある場合、Sec-Fetch-Siteはsame-originだけ、Sec-Fetch-Modeはsame-origin/corsだけを許可します。
+CLIはFetch Metadataを省略できますが、Origin・専用header・JSONは必須です。
+これらは未認証loopback PoC向けのCSRF対策で、本番の認証・authorizationの代替にはなりません。
+
+### Static frontend
+
+`/`→frontend/web.html、styles.css、web_app.js、http_api.js、list_view.js、list_tasks.js、presentation.js
+だけをinclude_bytes!で埋め込みます。favicon.icoは204です。runtime filesystem readやdirectory listingはありません。
+Tauri entrypoint/settings/sync、DB、source/config/lockfileは配信しません。asset変更後はserverを再buildしてください。
+HTML/CSS/JSにはUTF-8の正しいContent-Typeを付け、全応答にno-store、nosniff、CSP、no-referrer、
+frame拒否、CORP same-originを設定します。外部CDNへの依存はありません。
+
 ## Architecture / lifecycle
 
 ```text
-HTTP GET → Axum Query DTO → AssignmentQuery
+Browser → same-origin GET/PUT → Axum transport DTO
   → one PocState / ApplicationHandle → local worker → SQLite v3
   → safe application read model → Web JSON DTO
 ```
 
-shared applicationへquery_assignments_with_clockを追加しました。既存query_assignmentsは
+shared applicationのquery_assignments_with_clockと新しいset_completionを利用します。既存query_assignmentsは
 Local::now()を使う従来のままで、Tauri/SwiftUIの時計を変更しません。
 WebではserverがUTC instantを一度だけsampleし、+09:00のQueryClockを生成します。
 evaluatedAtも同じsampleで、server OS timezoneに依存しません。filter/sort/badgeは全てshared/core側です。
+Web表示もresponse.timeZone=Asia/TokyoをIntlへ指定します。DateOnlyは文字列のcalendar dateのまま表示します。
+共通のlist view/controllerへadapterを注入し、desktopは既存invoke/toggle、Webはfetch/PUTを選びます。
+自動transport fallbackはありません。[frontend統合説明](../../docs/FRONTEND-INTEGRATION.md)を参照してください。
+
+checkbox操作は希望状態を決定→二重操作防止→PUT→現在の条件でGETの順です。
+保存成功と再取得失敗を分け、PUT応答喪失時は未保存と断定せず、全件GETで実際の状態を確認します。
+確認できるまでcheckboxを停止し、再読み込みで復旧します。filter変更は通信中も可能で、古いGETは破棄します。
 
 startupはsynthetic DB検証→open_with_backend→実queryによるreadiness→loopback bind。
 initializerはmemory settingsと未設定credential portだけで、DisabledNetworkBackendは全操作を拒否します。
@@ -123,9 +178,11 @@ async threadでworkerをblocking joinしません。
 cargo fmt --manifest-path crates/web-server/Cargo.toml --check
 cargo clippy --manifest-path crates/web-server/Cargo.toml --locked --offline --all-targets --all-features -- -D warnings
 cargo test --manifest-path crates/web-server/Cargo.toml --locked --offline
+node --test tests/frontend.test.mjs tests/settings.test.mjs tests/sync.test.mjs tests/web_frontend.test.mjs
 ```
 
 testsはisolated temporary DBとloopback socketだけを使い、実credentialや大学serverへ接続しません。
 clockはserver-side test seamで固定できますが、HTTPからのclock入力はありません。
-[実装・検証報告](../../docs/WEB-1-IMPLEMENTATION.md)に実測結果と制限を記載します。
+[Web-2実装・検証報告](../../docs/PHASE-WEB-2.md)に実測結果と制限を記載します。
+Web-1の履歴は[Web-1報告](../../docs/WEB-1-IMPLEMENTATION.md)にあります。
 AxumのState/Query/serveは[公式documentation](https://docs.rs/axum/0.8.9/axum/)を参照しています。

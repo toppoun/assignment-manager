@@ -42,6 +42,7 @@ dependencies = [
  "assignment-manager-application",
  "axum",
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

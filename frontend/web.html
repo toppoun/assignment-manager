@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Assignment Manager · ローカルデモ</title>
+    <link rel="icon" href="/favicon.ico" />
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="web_app.js"></script>
+  </head>
+  <body>
+    <main>
+      <div id="list-view">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">Assignment Manager</p>
+          <h1>課題一覧</h1>
+          <p class="description">合成データを使ったローカルデモ · 表示時刻 Asia/Tokyo</p>
+          <p class="description">大学との同期・接続設定は利用できません。</p>
+        </div>
+        <div class="header-actions">
+          <button id="reload" type="button">再読み込み</button>
+        </div>
+      </header>
+      <form id="filters" class="toolbar" aria-label="課題の表示条件">
+        <div class="field">
+          <label for="completion-filter">完了状態</label>
+          <select id="completion-filter" name="completion">
+            <option value="incomplete" selected>未完了</option>
+            <option value="all">すべて</option>
+            <option value="completed">完了済み</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="deadline-filter">締切</label>
+          <select id="deadline-filter" name="deadline">
+            <option value="all">すべて</option>
+            <option value="overdue">期限切れ</option>
+            <option value="today">今日</option>
+            <option value="within_seven_days">7日以内</option>
+          </select>
+        </div>
+        <div class="field course-field">
+          <label for="course-filter">Course</label>
+          <select id="course-filter" name="course">
+            <option value="all">すべて</option>
+            <option value="unassigned">未所属</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="sort">並び順</label>
+          <select id="sort" name="sort">
+            <option value="deadline">締切が近い順</option>
+            <option value="course">Course順</option>
+            <option value="title">タイトル順</option>
+          </select>
+        </div>
+      </form>
+      <div class="list-summary">
+        <p id="count" class="count"></p>
+        <p id="status" class="status" role="status" aria-live="polite">課題を読み込んでいます…</p>
+      </div>
+      <p id="error" class="error" role="alert" hidden></p>
+      <section id="empty" class="empty" hidden>
+        <h2 id="empty-title"></h2>
+        <p id="empty-description"></p>
+        <button id="reset-filters" type="button" hidden>すべての課題を表示</button>
+      </section>
+      <div id="assignments" class="course-groups" aria-label="Courseごとの課題一覧" aria-busy="true"></div>
+      </div>
+    </main>
+  </body>
+</html>

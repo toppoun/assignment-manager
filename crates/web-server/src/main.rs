@@ -8,7 +8,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Web-1 PoC: {}", error.code());
+            eprintln!("Web-2 PoC: {}", error.code());
             ExitCode::FAILURE
         }
     }
@@ -21,15 +21,12 @@ async fn run() -> Result<(), WebError> {
     }
     let database = PocDatabase::prepare(&PocDatabase::default_directory())?;
     let server = PocServer::start(&database, SystemClock, DEFAULT_PORT).await?;
-    println!(
-        "Synthetic Web-1 PoC only: http://{}/api/v1/assignments",
-        server.local_addr()
-    );
+    println!("Synthetic Web-2 PoC only: http://{}/", server.local_addr());
     println!("No authentication. Keep this loopback endpoint private. Ctrl+C to stop.");
     server
         .serve(async {
             if tokio::signal::ctrl_c().await.is_err() {
-                eprintln!("Web-1 PoC: signal unavailable; stopping");
+                eprintln!("Web-2 PoC: signal unavailable; stopping");
             }
         })
         .await

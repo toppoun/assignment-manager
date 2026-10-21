@@ -36,11 +36,13 @@ Tauri側はpath解決、JSON request/DTO、日本語message、JSON settings stor
 
 ## Development
 
-Web-1の合成データ専用HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
+Web-2の合成データ専用Browser UI + HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
 `cargo run --manifest-path crates/web-server/Cargo.toml --locked`で127.0.0.1:3000だけにlistenし、
-課題一覧JSONとhealthを返します。大学通信・実credential・既存desktop DBを使用しません。
+Browserで`http://127.0.0.1:3000/`を開くと、課題一覧・Course/締切/完了filter・並び替え・完了状態の保存を利用できます。
+ページreloadとserver再起動後も完了状態を保持します。大学通信・実credential・既存desktop DBを使用しません。
 未認証localhost PoCのため外部公開しないでください。Windowsでのsmoke手順・制約・検証結果は
-[Web-1 report](docs/WEB-1-IMPLEMENTATION.md)を参照してください。
+[Web-2 report](docs/PHASE-WEB-2.md)と[frontend統合説明](docs/FRONTEND-INTEGRATION.md)を参照してください。
+Webの日時表示・badgeはAsia/Tokyoで統一し、Settings/Sync操作は提供しません。認証・公開運用は未実装です。
 
 Tauriの[OS別prerequisites](https://v2.tauri.app/start/prerequisites/)が必要です。
 WindowsではMSVC build toolsとWebView2、macOSではXcode Command Line Toolsを使用します。
@@ -198,7 +200,7 @@ cargo build --manifest-path src-tauri/Cargo.toml --locked --offline --features c
 Node.jsがある場合、外部test frameworkなしで表示helperも検証できます:
 
 ```sh
-node --test tests/frontend.test.mjs tests/settings.test.mjs tests/sync.test.mjs
+node --test tests/frontend.test.mjs tests/settings.test.mjs tests/sync.test.mjs tests/web_frontend.test.mjs
 ```
 
 Rust testsはDTO、固定error境界、DB path/directory failure、request→core options、
