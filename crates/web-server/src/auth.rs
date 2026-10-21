@@ -2,7 +2,8 @@
 //! No university identity/credential ports are used here.
 use crate::{
     WebError,
-    poc::{PocDatabase, reject_links},
+    control::{ControlDb, SharedControl},
+    poc::PocDatabase,
 };
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use rand_core::{OsRng, RngCore};
@@ -10,9 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
@@ -23,9 +23,10 @@ pub const COOKIE_NAME: &str = "am_loopback_session";
 pub const IDLE_SECONDS: i64 = 30 * 60;
 pub const ABSOLUTE_SECONDS: i64 = 12 * 60 * 60;
 const LOGIN_LIMIT: i64 = 5;
+pub const REAUTH_SECONDS: i64 = 5 * 60;
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub struct UserId(String);
+pub struct UserId(pub(crate) String);
 
 pub trait AuthClock: Send + Sync + 'static {
     fn seconds(&self) -> i64;
@@ -130,62 +131,6 @@ fn valid_login(login: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-struct ControlDb {
-    connection: Connection,
-    _lock: File,
-}
-impl ControlDb {
-    fn open(database: &PocDatabase) -> Result<Self, WebError> {
-        let directory = database.path().parent().ok_or(WebError::Internal)?;
-        let path = directory.join("web-control.db");
-        let lock_path = directory.join("web-control.lock");
-        reject_links(&path)?;
-        reject_links(&lock_path)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-            .map_err(|_| WebError::Internal)?;
-        lock.try_lock().map_err(|_| WebError::Unavailable)?;
-        let mut connection = Connection::open(path).map_err(|_| WebError::Internal)?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(2))
-            .map_err(|_| WebError::Internal)?;
-        connection
-            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")
-            .map_err(|_| WebError::Internal)?;
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .map_err(|_| WebError::Internal)?;
-        if version == 0 {
-            let count: i64 = connection
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|_| WebError::Internal)?;
-            if count != 0 {
-                return Err(WebError::Internal);
-            }
-            let tx = connection.transaction().map_err(|_| WebError::Internal)?;
-            tx.execute_batch("CREATE TABLE accounts (singleton INTEGER PRIMARY KEY CHECK(singleton=1), user_id TEXT NOT NULL UNIQUE, login TEXT NOT NULL UNIQUE, verifier TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('enabled','disabled')));
-                CREATE TABLE sessions (token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL REFERENCES accounts(user_id), csrf TEXT NOT NULL, created INTEGER NOT NULL, last_seen INTEGER NOT NULL, absolute_expiry INTEGER NOT NULL);
-                CREATE TABLE login_attempts (at INTEGER NOT NULL);
-                PRAGMA user_version=1;").map_err(|_| WebError::Internal)?;
-            tx.commit().map_err(|_| WebError::Internal)?;
-        } else if version != 1 {
-            return Err(WebError::Internal);
-        }
-        Ok(Self {
-            connection,
-            _lock: lock,
-        })
-    }
-}
-
 /// Explicit local administration only. The binary prompts on the terminal; no
 /// HTTP signup, environment password or password CLI argument is supported.
 pub fn bootstrap_admin(
@@ -244,7 +189,7 @@ impl AuthenticatedSession {
 }
 
 struct Inner {
-    db: Mutex<Option<ControlDb>>,
+    control: SharedControl,
     provider: LocalPasswordProvider,
     clock: Arc<dyn AuthClock>,
     login_gate: Arc<Semaphore>,
@@ -288,7 +233,7 @@ fn issue_session(
     )
     .map_err(|_| WebError::Internal)?;
     tx.execute(
-        "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        "INSERT INTO sessions (token_hash,user_id,csrf,created,last_seen,absolute_expiry) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
         params![
             session.hash,
             session.user_id.0,
@@ -330,7 +275,7 @@ impl AuthService {
                 .map_err(|_| WebError::Internal)?;
             Ok((
                 Self(Arc::new(Inner {
-                    db: Mutex::new(Some(db)),
+                    control: SharedControl::new(db),
                     provider: LocalPasswordProvider::new()?,
                     clock: Arc::new(clock),
                     login_gate: Arc::new(Semaphore::new(1)),
@@ -346,13 +291,9 @@ impl AuthService {
         action: impl FnOnce(&mut Connection, &Inner) -> Result<T, WebError> + Send + 'static,
     ) -> Result<T, WebError> {
         let inner = self.0.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.db.lock().map_err(|_| WebError::Unavailable)?;
-            let db = guard.as_mut().ok_or(WebError::Unavailable)?;
-            action(&mut db.connection, &inner)
-        })
-        .await
-        .map_err(|_| WebError::Unavailable)?
+        tokio::task::spawn_blocking(move || inner.control.with(|db| action(db, &inner)))
+            .await
+            .map_err(|_| WebError::Unavailable)?
     }
     pub async fn login(
         &self,
@@ -369,16 +310,7 @@ impl AuthService {
         self.run(move |db, inner| {
             let _permit = permit; // Cancellation cannot release the hash-work limit early.
             let now = inner.clock.seconds();
-            db.execute("DELETE FROM login_attempts WHERE at <= ?1", [now - 60])
-                .map_err(|_| WebError::Internal)?;
-            let count: i64 = db
-                .query_row("SELECT count(*) FROM login_attempts", [], |r| r.get(0))
-                .map_err(|_| WebError::Internal)?;
-            if count >= LOGIN_LIMIT {
-                return Err(WebError::RateLimited);
-            }
-            db.execute("INSERT INTO login_attempts VALUES (?1)", [now])
-                .map_err(|_| WebError::Internal)?;
+            charge_attempt(db, now)?;
             if !valid_login(&login)
                 || password.is_empty()
                 || password.len() > 256
@@ -440,6 +372,62 @@ impl AuthService {
         })
         .await
     }
+    pub(crate) fn control(&self) -> SharedControl {
+        self.0.control.clone()
+    }
+    pub async fn require_recent(&self, session: AuthenticatedSession) -> Result<(), WebError> {
+        self.run(move |db, inner| {
+            let now = inner.clock.seconds();
+            let (_, recent) = live_session(db, &session, now)?;
+            if recent.is_none_or(|at| at > now || now - at >= REAUTH_SECONDS) {
+                return Err(WebError::ReauthRequired);
+            }
+            Ok(())
+        })
+        .await
+    }
+    pub async fn reauthenticate(
+        &self,
+        session: AuthenticatedSession,
+        password: Zeroizing<String>,
+    ) -> Result<(), WebError> {
+        let permit = self
+            .0
+            .login_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WebError::RateLimited)?;
+        self.run(move |db, inner| {
+            let _permit = permit;
+            let now = inner.clock.seconds();
+            let (login, _) = live_session(db, &session, now)?;
+            charge_attempt(db, now)?;
+            if password.is_empty() || password.len() > 256 || password.chars().any(char::is_control)
+            {
+                return Err(WebError::InvalidRequest);
+            }
+            let user = inner
+                .provider
+                .authenticate(db, &login, &password)
+                .map_err(|error| {
+                    if error == WebError::Unauthorized {
+                        WebError::ReauthFailed
+                    } else {
+                        error
+                    }
+                })?;
+            if user != session.user_id {
+                return Err(WebError::Forbidden);
+            }
+            db.execute(
+                "UPDATE sessions SET reauthenticated_at=?1 WHERE token_hash=?2 AND user_id=?3",
+                params![now, session.hash, session.user_id.0],
+            )
+            .map_err(|_| WebError::Internal)?;
+            Ok(())
+        })
+        .await
+    }
     pub async fn logout(&self, session: AuthenticatedSession) -> Result<(), WebError> {
         self.run(move |db, _| {
             db.execute("DELETE FROM sessions WHERE token_hash=?1", [session.hash])
@@ -451,12 +439,42 @@ impl AuthService {
     pub async fn close(&self) {
         let inner = self.0.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(mut guard) = inner.db.lock() {
-                guard.take();
-            }
+            inner.control.close();
         })
         .await;
     }
+}
+
+fn charge_attempt(db: &Connection, now: i64) -> Result<(), WebError> {
+    db.execute("DELETE FROM login_attempts WHERE at <= ?1", [now - 60])
+        .map_err(|_| WebError::Internal)?;
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM login_attempts", [], |r| r.get(0))
+        .map_err(|_| WebError::Internal)?;
+    if count >= LOGIN_LIMIT {
+        return Err(WebError::RateLimited);
+    }
+    db.execute("INSERT INTO login_attempts VALUES (?1)", [now])
+        .map_err(|_| WebError::Internal)?;
+    Ok(())
+}
+// Re-check the row at admission: logout, disable, rotation and expiry cannot
+// turn an earlier session snapshot into a new reauthentication grant.
+fn live_session(
+    db: &Connection,
+    session: &AuthenticatedSession,
+    now: i64,
+) -> Result<(String, Option<i64>), WebError> {
+    let (login,status,last,absolute,recent): (String,String,i64,i64,Option<i64>) = db.query_row(
+        "SELECT a.login,a.status,s.last_seen,s.absolute_expiry,s.reauthenticated_at FROM sessions s JOIN accounts a ON a.user_id=s.user_id WHERE s.token_hash=?1 AND s.user_id=?2",
+        params![session.hash,session.user_id.0], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|_| WebError::Internal)?.ok_or(WebError::Unauthorized)?;
+    if status != "enabled" {
+        return Err(WebError::Forbidden);
+    }
+    if now < last || now >= absolute || now - last >= IDLE_SECONDS {
+        return Err(WebError::Unauthorized);
+    }
+    Ok((login, recent))
 }
 
 /// HTTP loopback policy only. There is no runtime production/non-Secure switch.

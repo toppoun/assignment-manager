@@ -8,7 +8,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Web-3A PoC: {}", error.code());
+            eprintln!("Web-3B PoC: {}", error.code());
             ExitCode::FAILURE
         }
     }
@@ -17,7 +17,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), WebError> {
     // In particular, do not silently accept --host/--bind/--database options.
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !args.is_empty() && args != ["bootstrap-admin"] {
+    if !args.is_empty() && args != ["bootstrap-admin"] && args != ["init-vault-key"] {
         return Err(WebError::InvalidRequest);
     }
     let database = PocDatabase::prepare(&PocDatabase::default_directory())?;
@@ -41,12 +41,17 @@ async fn run() -> Result<(), WebError> {
             return Err(WebError::InvalidRequest);
         }
         assignment_manager_web_server::auth::bootstrap_admin(&database, login.trim(), password)?;
-        println!("Web account created. Start the server without arguments.");
+        println!("Web account created. Run init-vault-key, then start without arguments.");
+        return Ok(());
+    }
+    if args == ["init-vault-key"] {
+        assignment_manager_web_server::vault::initialize_local_key(&database)?;
+        println!("Web vault key initialized/verified. No key material is displayed.");
         return Ok(());
     }
     let server = PocServer::start(&database, SystemClock, DEFAULT_PORT).await?;
     println!(
-        "Synthetic Web-3A loopback PoC: http://{}/",
+        "Synthetic Web-3B loopback PoC: http://{}/",
         server.local_addr()
     );
     println!(
@@ -55,7 +60,7 @@ async fn run() -> Result<(), WebError> {
     server
         .serve(async {
             if tokio::signal::ctrl_c().await.is_err() {
-                eprintln!("Web-3A PoC: signal unavailable; stopping");
+                eprintln!("Web-3B PoC: signal unavailable; stopping");
             }
         })
         .await

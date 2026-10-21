@@ -94,3 +94,15 @@ intersecting existing filters. Source submission state can extend the source-own
 domain/import/read model separately from user completion. Course schedule remains
 unchanged. WidgetKit should consume a separate safe snapshot, not this live DB.
 No Swift, FFI, academic-term, timetable or widget implementation is included here.
+
+## Web credential adapter (Web-3B)
+
+The Web consumer uses the existing ApplicationHandle settings methods and
+SettingsWorker with an owner-bound encrypted CredentialStore. Validation,
+`default.course-related`/CourseRelated identity and WebClass credential revision
+updates remain in SettingsService; Web HTTP does not implement a second service.
+Successful credential save/delete changes revision; a failed persistence operation
+does not. Existing SyncService drops old cached sessions before the next run with
+a new revision. Web-3B uses DisabledNetworkBackend and never establishes a session
+or runs startup/manual sync. Session-bound reauthentication is Web transport policy
+and is not imposed on desktop/UniFFI. See [Web vault](../../docs/WEB-CREDENTIAL-VAULT.md).

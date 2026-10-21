@@ -1,7 +1,7 @@
 use crate::{
     WebError,
     dto::AssignmentListDto,
-    poc::{DisabledNetworkBackend, MemorySettings, NoCredentials, PocDatabase},
+    poc::{DisabledNetworkBackend, MemorySettings, PocDatabase},
 };
 use assignment_manager_application::{
     ApplicationHandle,
@@ -59,13 +59,35 @@ impl PocState {
         clock: impl Clock,
         auth_clock: impl crate::auth::AuthClock,
     ) -> Result<Self, WebError> {
+        let provider = crate::keys::local_provider(database)?;
+        Self::open_with_key_provider(database, clock, auth_clock, provider).await
+    }
+    /// Synthetic tests inject an isolated memory provider; never touches OS entries.
+    pub async fn open_with_key_provider(
+        database: &PocDatabase,
+        clock: impl Clock,
+        auth_clock: impl crate::auth::AuthClock,
+        provider: Arc<dyn crate::keys::KeyProvider>,
+    ) -> Result<Self, WebError> {
         let (auth, owner) = crate::auth::AuthService::open(database, auth_clock).await?;
-        let application = ApplicationHandle::open_with_backend(
+        let control = auth.control();
+        let vault_owner = owner.clone();
+        let application = match ApplicationHandle::open_with_backend(
             Ok(database.path().to_owned()),
-            || Ok((MemorySettings, NoCredentials)),
+            move || {
+                Ok((
+                    MemorySettings,
+                    crate::vault::WebVault::new(control, vault_owner, provider)?,
+                ))
+            },
             DisabledNetworkBackend,
-        )
-        .map_err(WebError::from)?;
+        ) {
+            Ok(application) => application,
+            Err(error) => {
+                auth.close().await;
+                return Err(error.into());
+            }
+        };
         let state = Self(Arc::new(Inner {
             tenant: TenantRuntime {
                 owner: owner.clone(),
@@ -76,6 +98,10 @@ impl PocState {
             accepting: AtomicBool::new(true),
         }));
         if let Err(error) = state.query(&owner, AssignmentQuery::default()).await {
+            state.shutdown().await;
+            return Err(error);
+        }
+        if let Err(error) = state.settings_status(&owner).await {
             state.shutdown().await;
             return Err(error);
         }
@@ -97,6 +123,59 @@ impl PocState {
             .await
             .map_err(WebError::from)?;
         Ok(AssignmentListDto::new(response, now))
+    }
+    pub(crate) fn check_owner(&self, user: &crate::auth::UserId) -> Result<(), WebError> {
+        self.0.tenant.for_user(user).map(|_| ())
+    }
+    pub(crate) async fn settings_status(
+        &self,
+        user: &crate::auth::UserId,
+    ) -> Result<crate::dto::SettingsStatusDto, WebError> {
+        let status = self.0.tenant.for_user(user)?.get_settings_status().await?;
+        Ok(crate::dto::SettingsStatusDto {
+            moodle_configured: status.moodle_configured,
+            webclass_configured: status.webclass_configured,
+        })
+    }
+    pub(crate) async fn save_moodle(
+        &self,
+        user: &crate::auth::UserId,
+        secret: assignment_manager_application::credentials::SecretText,
+    ) -> Result<(), WebError> {
+        self.0
+            .tenant
+            .for_user(user)?
+            .save_moodle_config(secret)
+            .await
+            .map_err(Into::into)
+    }
+    pub(crate) async fn remove_moodle(&self, user: &crate::auth::UserId) -> Result<(), WebError> {
+        self.0
+            .tenant
+            .for_user(user)?
+            .remove_moodle_config()
+            .await
+            .map_err(Into::into)
+    }
+    pub(crate) async fn save_webclass(
+        &self,
+        user: &crate::auth::UserId,
+        credentials: assignment_manager_application::credentials::WebClassCredentials,
+    ) -> Result<(), WebError> {
+        self.0
+            .tenant
+            .for_user(user)?
+            .save_webclass_credentials(credentials)
+            .await
+            .map_err(Into::into)
+    }
+    pub(crate) async fn remove_webclass(&self, user: &crate::auth::UserId) -> Result<(), WebError> {
+        self.0
+            .tenant
+            .for_user(user)?
+            .remove_webclass_credentials()
+            .await
+            .map_err(Into::into)
     }
     pub(crate) fn accepting(&self) -> bool {
         self.0.accepting.load(Ordering::Acquire)

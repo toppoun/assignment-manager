@@ -6,9 +6,11 @@ use assignment_manager::{
     persistence::{ManualAssignmentInput, SqliteStore},
     sync::WebClassCredentialProvider,
 };
+#[cfg(test)]
+use assignment_manager_application::credentials::CredentialStore;
 use assignment_manager_application::{
     SyncBackend, SyncCounts, SyncFailure,
-    credentials::{CredentialStore, SecretText, WebClassCredentials},
+    credentials::{SecretText, WebClassCredentials},
     error::ApplicationError,
     settings::{Settings, SettingsStore},
 };
@@ -244,7 +246,9 @@ impl SettingsStore for MemorySettings {
         Err(ApplicationError::SettingsWriteFailed)
     }
 }
+#[cfg(test)]
 pub(crate) struct NoCredentials;
+#[cfg(test)]
 impl CredentialStore for NoCredentials {
     fn load_moodle_feed_secret(&self) -> Result<Option<SecretText>, ApplicationError> {
         Ok(None)

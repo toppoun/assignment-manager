@@ -5,7 +5,7 @@ use assignment_manager::{
     query::load_assignment_list,
 };
 use assignment_manager_web_server::{
-    Clock, PocServer, PocState, WebError,
+    Clock, PocState, WebError,
     poc::{PRIVATE_MARKER, PocDatabase, SOURCE_MARKER},
 };
 use axum::{
@@ -36,7 +36,7 @@ impl Clock for FixedClock {
 async fn fixture() -> (tempfile::TempDir, PocDatabase, PocState, Router) {
     let root = tempfile::tempdir().unwrap();
     let db = common::database(&root.path().join("poc")).unwrap();
-    let state = PocState::open(&db, FixedClock(NOW.parse().unwrap()))
+    let state = common::open(&db, FixedClock(NOW.parse().unwrap()))
         .await
         .unwrap();
     let app = common::authenticated_router(state.clone(), PORT).await;
@@ -260,7 +260,7 @@ async fn jst_boundaries_inclusive_windows_and_evaluated_at_share_one_sample() {
     assert_eq!(item(&week, "え・7日後")["status"], "upcoming");
     state.shutdown().await;
     let before = "2026-10-21T14:59:59.999999999Z".parse().unwrap();
-    let state = PocState::open(&db, FixedClock(before)).await.unwrap();
+    let state = common::open(&db, FixedClock(before)).await.unwrap();
     let (_, today) = request(
         &common::authenticated_router(state.clone(), PORT).await,
         "/api/v1/assignments?deadline=today&completion=all",
@@ -287,7 +287,7 @@ async fn one_runtime_multiple_gets_sample_once_each_and_ignore_os_calendar() {
     let root = tempfile::tempdir().unwrap();
     let db = common::database(&root.path().join("poc")).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
-    let state = PocState::open(
+    let state = common::open(
         &db,
         AdvancingClock {
             calls: Arc::clone(&calls),
@@ -470,7 +470,7 @@ async fn host_origin_methods_bodies_and_absent_routes_are_guarded() {
         serde_json::from_slice::<Value>(&bytes).unwrap(),
         json!({"error":{"code":"invalid_request"}})
     );
-    for path in ["/api/v1/sync", "/api/v1/settings/status"] {
+    for path in ["/api/v1/sync"] {
         assert_eq!(request(&app, path).await.0, StatusCode::NOT_FOUND);
     }
     assert_eq!(
@@ -602,7 +602,7 @@ async fn put_is_idempotent_commits_before_ack_and_preserves_every_other_field_ac
     assert_eq!(after["totalCount"], 11);
     state.shutdown().await;
     let reopened = common::database(db.path().parent().unwrap()).unwrap();
-    let state = PocState::open(&reopened, FixedClock(NOW.parse().unwrap()))
+    let state = common::open(&reopened, FixedClock(NOW.parse().unwrap()))
         .await
         .unwrap();
     let app = common::authenticated_router(state.clone(), PORT).await;
@@ -835,7 +835,7 @@ async fn static_allowlist_has_safe_types_and_no_desktop_or_filesystem_access() {
         if path == "/" {
             assert!(body.contains("合成データを使ったローカルデモ"));
             assert!(!body.contains("id=\"sync-now\""));
-            assert!(!body.contains("id=\"show-settings\""));
+            assert!(body.contains("id=\"show-settings\""));
         }
     }
     for path in [
@@ -875,7 +875,7 @@ async fn restart_preserves_synthetic_database_and_completion_without_reseeding()
         .unwrap();
     drop(store);
     let db2 = common::database(db.path().parent().unwrap()).unwrap();
-    let state = PocState::open(&db2, FixedClock(NOW.parse().unwrap()))
+    let state = common::open(&db2, FixedClock(NOW.parse().unwrap()))
         .await
         .unwrap();
     let (_, after) = request(
@@ -898,7 +898,7 @@ async fn readiness_failure_never_listens_and_has_no_path_or_driver_cause() {
     let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = reserved.local_addr().unwrap().port();
     drop(reserved);
-    match PocServer::start(&db, FixedClock(NOW.parse().unwrap()), port).await {
+    match common::server(&db, FixedClock(NOW.parse().unwrap()), port).await {
         Err(error) => assert_eq!(error, WebError::Internal),
         Ok(_) => panic!("invalid database became ready"),
     }
@@ -924,7 +924,7 @@ fn foreign_or_incomplete_directories_are_rejected_without_touching_database() {
 async fn actual_listener_is_ipv4_loopback_and_graceful_shutdown_reopens() {
     let root = tempfile::tempdir().unwrap();
     let db = common::database(&root.path().join("poc")).unwrap();
-    let server = PocServer::start(&db, FixedClock(NOW.parse().unwrap()), 0)
+    let server = common::server(&db, FixedClock(NOW.parse().unwrap()), 0)
         .await
         .unwrap();
     let address = server.local_addr();
@@ -950,7 +950,7 @@ async fn actual_listener_is_ipv4_loopback_and_graceful_shutdown_reopens() {
         .unwrap()
         .unwrap();
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
-    let state = PocState::open(&db, FixedClock(NOW.parse().unwrap()))
+    let state = common::open(&db, FixedClock(NOW.parse().unwrap()))
         .await
         .unwrap();
     assert_eq!(

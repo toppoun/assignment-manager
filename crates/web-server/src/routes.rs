@@ -20,15 +20,37 @@ use serde::Serialize;
 /// Only a port can vary; there is no configurable public host/origin allowlist.
 pub fn router(state: PocState, port: u16) -> Router {
     Router::new()
-        .route("/api/v1/auth/login", post(login))
-        .route("/api/v1/auth/logout", post(logout))
+        .route(
+            "/api/v1/auth/login",
+            post(login).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/v1/auth/logout",
+            post(logout).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/v1/auth/reauth",
+            post(reauth).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/api/v1/settings/status", get(settings_status))
+        .route(
+            "/api/v1/settings/moodle",
+            put(save_moodle).delete(remove_moodle),
+        )
+        .route(
+            "/api/v1/settings/webclass",
+            put(save_webclass).delete(remove_webclass),
+        )
         .route("/api/v1/session", get(session))
         .route("/api/v1/assignments", get(assignments))
-        .route("/api/v1/assignments/{id}/completion", put(completion))
+        .route(
+            "/api/v1/assignments/{id}/completion",
+            put(completion).layer(DefaultBodyLimit::max(1024)),
+        )
         .route("/health/live", get(live))
         .fallback(crate::assets::serve)
         .method_not_allowed_fallback(|| async { WebError::MethodNotAllowed })
-        .layer(DefaultBodyLimit::max(1024))
+        .layer(DefaultBodyLimit::max(4096))
         .layer(middleware::from_fn_with_state(
             (state.clone(), port),
             boundary,
@@ -78,13 +100,7 @@ async fn assignments(
 #[serde(deny_unknown_fields)]
 struct LoginRequest {
     login: String,
-    password: String,
-}
-impl Drop for LoginRequest {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.password.zeroize();
-    }
+    password: SecretInput,
 }
 fn json_error(error: JsonRejection) -> WebError {
     match error.status() {
@@ -98,15 +114,10 @@ async fn login(
     headers: header::HeaderMap,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, WebError> {
-    let Json(mut input) = body.map_err(json_error)?;
-    let password = zeroize::Zeroizing::new(std::mem::take(&mut input.password));
+    let Json(input) = body.map_err(json_error)?;
     let (token, session) = state
         .auth()
-        .login(
-            std::mem::take(&mut input.login),
-            password,
-            auth::read_cookie(&headers)?,
-        )
+        .login(input.login, input.password.0, auth::read_cookie(&headers)?)
         .await?;
     let mut response = Json(session).into_response();
     response.headers_mut().insert(
@@ -140,6 +151,113 @@ async fn logout(
             .map_err(|_| WebError::Internal)?,
     );
     Ok(response)
+}
+// Secret inputs have no Debug/Serialize and are zeroized even when deserialization
+// subsequently rejects an unknown/duplicate field. Raw JSON/HTTP buffers are not
+// covered by this ownership guarantee.
+struct SecretInput(zeroize::Zeroizing<String>);
+impl<'de> serde::Deserialize<'de> for SecretInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        <String as serde::Deserialize>::deserialize(d).map(|s| Self(s.into()))
+    }
+}
+impl SecretInput {
+    fn into_secret(mut self) -> assignment_manager_application::credentials::SecretText {
+        assignment_manager_application::credentials::SecretText::new(std::mem::take(&mut *self.0))
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReauthRequest {
+    password: SecretInput,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MoodleRequest {
+    calendar_url: SecretInput,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebclassRequest {
+    university_id: SecretInput,
+    password: SecretInput,
+}
+async fn reauth(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    body: Result<Json<ReauthRequest>, JsonRejection>,
+) -> Result<StatusCode, WebError> {
+    let Json(input) = body.map_err(json_error)?;
+    state
+        .auth()
+        .reauthenticate(session, input.password.0)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn settings_status(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    request: Request,
+) -> Result<Json<crate::dto::SettingsStatusDto>, WebError> {
+    if request.uri().query().is_some() {
+        return Err(WebError::InvalidQuery);
+    }
+    Ok(Json(state.settings_status(&session.user_id).await?))
+}
+async fn save_moodle(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    body: Result<Json<MoodleRequest>, JsonRejection>,
+) -> Result<StatusCode, WebError> {
+    let Json(input) = body.map_err(json_error)?;
+    if input.calendar_url.0.len() > crate::vault::URL_LIMIT {
+        return Err(WebError::InvalidRequest);
+    }
+    state
+        .save_moodle(&session.user_id, input.calendar_url.into_secret())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn save_webclass(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    body: Result<Json<WebclassRequest>, JsonRejection>,
+) -> Result<StatusCode, WebError> {
+    let Json(input) = body.map_err(json_error)?;
+    if input.university_id.0.len() > crate::vault::ID_LIMIT
+        || input.password.0.len() > crate::vault::PASSWORD_LIMIT
+    {
+        return Err(WebError::InvalidRequest);
+    }
+    use assignment_manager_application::credentials::WebClassCredentials;
+    state
+        .save_webclass(
+            &session.user_id,
+            WebClassCredentials {
+                university_id: input.university_id.into_secret(),
+                password: input.password.into_secret(),
+            },
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn remove_moodle(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    body: Result<Json<EmptyBody>, JsonRejection>,
+) -> Result<StatusCode, WebError> {
+    let _ = body.map_err(json_error)?;
+    state.remove_moodle(&session.user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn remove_webclass(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    body: Result<Json<EmptyBody>, JsonRejection>,
+) -> Result<StatusCode, WebError> {
+    let _ = body.map_err(json_error)?;
+    state.remove_webclass(&session.user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 #[derive(Serialize)]
 struct Health {
@@ -185,11 +303,22 @@ fn check(request: &Request, port: u16, accepting: bool) -> Result<(), WebError> 
     let mutation = (request.method() == Method::POST
         && matches!(
             request.uri().path(),
-            "/api/v1/auth/login" | "/api/v1/auth/logout"
+            "/api/v1/auth/login" | "/api/v1/auth/logout" | "/api/v1/auth/reauth"
         ))
         || (request.method() == Method::PUT
             && request.uri().path().starts_with("/api/v1/assignments/")
             && request.uri().path().ends_with("/completion"));
+    let settings_mutation = matches!(request.method(), &Method::PUT | &Method::DELETE)
+        && matches!(
+            request.uri().path(),
+            "/api/v1/settings/moodle" | "/api/v1/settings/webclass"
+        );
+    let mutation = mutation || settings_mutation;
+    let body_limit = if request.uri().path().starts_with("/api/v1/settings/") {
+        4096
+    } else {
+        1024
+    };
     if request.method() != Method::GET && !mutation {
         return Err(WebError::MethodNotAllowed);
     }
@@ -230,7 +359,7 @@ fn check(request: &Request, port: u16, accepting: bool) -> Result<(), WebError> 
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-            .is_some_and(|v| v > 1024)
+            .is_some_and(|v| v > body_limit)
         {
             return Err(WebError::PayloadTooLarge);
         }
@@ -277,11 +406,13 @@ async fn boundary(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let mut response = match check(&request, port, state.accepting()) {
+    let response = match check(&request, port, state.accepting()) {
         Ok(()) => {
             let path = request.uri().path();
             let protected = path == "/api/v1/session"
                 || path == "/api/v1/auth/logout"
+                || path == "/api/v1/auth/reauth"
+                || path.starts_with("/api/v1/settings/")
                 || path == "/api/v1/assignments"
                 || (path.starts_with("/api/v1/assignments/") && path.ends_with("/completion"));
             let authorized = if protected {
@@ -290,6 +421,7 @@ async fn boundary(
                     Err(error) => Err(error),
                 }
                 .and_then(|session| {
+                    state.check_owner(&session.user_id)?;
                     if request.method() != Method::GET {
                         let values: Vec<_> =
                             request.headers().get_all("x-csrf-token").iter().collect();
@@ -299,19 +431,31 @@ async fn boundary(
                         session
                             .check_csrf(values[0].to_str().map_err(|_| WebError::InvalidCsrf)?)?;
                     }
-                    request.extensions_mut().insert(session);
-                    Ok(())
+                    Ok(session)
                 })
             } else {
-                Ok(())
+                // No protected extension is needed for static/login routes.
+                return finish(next.run(request).await);
             };
             match authorized {
-                Ok(()) => next.run(request).await,
+                Ok(session) => {
+                    if request.uri().path().starts_with("/api/v1/settings/")
+                        && request.method() != Method::GET
+                        && let Err(error) = state.auth().require_recent(session.clone()).await
+                    {
+                        return finish(error.into_response());
+                    }
+                    request.extensions_mut().insert(session);
+                    next.run(request).await
+                }
                 Err(error) => error.into_response(),
             }
         }
         Err(error) => error.into_response(),
     };
+    finish(response)
+}
+fn finish(mut response: Response) -> Response {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),

@@ -33,7 +33,7 @@ async fn fixture() -> (tempfile::TempDir, PocDatabase, PocState, Router, TestClo
     let root = tempfile::tempdir().unwrap();
     let db = common::database(&root.path().join("poc")).unwrap();
     let clock = TestClock(Arc::new(AtomicI64::new(1_800_000_000)));
-    let state = PocState::open_with_auth_clock(&db, QueryClock, clock.clone())
+    let state = common::open_with_auth_clock(&db, QueryClock, clock.clone())
         .await
         .unwrap();
     let app = router(state.clone(), PORT);
@@ -119,7 +119,7 @@ fn bootstrap_is_atomic_singleton_random_user_and_salted_hash_only() {
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         Connection::open(db.path())
@@ -165,13 +165,13 @@ async fn no_account_never_disables_auth_and_second_server_cannot_invalidate_firs
     let root = tempfile::tempdir().unwrap();
     let db = PocDatabase::prepare(&root.path().join("poc")).unwrap();
     assert!(matches!(
-        PocState::open(&db, QueryClock).await,
+        common::open(&db, QueryClock).await,
         Err(WebError::SetupRequired)
     ));
     auth::bootstrap_admin(&db, "owner", PASSWORD.to_owned().into()).unwrap();
-    let state = PocState::open(&db, QueryClock).await.unwrap();
+    let state = common::open(&db, QueryClock).await.unwrap();
     assert!(matches!(
-        PocState::open(&db, QueryClock).await,
+        common::open(&db, QueryClock).await,
         Err(WebError::Unavailable)
     ));
     assert!(matches!(
@@ -367,7 +367,7 @@ async fn idle_and_absolute_expiry_are_server_enforced_and_restart_revokes_sessio
     let (cookie, _) = common::login(&app, PORT).await;
     let before = assignments_snapshot(&db);
     state.shutdown().await;
-    let reopened = PocState::open_with_auth_clock(&db, QueryClock, clock)
+    let reopened = common::open_with_auth_clock(&db, QueryClock, clock)
         .await
         .unwrap();
     let app = router(reopened.clone(), PORT);
@@ -536,7 +536,7 @@ async fn login_rate_limit_is_global_bounded_persistent_and_recovers_after_window
     assert_eq!(h["retry-after"], "60");
     assert_eq!(v, json!({"error":{"code":"rate_limited"}}));
     state.shutdown().await;
-    let state = PocState::open_with_auth_clock(&db, QueryClock, clock.clone())
+    let state = common::open_with_auth_clock(&db, QueryClock, clock.clone())
         .await
         .unwrap();
     let app = router(state.clone(), PORT);

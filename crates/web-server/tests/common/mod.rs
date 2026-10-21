@@ -89,5 +89,65 @@ pub async fn send(app: &Router, req: Request<Body>) -> (u16, axum::http::HeaderM
     assert_eq!(headers["cache-control"], "no-store");
     assert!(!headers.contains_key("access-control-allow-origin"));
     let body = to_bytes(response.into_body(), 65536).await.unwrap();
-    (status, headers, serde_json::from_slice(&body).unwrap())
+    (
+        status,
+        headers,
+        if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        },
+    )
+}
+
+pub fn keys(
+    db: &PocDatabase,
+) -> std::sync::Arc<assignment_manager_web_server::keys::MemoryKeyProvider> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static KEYS: OnceLock<
+        Mutex<
+            HashMap<
+                std::path::PathBuf,
+                Arc<assignment_manager_web_server::keys::MemoryKeyProvider>,
+            >,
+        >,
+    > = OnceLock::new();
+    let mut keys = KEYS.get_or_init(Default::default).lock().unwrap();
+    keys.entry(db.path().to_owned())
+        .or_insert_with(|| {
+            Arc::new(assignment_manager_web_server::keys::MemoryKeyProvider::random().unwrap())
+        })
+        .clone()
+}
+pub async fn open(
+    db: &PocDatabase,
+    clock: impl assignment_manager_web_server::Clock,
+) -> Result<PocState, WebError> {
+    open_with_auth_clock(
+        db,
+        clock,
+        assignment_manager_web_server::auth::SystemAuthClock,
+    )
+    .await
+}
+pub async fn open_with_auth_clock(
+    db: &PocDatabase,
+    clock: impl assignment_manager_web_server::Clock,
+    auth_clock: impl assignment_manager_web_server::auth::AuthClock,
+) -> Result<PocState, WebError> {
+    // Existing live state must be allowed to report the process-lock conflict.
+    let provider = keys(db);
+    assignment_manager_web_server::vault::initialize_with_provider(db, provider.as_ref())?;
+    PocState::open_with_key_provider(db, clock, auth_clock, provider).await
+}
+pub async fn server(
+    db: &PocDatabase,
+    clock: impl assignment_manager_web_server::Clock,
+    port: u16,
+) -> Result<assignment_manager_web_server::PocServer, WebError> {
+    let provider = keys(db);
+    assignment_manager_web_server::vault::initialize_with_provider(db, provider.as_ref())?;
+    assignment_manager_web_server::PocServer::start_with_key_provider(db, clock, port, provider)
+        .await
 }

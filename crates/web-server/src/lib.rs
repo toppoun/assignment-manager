@@ -2,12 +2,15 @@
 #![forbid(unsafe_code)]
 mod assets;
 pub mod auth;
+mod control;
 mod dto;
 mod error;
+pub mod keys;
 pub mod poc;
 mod requests;
 mod routes;
 mod state;
+pub mod vault;
 
 pub use error::WebError;
 pub use routes::router;
@@ -35,6 +38,25 @@ impl PocServer {
         port: u16,
     ) -> Result<Self, WebError> {
         let state = PocState::open(database, clock).await?;
+        Self::bind(state, port).await
+    }
+    /// Trusted synthetic test seam. The executable always uses the local provider.
+    pub async fn start_with_key_provider(
+        database: &PocDatabase,
+        clock: impl Clock,
+        port: u16,
+        provider: std::sync::Arc<dyn crate::keys::KeyProvider>,
+    ) -> Result<Self, WebError> {
+        let state = PocState::open_with_key_provider(
+            database,
+            clock,
+            crate::auth::SystemAuthClock,
+            provider,
+        )
+        .await?;
+        Self::bind(state, port).await
+    }
+    async fn bind(state: PocState, port: u16) -> Result<Self, WebError> {
         let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
             Ok(listener) => listener,
             Err(_) => {
@@ -120,7 +142,9 @@ mod tests {
             .unwrap();
         let entered = Arc::new(Notify::new());
         let (resume, paused) = mpsc::channel();
-        let server = PocServer::start(
+        let provider = Arc::new(crate::keys::MemoryKeyProvider::random().unwrap());
+        crate::vault::initialize_with_provider(&db, provider.as_ref()).unwrap();
+        let server = PocServer::start_with_key_provider(
             &db,
             PausedClock {
                 calls: AtomicUsize::new(0),
@@ -128,6 +152,7 @@ mod tests {
                 resume: Mutex::new(paused),
             },
             0,
+            provider,
         )
         .await
         .unwrap();

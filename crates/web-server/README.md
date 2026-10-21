@@ -1,10 +1,10 @@
-# Web-3A: local authentication + Browser HTTP PoC
+# Web-3B: encrypted Web vault + authenticated Settings
 
 合成データ専用・Web専用password認証のPoCです。
 **127.0.0.1:3000だけにbindします。外部公開、LAN、reverse proxy、tunnel運用は禁止です。**
 本番HTTPS、reverse proxy trust、deployment secret管理は未実装です。
 Cookie policyはHTTP loopback専用で、production/public flagやbind/DB pathの選択機能はありません。
-Ready for Web-3Bは次Phaseへの着手判定であり、公開運用の許可ではありません。
+Ready for Web-4は次Phaseへの着手判定であり、公開運用の許可ではありません。
 
 ## Bootstrap / start
 
@@ -21,11 +21,12 @@ env file、sourceへ保存しないでください。公開signup・default acco
 account未作成のserver起動はbootstrap_requiredで停止します。
 
 ```powershell
+cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline -- init-vault-key
 cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline
 ```
 
 [Browser UI](http://127.0.0.1:3000/)からログインします。Ctrl+Cで停止します。
-CLIは引数なしまたはbootstrap-adminだけを許可。control DBのexclusive OS file lockで
+CLIは引数なし、bootstrap-admin、init-vault-keyだけを許可。control DBのexclusive OS file lockで
 複数serverや稼働中bootstrapを拒否します。localhostと127.0.0.1は別Cookie hostです。
 Host/portとOriginの完全一致を要求し、CORS許可はありません。
 
@@ -44,21 +45,27 @@ LocalAddressが127.0.0.1だけであることを確認してください。
 | --- | --- |
 | assignment-manager.db | 既存synthetic課題DB、core schema v3のまま |
 | SYNTHETIC-ONLY | 既存PoC所有marker、再seed禁止 |
-| web-control.db | 独立Web control schema v1: accounts / sessions / login_attempts |
+| web-control.db | 独立Web control schema v2: account/session/rate limit + vault binding/暗号化record/nonce履歴 |
 | web-control.lock | server/bootstrapのexclusive OS lock。fileの存在だけではlock判定しない |
 
 初回だけ11課題をseedします。marker不整合、symlink/reparse point、foreign/unknown schema、
 破損DBはfail closedです。既存課題DBを変更してWeb tableを追加しません。
 認証後のUserIdがimmutable TenantRuntime.ownerと一致してから、1つのApplicationHandleへ
 query/setを送ります。request単位で3 workerを作らず、DB pathをrequestから選びません。
-NoCredentials / MemorySettings / DisabledNetworkBackendを維持し、大学HTTP client、
-real Keychain、大学設定、startup sync、sync/settings endpointはありません。
+WebVaultがshared CredentialStoreを実装し、MemorySettings（startup sync OFF）とDisabledNetworkBackendを維持します。
+大学HTTP clientは構築せず、大学ログイン/fetch、startup sync、sync endpointはありません。
 
 ## Authentication / session API
 
 | Method / path | Behavior |
 | --- | --- |
 | POST /api/v1/auth/login | JSON login/passwordを検証、新規Cookie + safe session JSON |
+| POST /api/v1/auth/reauth | JSON password（Web専用）+ CSRF、Argon2id verify、成功204 |
+| GET /api/v1/settings/status | 認証必須、moodleConfigured/webclassConfigured booleanだけ |
+| PUT /api/v1/settings/moodle | JSON calendarUrl、recent reauth + CSRF、commit後204 |
+| DELETE /api/v1/settings/moodle | JSON {}、recent reauth + CSRF、成功204（未設定も同じ） |
+| PUT /api/v1/settings/webclass | JSON universityId/passwordを一組で保存、recent reauth + CSRF、204 |
+| DELETE /api/v1/settings/webclass | JSON {}、recent reauth + CSRF、成功204（未設定も同じ） |
 | GET /api/v1/session | authenticated/userId/csrfToken/expiresAt/absoluteExpiresAt |
 | POST /api/v1/auth/logout | JSON {} + CSRF、server record削除、Cookie Max-Age=0 |
 | GET /api/v1/assignments | 認証されたownerの一覧 |
@@ -78,22 +85,23 @@ Max-Age=43200、Domainなし。**HTTP loopback専用のためSecureなし**で�
 idle 30分、absolute 12時間をserverで検証。API活動でidleを更新しますがabsoluteは固定。
 loginでCookie/CSRFを新規発行し、提示された旧sessionを同一transactionで失効させます。
 logout後のreplayは401。reloadはCookieを利用可能ですが、server再起動では全sessionを
-削除し再ログインを要求します。account、課題、completionは保持します。
-loginは全ID合計5回/60秒 (成功・失敗を含む)、同時hash検証1件、超過は429 + Retry-After: 60。
+削除し再ログインを要求します。account、課題、completion、暗号化credentialは保持します。
+loginとreauthは共通で全ID合計5回/60秒 (成功・失敗を含む)、同時hash検証1件、超過は429 + Retry-After: 60。
 limit timestampも再起動で消しません。password reset/changeは今回未実装です。
 
 ## CSRF / request boundaries
 
-login・logout・PUTには実Hostと完全一致するOrigin、X-Assignment-Manager: web-3a、
+login・logout・reauth・Settings PUT/DELETE・completion PUTには実Hostと完全一致するOrigin、X-Assignment-Manager: web-3a、
 application/json (任意のcharset=utf-8だけを許可)が必要です。
 Fetch MetadataがあればSite=same-origin、Mode=same-origin/corsだけです。
-logout・PUTにはさらにsessionに束縛したX-CSRF-Token (constant-time比較)が必要です。
+logout・reauth・Settings PUT/DELETE・completion PUTにはさらにsessionに束縛したX-CSRF-Token (constant-time比較)が必要です。
 loginはOrigin/JSON/custom header/Metadataでlogin CSRFを防御します。
 CLIはMetadata省略可能ですが、Origin/custom header/JSON/認証・CSRFは必須です。
 GET APIはsame-origin、または直接navigationのnoneを許可し、same-site/cross-site/不明値を拒否。
 mutationのnoneは拒否します。旧web-2 headerだけでは許可しません。
 
-全bodyは1024 bytes上限、queryは2048 bytes。不明・重複field、不正enum/JSON/IDを拒否します。
+Settings bodyは4096 bytes、その他のmutationは1024 bytes上限、queryは2048 bytes。
+Moodle URLは2048 bytes、大学IDは256 bytes、大学passwordは1024 bytesまで。不明・重複field、不正enum/JSON/IDを拒否します。
 raw error/body/path/SQL/secretをlogやresponseへ出しません。全responseにno-store、nosniff、
 CSP、no-referrer、X-Frame-Options: DENY、CORP: same-originを設定します。
 
@@ -119,12 +127,12 @@ raw submission URL/source identityは返しません。
 ## Browser / lifecycle
 
 web_auth.jsがsessionを確認し、login成功後だけ共通list viewを作成します。
-CookieはJSへ返さず、CSRFだけmemory保持。logout/401/403でrows/Course options/countsを消去し、
+CookieはJSへ返さず、CSRFだけmemory保持。logout/401/一般403でrows/Course options/countsとsecret入力を消去し、
 古いGET/PUTからの復活を防止。失敗したlogoutは一覧を隠したまま再試行できます。
 passwordのbrowser storageはありません。titleはtextContentで描画します。
 
 compile-time allowlistは/、styles.css、web_app.js、web_auth.js、http_api.js、list_view.js、
-list_tasks.js、presentation.jsだけ。faviconは204。filesystem serving/desktop module配信はありません。
+list_tasks.js、presentation.js、web_settings.js、settings.jsだけ。faviconは204。filesystem serving/desktop module配信はありません。
 asset変更後はrebuildが必要。startupはowner設定検証→実query/readiness→bind。
 shutdownはadmission停止→HTTP drain→application shutdown→control DB/lock close。
 
@@ -134,9 +142,39 @@ shutdownはadmission停止→HTTP drain→application shutdown→control DB/lock
 cargo fmt --manifest-path crates/web-server/Cargo.toml --check
 cargo clippy --manifest-path crates/web-server/Cargo.toml --locked --offline --all-targets --all-features -- -D warnings
 cargo test --manifest-path crates/web-server/Cargo.toml --locked --offline
-node --test tests/frontend.test.mjs tests/settings.test.mjs tests/sync.test.mjs tests/web_frontend.test.mjs
+node --test tests/*.test.mjs
 ```
 
-[認証設計](../../docs/WEB-AUTHENTICATION.md)、[Web-3A検証報告](../../docs/PHASE-WEB-3A.md)、
+[認証設計](../../docs/WEB-AUTHENTICATION.md)、[Web-3B検証報告](../../docs/PHASE-WEB-3B.md)、[Vault設計](../../docs/WEB-CREDENTIAL-VAULT.md)、
 [frontend統合](../../docs/FRONTEND-INTEGRATION.md)を参照してください。
 WindowsでRust/Tauri buildを確認し、macOS native/XcodeはWindowsでは未検証です。
+
+## Key management / recovery boundary
+
+`init-vault-key`は明示操作だけで鍵を作成します。Windows保護ストアのserviceは
+`org.assignmentmanager.web.vault.keys.v1`、accountはinstallation pathのSHA-256です。
+Local persistenceを使い、大学ID/token/passwordをOS metadataに入れません。
+control DBの暗号化key-check recordで鍵ID/実鍵を照合します。欠落・不一致・破損はfail closedです。
+鍵が消えた既存Vaultを新規鍵で初期化する機能や暗号化を迂回するfallbackはありません。
+
+通常testはmemory鍵だけです。実Windows providerの隔離テストは明示的に実行します。
+
+```powershell
+cargo test --manifest-path crates/web-server/Cargo.toml --locked --offline windows_key_persists -- --ignored
+```
+
+このtestは一時directory専用のOS entryだけを作成・検証・削除します。
+Browser smokeには通常環境と別の固定`target/web-3b-browser-smoke`を使うexampleがあります。
+
+```powershell
+cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline --example vault_browser_smoke -- bootstrap
+cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline --example vault_browser_smoke -- init-vault-key
+cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline --example vault_browser_smoke -- serve
+```
+
+login IDは`synthetic-smoke`、Web passwordはbootstrap時の非表示入力です。既存accountは上書きしません。
+normal serverと同時起動せず、同じ127.0.0.1:3000で合成値だけを入力してください。
+
+Linux/VPS provider、鍵rotation/re-encryption CLI、鍵のbackup/restore、ACLの運用設計は未実装です。
+鍵とciphertextを同じbackupへ入れないでください。path移動ではOS entryのinstallation identityが変わるため、
+現状のままdirectoryを移動するrestore手順は提供していません。Web-4開始前にもegress/SSRF制御が必要です。

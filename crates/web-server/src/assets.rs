@@ -26,6 +26,14 @@ pub(crate) async fn serve(uri: Uri) -> Response {
             "text/javascript; charset=utf-8",
             include_bytes!("../../../frontend/web_auth.js"),
         ),
+        "/web_settings.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../../frontend/web_settings.js"),
+        ),
+        "/settings.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../../frontend/settings.js"),
+        ),
         "/http_api.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("../../../frontend/http_api.js"),

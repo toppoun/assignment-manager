@@ -1,4 +1,4 @@
-# Vanilla frontend integration (Web-3A)
+# Vanilla frontend integration (Web-3B)
 
 ## Entrypoints and transport
 
@@ -10,8 +10,9 @@
 Both call `createListView(api)` in list_view.js. There is no runtime transport
 detection or HTTP fallback. Only tauri_api.js references window.__TAURI__.
 settings_view.js and desktop sync continue using the same invoke function.
-The Web module graph never imports desktop settings/sync/adapters, and those files
-are absent from the HTTP asset allowlist. No framework, npm dependency, bundler,
+The Web module graph imports the shared settings.js presentation/clearing helpers,
+but never desktop settings_view.js, sync.js or tauri_api.js. Those desktop modules
+remain absent from the HTTP asset allowlist. No framework, npm dependency, bundler,
 CDN, service worker or browser storage was added.
 
 ## Reused presentation and queries
@@ -57,7 +58,7 @@ All checkboxes are temporarily blocked (a conservative choice for this small PoC
 
 The desktop adapter preserves its existing toggle command and definite command
 error behavior. It has no HTTP retry capability. Source sync refreshes still queue
-behind active local operations. Settings/Sync exist only in the desktop entrypoint.
+behind active local operations. Sync exists only in the desktop entrypoint. Web Settings has its own HTTP lifecycle.
 
 Multiple tabs can set the same state idempotently; opposing writes follow DB commit
 order. Tabs do not auto-refresh each other and there is no conflict-version API.
@@ -65,7 +66,7 @@ Use reload to observe changes made in another tab. No optimistic state is persis
 
 ## Serving and validation
 
-crates/web-server/src/assets.rs embeds only the Web entry HTML and seven required
+crates/web-server/src/assets.rs embeds only the Web entry HTML and nine required
 CSS/JS assets. favicon.ico is an empty 204. There is no filesystem route or directory
 traversal resolution. Assets must be rebuilt into the server after editing.
 The server applies the localhost boundary to static and API requests alike.
@@ -73,13 +74,13 @@ The server applies the localhost boundary to static and API requests alike.
 Run from the repository root:
 
 ```powershell
-node --test tests/frontend.test.mjs tests/settings.test.mjs tests/sync.test.mjs tests/web_frontend.test.mjs
+node --test tests/*.test.mjs
 cargo test --manifest-path crates/web-server/Cargo.toml --locked --offline
 ```
 
 The Node standard test runner tests the real adapters/controller and a minimal DOM
 seam for literal title rendering/checkbox intent. Browser smoke additionally verifies
-the actual DOM, requests and persistence. See [Phase report](PHASE-WEB-3A.md).
+the actual DOM, requests and persistence. See [Phase report](PHASE-WEB-3B.md).
 
 ## Web authentication lifecycle
 
@@ -99,7 +100,7 @@ Logout immediately disposes the view, clears rows, Course options/counts/errors,
 and invalidates adapter and model generations. Old GET/body/PUT responses cannot
 restore data or initiate post-write reconciliation after logout. View disposal
 also aborts its control event listeners; Tauri never calls this auth lifecycle.
-401/403 responses similarly return to login. A failed logout keeps the list empty,
+401 and general 403 responses similarly return to login. Reauth-specific 403 keeps the session and requests fresh proof. A failed logout keeps the list empty,
 blocks another login and offers a server-confirmed logout retry. Back/forward cache
 restores check the session again before showing assignments.
 
@@ -107,3 +108,29 @@ Idle/absolute expiration is enforced by the server. On the next API request the
 UI clears expired data; it has no background keepalive. Other tabs do not yet
 receive a logout broadcast and revalidate on their next request/reload. This PoC
 supports one account and is not approved for public multi-user use.
+
+## Web Settings lifecycle (Web-3B)
+
+Navigation disposes the previous view/listeners and constructs web_settings.js only
+for an authenticated session. Desktop settings.js/settings_view.js/tauri_api.js keep
+their invoke contract without Web reauthentication. Shared configuredPresentation
+and clearSecretInputs are reused. No frontend encryption is added.
+
+Web settings state contains booleans, busy/outcome classifications and fixed text.
+The adapter sends fixed same-origin URLs plus the existing JSON/custom header/CSRF
+proof. GET status accepts exactly two boolean fields. PUT/DELETE/reauth expect 204;
+status is a separate GET, and its failure never changes an acknowledged save into
+a failed save. Unknown network/5xx/response outcomes trigger only a safe status read.
+Boolean configured status cannot prove whether an existing secret was replaced.
+The UI preserves this uncertainty and never automatically resends a write.
+
+Reauth uses the Web account password and is enforced by the server for five minutes
+on that session. Input clears at send start, after an active operation, navigation,
+visibility change, pagehide and logout. It is never repopulated. Autocomplete is off
+for token/university/reauth inputs, with password fields for token URL/passwords.
+JavaScript cannot guarantee destruction of engine/network/password-manager copies.
+
+Generation and active-view checks suppress stale status/write/reauth results after
+disposal, including automatic follow-up GETs and old finally blocks clearing a new
+view's inputs. Pending operations reject duplicate submission. The server remains
+the authority for proof expiry even when a view still shows the previous proof label.

@@ -268,33 +268,12 @@ test("desktop adapter preserves invoke command names/arguments and never falls b
   }
   visit("web_app.js");
   const web = readFileSync(new URL("../frontend/web.html", import.meta.url), "utf8");
-  assert.doesNotMatch(web, /id="(?:show-settings|sync-now|settings-view)"/);
+  assert.doesNotMatch(web, /id="sync-now"/);
+  assert.match(web, /id="show-settings"/);
   assert.match(web, /合成データを使ったローカルデモ/);
 });
 
-// Minimal DOM surface used by the view; any HTML assignment fails the test.
-function documentFixture() {
-  const elements = [];
-  class Element {
-    children = []; dataset = {}; listeners = {}; attributes = {}; value = ""; hidden = false; isConnected = true;
-    constructor(tag) { this.tagName = tag; elements.push(this); }
-    set innerHTML(_) { throw new Error("unsafe HTML rendering"); }
-    append(...children) { this.children.push(...children); }
-    replaceChildren(...children) { this.children = children; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    addEventListener(name, fn) { this.listeners[name] = fn; }
-    querySelectorAll(tag) { return this.children.flatMap(c => [c, ...c.querySelectorAll(tag)]).filter(c => c.tagName === tag); }
-    get options() { return this.children; }
-    focus() { doc.activeElement = this; }
-    click() { return this.listeners.click?.(); }
-  }
-  const ids = Object.fromEntries(["assignments", "empty", "status", "count", "error", "reload", "reset-filters", "filters",
-    "completion-filter", "deadline-filter", "course-filter", "sort", "empty-title", "empty-description",
-    "auth-status", "login-view", "list-view", "web-login", "web-password", "login-form", "login-submit", "logout", "session-retry", "retry-logout"].map(id => [id, new Element("div")]));
-  for (const [key, value] of Object.entries(DEFAULT_CONTROLS)) ids[key === "sort" ? "sort" : `${key}-filter`].value = value;
-  const doc = { querySelector: selector => ids[selector.slice(1)], createElement: tag => new Element(tag), activeElement: null };
-  return { doc, ids, elements };
-}
+import { documentFixture } from "./dom_fixture.mjs";
 
 test("shared view renders malicious titles as literal text and sends checkbox desired state", async () => {
   const { doc, ids, elements } = documentFixture();

@@ -149,3 +149,10 @@ impl From<AssignmentListEntry> for AssignmentDto {
         }
     }
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SettingsStatusDto {
+    pub moodle_configured: bool,
+    pub webclass_configured: bool,
+}

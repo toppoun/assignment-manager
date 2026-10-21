@@ -1,15 +1,20 @@
 import { createListView } from "./list_view.js";
 import { createHttpApi } from "./http_api.js";
+import { createWebSettingsView } from "./web_settings.js";
 
 export function createWebApp(document_ = document, fetch_ = (...args) => globalThis.fetch(...args)) {
   const get = id => document_.querySelector(`#${id}`);
   let view = null;
+  let authenticated = false;
   let generation = 0;
   let pending = false;
   let logoutUnconfirmed = false;
   const api = createHttpApi(fetch_, signedOut);
   function signedOut() {
     ++generation;
+    authenticated = false;
+    get("view-navigation").hidden = true;
+    get("settings-view").hidden = true;
     view?.dispose(); view = null;
     get("list-view").hidden = true;
     get("login-view").hidden = false;
@@ -20,10 +25,22 @@ export function createWebApp(document_ = document, fetch_ = (...args) => globalT
     view?.dispose();
     get("auth-status").textContent = "";
     get("login-view").hidden = true;
-    get("list-view").hidden = false;
-    view = createListView(api, document_);
+    authenticated = true;
+    get("view-navigation").hidden = false;
+    await showView(false);
+  }
+  async function showView(settings) {
+    if (!authenticated) return;
+    view?.dispose();
+    get("list-view").hidden = settings;
+    get("settings-view").hidden = !settings;
+    get("show-list").setAttribute("aria-pressed", String(!settings));
+    get("show-settings").setAttribute("aria-pressed", String(settings));
+    view = settings ? createWebSettingsView(api, document_) : createListView(api, document_);
     await view.load();
   }
+  get("show-list").addEventListener("click", () => showView(false));
+  get("show-settings").addEventListener("click", () => showView(true));
   const message = error => error?.code === "rate_limited" ? "ログイン試行が多すぎます。60秒待ってください。"
     : error?.code === "authentication_failed" ? "ログインIDまたはpasswordを確認してください。"
     : "通信を確認して、もう一度お試しください。";
@@ -73,5 +90,5 @@ export function createWebApp(document_ = document, fetch_ = (...args) => globalT
   get("session-retry").addEventListener("click", refreshSession);
   // A back/forward cache restore must re-check the server before showing data.
   const resume = () => { signedOut(); api.clearSession(); return refreshSession(); };
-  return { start: refreshSession, resume };
+  return { start: refreshSession, resume, suspend: () => { signedOut(); api.clearSession(); }, clearSecrets: () => { get("web-password").value = ""; view?.clear?.(); } };
 }

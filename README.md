@@ -36,18 +36,28 @@ Tauri側はpath解決、JSON request/DTO、日本語message、JSON settings stor
 
 ## Development
 
-Web-3Aの合成データ専用Browser UI + HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
-最初にserverを停止した状態で、`cargo run --manifest-path crates/web-server/Cargo.toml --locked -- bootstrap-admin`
-を実行し、Web専用IDと大学とは別のpasswordをterminalの非表示入力で作成します。公開signupはありません。
-引数なしの同じcommandで127.0.0.1:3000だけにlistenします。
-Browserで[ローカルUI](http://127.0.0.1:3000/)へログインし、課題一覧・filter/sort・完了変更を利用できます。
-reloadでsessionを再利用し、logout・idle 30分・absolute 12時間・server再起動で失効します。
-課題の完了状態とWeb accountは再起動後も保持します。大学通信・実credential・既存desktop DBは使用しません。
-**HTTP loopback開発専用です。外部公開・LAN bind・reverse proxy・tunnel運用は禁止です。**
-本番HTTPS、Secure/__Host- Cookieによる本番配信、reverse proxy trust、deployment secret管理は未実装です。
-public/production flagや非Secure Cookieを本番へ持ち込む切替はありません。
-設計は[Web認証・session](docs/WEB-AUTHENTICATION.md)、検証結果は[Web-3A report](docs/PHASE-WEB-3A.md)、
-frontendは[統合説明](docs/FRONTEND-INTEGRATION.md)を参照してください。Web-3Bは実装していません。
+Web-3Bの合成データ専用Browser UI + HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
+serverを停止し、次の明示的な管理操作を順に実行します。
+
+```powershell
+cargo run --manifest-path crates/web-server/Cargo.toml --locked -- bootstrap-admin
+cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline -- init-vault-key
+cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline
+```
+
+Web専用ID/passwordはterminalの非表示入力で作成します。`init-vault-key`はWindows Credential Managerの
+Web専用serviceへ256-bit鍵を生成し、既存鍵・既存Vaultは上書きしません。通常起動で鍵を自動生成しません。
+鍵はcontrol DBやGitに含めず、Tauriのcredential entryとも分離します。
+[ローカルUI](http://127.0.0.1:3000/)で課題一覧・完了変更・Settingsを利用できます。
+Settingsの保存・置換・削除にはWeb専用passwordによる再認証（5分）が必要です。
+**合成URL/ID/passwordだけを使用してください。大学通信・実同期は無効です。**
+AES-256-GCMでUserId/record種別に束縛した認証情報と課題completionは再起動後も保持します。
+server再起動ではWeb sessionを失効させ、再ログインを要求します。課題schema v3、desktop/native DBは維持します。
+**127.0.0.1:3000のHTTP開発専用です。外部公開・LAN bind・reverse proxy・tunnel運用は禁止です。**
+本番HTTPS/Secure Cookie、proxy trust、production鍵provider/ACL、backup/restore、大学別SSRF/egress制御は未実装です。
+[Web認証](docs/WEB-AUTHENTICATION.md)、[Vault設計](docs/WEB-CREDENTIAL-VAULT.md)、
+[Web-3B報告](docs/PHASE-WEB-3B.md)、[frontend統合](docs/FRONTEND-INTEGRATION.md)を参照してください。
+Ready for Web-4は次Phaseの設計上の着手判定で、公開運用の承認ではありません。
 
 Tauriの[OS別prerequisites](https://v2.tauri.app/start/prerequisites/)が必要です。
 WindowsではMSVC build toolsとWebView2、macOSではXcode Command Line Toolsを使用します。

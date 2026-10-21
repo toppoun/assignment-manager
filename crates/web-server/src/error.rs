@@ -27,6 +27,9 @@ pub enum WebError {
     Busy,
     Unavailable,
     Internal,
+    VaultUnavailable,
+    ReauthRequired,
+    ReauthFailed,
 }
 
 impl WebError {
@@ -49,13 +52,18 @@ impl WebError {
             Self::Busy => "busy",
             Self::Unavailable => "unavailable",
             Self::Internal => "internal_error",
+            Self::VaultUnavailable => "vault_unavailable",
+            Self::ReauthRequired => "reauth_required",
+            Self::ReauthFailed => "reauth_failed",
         }
     }
 
     pub fn status(self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden | Self::InvalidCsrf => StatusCode::FORBIDDEN,
+            Self::Forbidden | Self::InvalidCsrf | Self::ReauthRequired | Self::ReauthFailed => {
+                StatusCode::FORBIDDEN
+            }
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::SetupRequired | Self::AccountExists => StatusCode::CONFLICT,
             Self::InvalidQuery | Self::InvalidRequest | Self::InvalidHost => {
@@ -66,7 +74,9 @@ impl WebError {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Busy | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Busy | Self::Unavailable | Self::VaultUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -77,6 +87,13 @@ impl From<ApplicationError> for WebError {
         match value {
             ApplicationError::InvalidQuery => Self::InvalidQuery,
             ApplicationError::InvalidAssignmentId => Self::InvalidRequest,
+            ApplicationError::InvalidMoodleFeed | ApplicationError::InvalidCredentials => {
+                Self::InvalidRequest
+            }
+            ApplicationError::CredentialUnavailable
+            | ApplicationError::CredentialReadFailed
+            | ApplicationError::CredentialWriteFailed
+            | ApplicationError::CredentialDeleteFailed => Self::VaultUnavailable,
             ApplicationError::NotFound => Self::NotFound,
             ApplicationError::Busy => Self::Busy,
             ApplicationError::Unavailable => Self::Unavailable,

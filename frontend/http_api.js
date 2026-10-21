@@ -2,7 +2,7 @@
 const completions = ["incomplete", "completed"];
 const codes = new Set(["invalid_query", "invalid_request", "invalid_host", "cross_origin",
   "not_found", "method_not_allowed", "unsupported_media_type", "payload_too_large", "busy", "unavailable", "internal_error",
-  "authentication_failed", "forbidden", "invalid_csrf", "rate_limited"]);
+  "authentication_failed", "forbidden", "invalid_csrf", "rate_limited", "reauth_required", "reauth_failed", "vault_unavailable"]);
 const failure = (code, outcome = "unknown") => ({ code, outcome });
 
 export function serializeQuery(request) {
@@ -37,7 +37,7 @@ export function createHttpApi(fetch_ = (...args) => globalThis.fetch(...args), o
   let csrf = null;
   let generation = 0;
   const forget = () => { csrf = null; ++generation; };
-  async function json(path, options = {}) {
+  async function json(path, options = {}, noContent = false) {
     const ticket = generation;
     let response;
     try {
@@ -45,21 +45,29 @@ export function createHttpApi(fetch_ = (...args) => globalThis.fetch(...args), o
         redirect: "error", signal: AbortSignal.timeout(10000), ...options });
     } catch { throw failure("network_failed"); }
     if (ticket !== generation) throw failure("authentication_failed", "rejected");
-    if (response.status === 401 || response.status === 403 && path !== "/api/v1/auth/login") {
+    if (response.status === 401) {
       forget(); onUnauthorized();
       throw failure("authentication_failed", "rejected");
     }
+    if (noContent && response.status === 204) return;
     let value;
     try {
       if (!/^application\/json(?:;|$)/i.test(response.headers.get("content-type") ?? "")) throw null;
       value = await response.json();
-    } catch { throw failure("response_invalid"); }
+    } catch {
+      if (response.status === 403) { forget(); onUnauthorized(); throw failure("authentication_failed", "rejected"); }
+      throw failure("response_invalid");
+    }
     if (ticket !== generation) throw failure("authentication_failed", "rejected");
+    if (response.status === 403 && !["reauth_required", "reauth_failed"].includes(value?.error?.code)) {
+      forget(); onUnauthorized(); throw failure("authentication_failed", "rejected");
+    }
     if (!response.ok) {
       const code = codes.has(value?.error?.code) ? value.error.code : "http_failed";
       // 5xx may be returned by an intermediary after the server committed.
       throw failure(code, response.status >= 400 && response.status < 500 ? "rejected" : "unknown");
     }
+    if (noContent) throw failure("response_invalid");
     return value;
   }
   const mutation = (method, body, token = csrf) => ({ method,
@@ -85,6 +93,17 @@ export function createHttpApi(fetch_ = (...args) => globalThis.fetch(...args), o
       try { await json("/api/v1/auth/logout", mutation("POST", {}, token)); }
       finally { forget(); }
     },
+    async reauthenticate(password) { await json("/api/v1/auth/reauth", mutation("POST", { password }), true); },
+    async settingsStatus() {
+      const value = await json("/api/v1/settings/status");
+      if (typeof value?.moodleConfigured !== "boolean" || typeof value?.webclassConfigured !== "boolean"
+          || Object.keys(value).length !== 2) throw failure("response_invalid");
+      return { moodleConfigured: value.moodleConfigured, webclassConfigured: value.webclassConfigured };
+    },
+    async saveMoodle(calendarUrl) { await json("/api/v1/settings/moodle", mutation("PUT", { calendarUrl }), true); },
+    async saveWebclass(universityId, password) { await json("/api/v1/settings/webclass", mutation("PUT", { universityId, password }), true); },
+    async removeMoodle() { await json("/api/v1/settings/moodle", mutation("DELETE", {}), true); },
+    async removeWebclass() { await json("/api/v1/settings/webclass", mutation("DELETE", {}), true); },
     async listAssignments(request) {
       const value = await json(`/api/v1/assignments?${serializeQuery(request)}`);
       if (!validList(value)) throw failure("response_invalid");
