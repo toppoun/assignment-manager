@@ -11,6 +11,9 @@ public final class AssignmentAppModel: ObservableObject {
     @Published public private(set) var queryError: SafeApplicationError?
     @Published public private(set) var toggleError: SafeApplicationError?
     @Published public private(set) var savedChangeNeedsRefresh = false
+    @Published public private(set) var isSyncing = false
+    @Published public private(set) var syncOutcome: SyncOutcome?
+    @Published public private(set) var syncError: SafeApplicationError?
     @Published public var selection = QuerySelection() {
         didSet { if oldValue != selection && phase == .ready { refresh() } }
     }
@@ -18,6 +21,9 @@ public final class AssignmentAppModel: ObservableObject {
     private var requestGeneration: UInt64 = 0
     var refreshTask: Task<Void, Never>?
     private var toggleTask: Task<Void, Never>?
+    private var syncTask: Task<Void, Never>?
+
+    public var canSync: Bool { phase == .ready && snapshot != nil && !isSyncing }
 
     public init(client: any ApplicationClient) { self.client = client }
 
@@ -45,8 +51,11 @@ public final class AssignmentAppModel: ObservableObject {
             do {
                 let response = try await client.query(request)
                 guard let self, self.accepts(generation) else { return }
+                let firstLocalSnapshot = self.snapshot == nil
                 self.snapshot = response; self.queryError = nil
                 self.savedChangeNeedsRefresh = false; self.isRefreshing = false
+                // Show local data first. The Rust lifetime guard owns startup policy.
+                if firstLocalSnapshot { self.beginSync(startup: true) }
             } catch {
                 guard let self, self.accepts(generation) else { return }
                 // Preserve the last successful snapshot on failure.
@@ -83,10 +92,45 @@ public final class AssignmentAppModel: ObservableObject {
     }
     public func waitForRefresh() async { await refreshTask?.value }
     public func waitForToggle() async { await toggleTask?.value; await waitForRefresh() }
+    public func syncNow() {
+        guard canSync else { return }
+        beginSync(startup: false)
+    }
+    private func beginSync(startup: Bool) {
+        guard phase == .ready, !isSyncing else { return }
+        isSyncing = true; syncError = nil
+        syncTask = Task { [weak self, client] in
+            do {
+                var outcome = try await (startup ? client.runStartupSync() : client.syncNow())
+                // Another proxy may own the accepted run. Observe it; never enqueue a retry.
+                if outcome == .alreadyRunning {
+                    while true {
+                        let status = try await client.syncStatus()
+                        guard let self, self.phase == .ready else { return }
+                        if !status.running { outcome = status.lastReport; break }
+                        try await Task.sleep(for: .milliseconds(250))
+                    }
+                }
+                guard let self, self.phase == .ready else { return }
+                self.isSyncing = false
+                if let outcome {
+                    self.syncOutcome = outcome
+                    if outcome.shouldReload { self.refresh() }
+                }
+            } catch {
+                guard let self, self.phase == .ready else { return }
+                self.isSyncing = false; self.syncError = SafeApplicationError(error)
+                // A missing reply is not rollback: read any work committed before failure.
+                self.refresh()
+            }
+        }
+    }
+    public func waitForSync() async { await syncTask?.value; await waitForRefresh() }
     public func shutdown() async {
         phase = .closing
         requestGeneration += 1; refreshTask?.cancel()
         await client.shutdown() // Rust rejects new admissions and drains accepted work.
         await toggleTask?.value
+        await syncTask?.value // Cancellation is never interpreted as Rust rollback.
     }
 }

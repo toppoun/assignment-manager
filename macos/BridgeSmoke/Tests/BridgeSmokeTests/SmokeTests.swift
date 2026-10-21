@@ -21,3 +21,7 @@ import Testing
 @Test func foreignTraitsRetainReleaseAndSanitizeCallbackFailures() async throws {
     try await SmokeChecks().foreignStores()
 }
+
+@Test func syncReportsStartupOnceAndStatusCrossGeneratedAsyncBindings() async throws {
+    try await SmokeChecks().unconfiguredSync()
+}

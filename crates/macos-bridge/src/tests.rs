@@ -8,6 +8,9 @@ use assignment_manager_application::{error::ApplicationError, models};
 use chrono::{DateTime, NaiveDate};
 use std::error::Error;
 
+#[path = "sync_tests.rs"]
+mod native_sync;
+
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .build()

@@ -1,5 +1,10 @@
 # Phase 10A: macOS Swift bridge PoC
 
+現在は10C1 foreign storesと10C2 sync async APIも検証します。
+6 tests / CLI smokeをSwift 6.4 complete strict concurrencyで実行し、Sync smokeは未設定のoffline constructorだけを使います。
+大学server／本番Keychainへは接続しません。[Phase 10C2 report](../AssignmentManager/PHASE-10C2.md)を参照してください。
+以下は10A時点の仕様・検証記録です。
+
 Swift processから共有Rust applicationをopen/query/toggle/shutdownする検証用SwiftPM packageです。
 正式なSwiftUI shell、Settings、native Keychain、Sync、academic term filterは含みません。
 

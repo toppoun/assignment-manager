@@ -1,7 +1,7 @@
 # Assignment Manager
 
 Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shell、
-Phase 10C1のmacOS native SwiftUI application shell / Settings / Swift Keychainです。
+Phase 10C2のmacOS native SwiftUI application shell / Settings / Swift Keychain / Syncです。
 
 macOS正式shellのXcode project、build/test手順、lifecycle、保存先、検証結果は
 [macos/AssignmentManager/README.md](macos/AssignmentManager/README.md)を参照してください。
@@ -9,13 +9,13 @@ macOS正式shellのXcode project、build/test手順、lifecycle、保存先、�
 
 macOS bridgeのarchitecture・公式仕様の確認・再現可能なSwift 6 smoke手順は
 [macos/BridgeSmoke/README.md](macos/BridgeSmoke/README.md)を参照してください。
-UniFFI 0.32.2を固定し、Apple Silicon上で共有ApplicationHandleのopen/query/toggle/settings/shutdownを検証します。
+UniFFI 0.32.2を固定し、Apple Silicon上で共有ApplicationHandleのopen/query/toggle/settings/sync/shutdownを検証します。
 BridgeSmokeは引き続き独立したFFI regression smokeです。
-native Settings / Swift Keychain / foreign traitsを接続しました。network SyncはPhase 10C2です。
+native manual/startup Syncをshared coordinatorへ接続しました。
 最新のarchitecture・検証結果・manual smoke未確認項目は
-[Phase 10C1 report](macos/AssignmentManager/PHASE-10C1.md)を参照してください。
+[Phase 10C2 report](macos/AssignmentManager/PHASE-10C2.md)を参照してください。
 macOS Tauri版の起動・SQLite・Keychainは以前の実機確認済みです。
-SwiftUI版の実window / 実Keychain smokeはComputer Useのアクセスが許可されず未確認です。
+大学serverへの実接続はユーザーのmanual smokeで確認します。Codexは接続していません。
 
 ## Shared application architecture
 

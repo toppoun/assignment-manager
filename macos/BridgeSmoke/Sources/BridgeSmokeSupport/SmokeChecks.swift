@@ -90,6 +90,42 @@ private let all = QueryOptions(completion: .all, course: .all, deadline: .all, s
 public actor SmokeChecks {
     public init() {}
 
+    public func unconfiguredSync() async throws {
+        try requireOffMainThread()
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Offline constructor has no credentials: never invokes a network backend.
+        let app = try await MacApplication.open(databasePath: root.appendingPathComponent("sync.db").path)
+        do {
+            let skipped = try await app.runStartupSync()
+            try require(skipped == nil, "startup disabled")
+            let report = try await app.syncNow()
+            try require(report == .completed(moodle: .notConfigured, webclass: .notConfigured, shouldReload: false),
+                        "unconfigured source report")
+            let status = try await app.getSyncStatus()
+            try require(!status.running && status.lastReport == report, "shared sync status")
+            try require(!String(reflecting: status).contains(root.path), "sync report leaked path")
+            let once = try await app.runStartupSync()
+            try require(once == nil, "startup lifetime once")
+            try await app.shutdown()
+            do {
+                _ = try await app.syncNow()
+                throw SmokeFailure.check("sync accepted after shutdown")
+            } catch let error as BridgeError {
+                try require(error == .Unavailable, "shutdown sync rejection")
+            }
+            do {
+                _ = try await app.getSyncStatus()
+                throw SmokeFailure.check("sync status accepted after shutdown")
+            } catch let error as BridgeError {
+                try require(error == .Unavailable, "shutdown status rejection")
+            }
+        } catch {
+            try? await app.shutdown()
+            throw error
+        }
+    }
+
     public func emptyDatabase() async throws {
         try requireOffMainThread()
         let support = try nativeApplicationDataDirectory()

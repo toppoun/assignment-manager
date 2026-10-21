@@ -23,6 +23,15 @@ struct AssignmentShell: View {
             .navigationTitle("課題")
             .toolbar {
                 ToolbarItem {
+                    Button { model.syncNow() } label: {
+                        if model.isSyncing { Label("同期中…", systemImage: "arrow.triangle.2.circlepath") }
+                        else { Label("同期", systemImage: "arrow.triangle.2.circlepath") }
+                    }
+                    .help("設定済みのMoodle・WebClassから課題を同期")
+                    .accessibilityIdentifier("syncAssignments")
+                    .disabled(!model.canSync)
+                }
+                ToolbarItem {
                     Button { model.refresh() } label: { Label("再読み込み", systemImage: "arrow.clockwise") }
                         .help("ローカルの課題一覧を再読み込み（⌘R）")
                         .accessibilityIdentifier("refreshAssignments")
@@ -34,6 +43,23 @@ struct AssignmentShell: View {
     }
 
     @ViewBuilder private var notices: some View {
+        if model.isSyncing {
+            HStack { ProgressView().controlSize(.small); Text("同期中…"); Spacer() }
+                .font(.callout).padding(12)
+        }
+        if case .completed(let moodle, let webclass, _) = model.syncOutcome {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Moodle：\(moodle.message)", systemImage: moodle.symbol)
+                Label("WebClass：\(webclass.message)", systemImage: webclass.symbol)
+            }
+            .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary).accessibilityIdentifier("syncResults")
+        }
+        if let error = model.syncError {
+            Text("同期を完了できませんでした。\(error.message)")
+                .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary).accessibilityIdentifier("syncNotice")
+        }
         if model.savedChangeNeedsRefresh && model.queryError != nil {
             notice("完了状態は保存しました。一覧を更新できませんでした。再読み込みしてください。", symbol: "checkmark.circle")
         } else if let error = model.queryError { notice(error.message, symbol: "exclamationmark.triangle") }

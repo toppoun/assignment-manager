@@ -53,7 +53,7 @@ struct SettingsView: View {
                     set: { enabled in Task { await model.setSyncOnStartup(enabled) } }
                 ))
                 .disabled(model.status == nil)
-                Text("起動時の同期は準備中です。現在は自動実行されません。")
+                Text("ローカルの課題を表示した後、設定済みのMoodle・WebClassをバックグラウンドで同期します。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let error = model.error {

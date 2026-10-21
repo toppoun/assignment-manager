@@ -1,16 +1,18 @@
 //! Thin macOS transport boundary. Workers, storage and policy belong to application/core.
-//! No handwritten FFI or OS API implementations. Native sync is not exported yet.
+//! No handwritten FFI or OS API implementations.
 
 mod dto;
 mod error;
 mod native_ports;
 mod ports;
+mod sync_dto;
 
 pub use dto::*;
 pub use error::BridgeError;
 pub use native_ports::{
     CredentialEntry, NativeCredentialStore, NativeSettingsStore, NativeStoreError,
 };
+pub use sync_dto::*;
 
 use assignment_manager_application::{
     ApplicationHandle,
@@ -94,6 +96,30 @@ impl MacApplication {
         self.application
             .set_sync_on_startup(enabled)
             .await
+            .map_err(Into::into)
+    }
+
+    pub async fn sync_now(&self) -> Result<SyncReportDto, BridgeError> {
+        self.application
+            .sync_now()
+            .await
+            .map(Into::into)
+            .map_err(Into::into)
+    }
+
+    pub async fn run_startup_sync(&self) -> Result<Option<SyncReportDto>, BridgeError> {
+        self.application
+            .run_startup_sync()
+            .await
+            .map(|report| report.map(Into::into))
+            .map_err(Into::into)
+    }
+
+    /// Observe shared single-flight without submitting another run.
+    pub async fn get_sync_status(&self) -> Result<SyncStatusDto, BridgeError> {
+        self.application
+            .get_sync_status()
+            .map(Into::into)
             .map_err(Into::into)
     }
     /// The native shell supplies an absolute database path. Validate worker initialization

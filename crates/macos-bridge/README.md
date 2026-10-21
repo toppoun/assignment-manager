@@ -9,10 +9,15 @@ Swift向けにshared application/coreの公開contractを変更しません。
 
 Phase 10C1でSettings operationsとNativeSettingsStore/NativeCredentialStore foreign traitsを追加しました。
 Swift native Keychainをshared CredentialStoreへ接続し、validation/revisionはapplicationへ委譲します。
-Settings read modelはbooleanのみ。network Sync APIはexportしません。
+Settings read modelはbooleanのみ。
 詳細は[Phase 10C1 report](../../macos/AssignmentManager/PHASE-10C1.md)を参照してください。
 既存open(database_path)はKeychainを使わないoffline regression用constructorとして維持しています。
 `examples/prepare-smoke.rs`は一時DB専用helperで、production libraryの公開APIではありません。
+
+Phase 10C2で`sync_now` / `run_startup_sync` / `get_sync_status`を追加しました。
+shared coordinatorへ委譲し、source結果・safe error enum・件数・shared reload指示のみを返します。
+client/credential/sessionやexternal identityはexportしません。
+詳細は[Phase 10C2 report](../../macos/AssignmentManager/PHASE-10C2.md)を参照してください。
 
 Phase 10Bの[SwiftUI shell](../../macos/AssignmentManager/README.md)も同じbridgeを利用します。
 既存`QueryOptions`のcompletion/course/deadline/sort mappingを再利用し、

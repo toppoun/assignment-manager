@@ -5,6 +5,9 @@ public protocol ApplicationClient: Sendable {
     func open() async throws
     func query(_ selection: QuerySelection) async throws -> AssignmentSnapshot
     func toggle(id: String) async throws -> Bool
+    func syncNow() async throws -> SyncOutcome
+    func runStartupSync() async throws -> SyncOutcome?
+    func syncStatus() async throws -> SyncSnapshot
     func shutdown() async
 }
 
@@ -97,6 +100,18 @@ public actor RustApplicationClient: ApplicationClient, SettingsClient {
     public func toggle(id: String) async throws -> Bool {
         guard let application, !closed else { throw SafeApplicationError.unavailable }
         do { return try await application.toggleCompletion(id: id) == .completed }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func syncNow() async throws -> SyncOutcome {
+        do { return SyncOutcome(try await settingsApplication().syncNow()) }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func runStartupSync() async throws -> SyncOutcome? {
+        do { return try await settingsApplication().runStartupSync().map(SyncOutcome.init) }
+        catch { throw SafeApplicationError(error) }
+    }
+    public func syncStatus() async throws -> SyncSnapshot {
+        do { return SyncSnapshot(try await settingsApplication().getSyncStatus()) }
         catch { throw SafeApplicationError(error) }
     }
     public func shutdown() async {

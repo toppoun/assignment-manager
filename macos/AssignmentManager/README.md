@@ -1,8 +1,8 @@
 # macOS native SwiftUI shell
 
-Phase 10C1でnative Settings scene / Swift Security.framework Keychain / syncOnStartup preferencesを接続しました。
-現在のarchitecture、変更file、検証結果、残るmanual smokeは[Phase 10C1 report](PHASE-10C1.md)を参照してください。
-network syncはPhase 10C2で、まだ接続していません。
+Phase 10C2でmanual Sync / startup Syncをshared application coordinatorへ接続しました。
+現在のarchitecture、変更file、検証結果、ユーザー向け実server smoke手順は[Phase 10C2 report](PHASE-10C2.md)を参照してください。
+native Settings / Swift Security.framework Keychainの設計は[Phase 10C1 report](PHASE-10C1.md)に記録しています。
 
 以下はPhase 10B時点のAssignment shell実装・検証記録です。
 

@@ -50,6 +50,9 @@ actor ControlledClient: ApplicationClient {
     func setToggleError(_ value: SafeApplicationError) { toggleError = value }
     func shutdown() { shutdownCount += 1 }
     func setOpenError(_ value: SafeApplicationError?) { openError = value }
+    func syncNow() -> SyncOutcome { .completed(moodle: .notConfigured, webclass: .notConfigured, shouldReload: false) }
+    func runStartupSync() -> SyncOutcome? { nil }
+    func syncStatus() -> SyncSnapshot { SyncSnapshot(running: false, lastReport: nil) }
 }
 
 @Test @MainActor func filterChangesDoNotCancelAdmittedWriteOrAdoptPrecommitQueryAfterAck() async {
