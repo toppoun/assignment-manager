@@ -34,6 +34,10 @@ admitted operation, reset single-flight early, or undo a DB commit.
 ## Use cases
 
 - `query_assignments(AssignmentQuery)` -> `AssignmentListResponse`
+- `query_assignments_with_clock(AssignmentQuery, QueryClock)` -> same response,
+  using one trusted caller-supplied clock (Web/server adapters and deterministic tests).
+  Transport clients must not supply raw clock/calendar fields. The original query
+  API retains its local-worker `Local::now()` behavior for desktop consumers.
 - `toggle_completion(internal_id)` -> committed `CompletionState`
 - `get_settings_status()` -> configured flags and startup setting only
 - save/remove Moodle configuration and WebClass credentials
@@ -58,7 +62,7 @@ A query loads the validated core read model once. Existing core filter/sort rule
 are applied in memory to this snapshot, with one sampled clock for all projections.
 Items, course options, total count and deadline badges cannot mix separate commits.
 Application read models contain no raw submission/token URL or source identity.
-Tauri alone defines JSON tags, date serialization and localized error messages.
+Transport adapters define wire tags, date serialization and localized error messages.
 
 `toggle_completion` acknowledges the committed state only. If a later list refresh
 fails, the toggle remains successful; callers must not retry it as a failed write.

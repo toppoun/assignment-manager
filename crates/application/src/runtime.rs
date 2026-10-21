@@ -4,7 +4,7 @@ use crate::{
     lifecycle::WorkersLifetime,
     local_worker::{LocalWorker, Response},
     models::AssignmentListResponse,
-    query::AssignmentQuery,
+    query::{AssignmentQuery, QueryClock},
     settings::{SettingsStatus, SettingsStore},
     settings_worker::SettingsWorker,
     sync_service::{CoreSyncBackend, SyncBackend, SyncReport},
@@ -124,7 +124,18 @@ impl ApplicationHandle {
         &self,
         query: AssignmentQuery,
     ) -> Result<AssignmentListResponse, ApplicationError> {
-        receive(self.admit(|w| w.local.list(query))?).await
+        receive(self.admit(|w| w.local.list(query, None))?).await
+    }
+    /// Query with a trusted caller's clock, sampled once for the entire response.
+    /// Transport adapters must construct this context themselves, not accept raw
+    /// clock/calendar values from an untrusted client. Desktop queries keep using
+    /// `query_assignments` and its existing local-clock behavior.
+    pub async fn query_assignments_with_clock(
+        &self,
+        query: AssignmentQuery,
+        clock: QueryClock,
+    ) -> Result<AssignmentListResponse, ApplicationError> {
+        receive(self.admit(|w| w.local.list(query, Some(clock)))?).await
     }
     /// Returns the committed state. A later query failure does not undo this operation.
     pub async fn toggle_completion(&self, id: String) -> Result<CompletionState, ApplicationError> {

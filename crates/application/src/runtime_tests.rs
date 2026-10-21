@@ -56,6 +56,66 @@ fn all() -> AssignmentQuery {
         ..Default::default()
     }
 }
+
+#[test]
+fn explicit_clock_reaches_worker_without_changing_desktop_query_or_lifetime() {
+    use crate::query::{DeadlineSelection, QueryClock};
+    use assignment_manager::domain::Deadline;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("clock.db");
+    let mut store = SqliteStore::open(&path).unwrap();
+    for deadline in [
+        Deadline::DateOnly(chrono::NaiveDate::from_ymd_opt(2001, 1, 2).unwrap()),
+        Deadline::DateTime("2001-01-01T15:00:00.123456789Z".parse().unwrap()),
+    ] {
+        store
+            .create_manual_assignment(ManualAssignmentInput {
+                title: "clock fixture".into(),
+                deadline: Some(deadline),
+                course_id: None,
+                submission: SubmissionTarget::Unknown,
+                submission_url: None,
+            })
+            .unwrap();
+    }
+    drop(store);
+    let app =
+        ApplicationHandle::open(Ok(path), || Ok((MemorySettings::default(), fake()))).unwrap();
+    let today = || AssignmentQuery {
+        deadline: DeadlineSelection::Today,
+        ..all()
+    };
+    let clock = |value| {
+        QueryClock::from_local(chrono::DateTime::parse_from_rfc3339(value).unwrap()).unwrap()
+    };
+    let jst = block_on(
+        app.query_assignments_with_clock(today(), clock("2001-01-02T00:00:00.123456789+09:00")),
+    )
+    .unwrap();
+    assert_eq!(jst.total_count, 2);
+    assert_eq!(jst.items.len(), 2);
+    assert!(
+        jst.items
+            .iter()
+            .all(|item| item.status == crate::models::DeadlineStatus::Today)
+    );
+    // The same instant with a different calendar proves the supplied clock is used.
+    let utc = block_on(
+        app.clone()
+            .query_assignments_with_clock(today(), clock("2001-01-01T15:00:00.123456789Z")),
+    )
+    .unwrap();
+    assert_eq!(utc.items.len(), 1);
+    assert_eq!(
+        block_on(app.query_assignments(all())).unwrap().total_count,
+        2
+    );
+    block_on(app.shutdown());
+    assert_eq!(
+        block_on(app.query_assignments_with_clock(all(), clock("2001-01-01T00:00:00Z"))),
+        Err(ApplicationError::Unavailable)
+    );
+}
 fn configured() -> FakeCredentials {
     use crate::credentials::CredentialStore;
     let mut credentials = fake();

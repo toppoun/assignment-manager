@@ -36,6 +36,12 @@ Tauri側はpath解決、JSON request/DTO、日本語message、JSON settings stor
 
 ## Development
 
+Web-1の合成データ専用HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
+`cargo run --manifest-path crates/web-server/Cargo.toml --locked`で127.0.0.1:3000だけにlistenし、
+課題一覧JSONとhealthを返します。大学通信・実credential・既存desktop DBを使用しません。
+未認証localhost PoCのため外部公開しないでください。Windowsでのsmoke手順・制約・検証結果は
+[Web-1 report](docs/WEB-1-IMPLEMENTATION.md)を参照してください。
+
 Tauriの[OS別prerequisites](https://v2.tauri.app/start/prerequisites/)が必要です。
 WindowsではMSVC build toolsとWebView2、macOSではXcode Command Line Toolsを使用します。
 frontendは素のHTML/CSS/JavaScriptで、npm、frontend framework、pluginは不要です。

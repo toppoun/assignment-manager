@@ -21,7 +21,11 @@ use tokio::sync::oneshot;
 pub(crate) type Reply<T> = oneshot::Sender<Result<T, ApplicationError>>;
 pub(crate) type Response<T> = oneshot::Receiver<Result<T, ApplicationError>>;
 enum Request {
-    List(AssignmentQuery, Reply<AssignmentListResponse>),
+    List(
+        AssignmentQuery,
+        Option<QueryClock>,
+        Reply<AssignmentListResponse>,
+    ),
     Toggle(String, Reply<CompletionState>),
 }
 
@@ -53,11 +57,15 @@ impl LocalWorker {
                 let mut store = path.and_then(open_store);
                 for request in receiver {
                     match request {
-                        Request::List(query, reply) => {
+                        Request::List(query, clock, reply) => {
                             let result = store.as_ref().map_err(|e| *e).and_then(|store| {
-                                // Exactly one clock sample per response.
-                                QueryClock::from_local(Local::now())
-                                    .and_then(|clock| list_from_store(store, &query, &clock))
+                                // Desktop samples once here; server adapters supply
+                                // one already sampled clock for all projections.
+                                let clock = match clock {
+                                    Some(clock) => Ok(clock),
+                                    None => QueryClock::from_local(Local::now()),
+                                }?;
+                                list_from_store(store, &query, &clock)
                             });
                             let _ = reply.send(result);
                         }
@@ -78,9 +86,10 @@ impl LocalWorker {
     pub fn list(
         &self,
         query: AssignmentQuery,
+        clock: Option<QueryClock>,
     ) -> Result<Response<AssignmentListResponse>, ApplicationError> {
         let (reply, response) = oneshot::channel();
-        self.send(Request::List(query, reply))?;
+        self.send(Request::List(query, clock, reply))?;
         Ok(response)
     }
     pub fn toggle(&self, id: String) -> Result<Response<CompletionState>, ApplicationError> {

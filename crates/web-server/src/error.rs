@@ -1,0 +1,116 @@
+//! Fixed public classifications. Never retain a driver, input, path or source cause.
+use assignment_manager_application::error::ApplicationError;
+use axum::{
+    Json,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use serde::Serialize;
+use std::{error::Error, fmt};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebError {
+    InvalidQuery,
+    InvalidRequest,
+    InvalidHost,
+    CrossOrigin,
+    NotFound,
+    MethodNotAllowed,
+    Busy,
+    Unavailable,
+    Internal,
+}
+
+impl WebError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidQuery => "invalid_query",
+            Self::InvalidRequest => "invalid_request",
+            Self::InvalidHost => "invalid_host",
+            Self::CrossOrigin => "cross_origin",
+            Self::NotFound => "not_found",
+            Self::MethodNotAllowed => "method_not_allowed",
+            Self::Busy => "busy",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal_error",
+        }
+    }
+
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::InvalidQuery | Self::InvalidRequest | Self::InvalidHost => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::CrossOrigin => StatusCode::FORBIDDEN,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            Self::Busy | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl From<ApplicationError> for WebError {
+    fn from(value: ApplicationError) -> Self {
+        match value {
+            ApplicationError::InvalidQuery => Self::InvalidQuery,
+            ApplicationError::Busy => Self::Busy,
+            ApplicationError::Unavailable => Self::Unavailable,
+            _ => Self::Internal,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: ErrorCode,
+}
+#[derive(Serialize)]
+struct ErrorCode {
+    code: &'static str,
+}
+
+impl IntoResponse for WebError {
+    fn into_response(self) -> Response {
+        let mut response = (
+            self.status(),
+            Json(ErrorBody {
+                error: ErrorCode { code: self.code() },
+            }),
+        )
+            .into_response();
+        if self.status() == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        response
+    }
+}
+impl fmt::Display for WebError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+impl Error for WebError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn application_errors_have_fixed_http_mappings_without_causes() {
+        for (input, output, status) in [
+            (ApplicationError::InvalidQuery, WebError::InvalidQuery, 400),
+            (ApplicationError::Busy, WebError::Busy, 503),
+            (ApplicationError::Unavailable, WebError::Unavailable, 503),
+            (ApplicationError::Storage, WebError::Internal, 500),
+            (ApplicationError::DatabaseStartup, WebError::Internal, 500),
+        ] {
+            let error = WebError::from(input);
+            assert_eq!(error, output);
+            assert_eq!(error.status().as_u16(), status);
+            assert!(error.source().is_none());
+            assert_eq!(error.to_string(), error.code());
+        }
+    }
+}

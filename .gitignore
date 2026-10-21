@@ -1,5 +1,6 @@
 /target
 /crates/application/target/
+/crates/web-server/target/
 /crates/macos-bridge/target/
 /macos/BridgeSmoke/.build/
 /macos/BridgeSmoke/.swiftpm/
