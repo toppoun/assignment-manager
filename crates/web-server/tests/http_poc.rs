@@ -1,3 +1,4 @@
+mod common;
 use assignment_manager::{
     domain::{AssignmentId, CompletionState},
     persistence::SqliteStore,
@@ -6,7 +7,6 @@ use assignment_manager::{
 use assignment_manager_web_server::{
     Clock, PocServer, PocState, WebError,
     poc::{PRIVATE_MARKER, PocDatabase, SOURCE_MARKER},
-    router,
 };
 use axum::{
     Router,
@@ -35,11 +35,11 @@ impl Clock for FixedClock {
 }
 async fn fixture() -> (tempfile::TempDir, PocDatabase, PocState, Router) {
     let root = tempfile::tempdir().unwrap();
-    let db = PocDatabase::prepare(&root.path().join("poc")).unwrap();
+    let db = common::database(&root.path().join("poc")).unwrap();
     let state = PocState::open(&db, FixedClock(NOW.parse().unwrap()))
         .await
         .unwrap();
-    let app = router(state.clone(), PORT);
+    let app = common::authenticated_router(state.clone(), PORT).await;
     (root, db, state, app)
 }
 async fn request(app: &Router, uri: &str) -> (StatusCode, Value) {
@@ -262,7 +262,7 @@ async fn jst_boundaries_inclusive_windows_and_evaluated_at_share_one_sample() {
     let before = "2026-10-21T14:59:59.999999999Z".parse().unwrap();
     let state = PocState::open(&db, FixedClock(before)).await.unwrap();
     let (_, today) = request(
-        &router(state.clone(), PORT),
+        &common::authenticated_router(state.clone(), PORT).await,
         "/api/v1/assignments?deadline=today&completion=all",
     )
     .await;
@@ -285,7 +285,7 @@ impl Clock for AdvancingClock {
 #[tokio::test]
 async fn one_runtime_multiple_gets_sample_once_each_and_ignore_os_calendar() {
     let root = tempfile::tempdir().unwrap();
-    let db = PocDatabase::prepare(&root.path().join("poc")).unwrap();
+    let db = common::database(&root.path().join("poc")).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let state = PocState::open(
         &db,
@@ -296,7 +296,7 @@ async fn one_runtime_multiple_gets_sample_once_each_and_ignore_os_calendar() {
     .await
     .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1); // Actual readiness query.
-    let app = router(state.clone(), PORT);
+    let app = common::authenticated_router(state.clone(), PORT).await;
     let (_, first) = request(&app, "/api/v1/assignments?deadline=today").await;
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(first["evaluatedAt"], "2026-10-22T15:00:00.123456789Z");
@@ -492,7 +492,7 @@ fn put_request(id: &str, body: impl Into<Body>) -> Request<Body> {
         .header("origin", format!("http://127.0.0.1:{PORT}"))
         .header("sec-fetch-site", "same-origin")
         .header("sec-fetch-mode", "same-origin")
-        .header("x-assignment-manager", "web-2")
+        .header("x-assignment-manager", "web-3a")
         .header("content-type", "application/json")
         .body(body.into())
         .unwrap()
@@ -601,11 +601,11 @@ async fn put_is_idempotent_commits_before_ack_and_preserves_every_other_field_ac
     assert_eq!(after["courses"], before["courses"]);
     assert_eq!(after["totalCount"], 11);
     state.shutdown().await;
-    let reopened = PocDatabase::prepare(db.path().parent().unwrap()).unwrap();
+    let reopened = common::database(db.path().parent().unwrap()).unwrap();
     let state = PocState::open(&reopened, FixedClock(NOW.parse().unwrap()))
         .await
         .unwrap();
-    let app = router(state.clone(), PORT);
+    let app = common::authenticated_router(state.clone(), PORT).await;
     assert_eq!(db_snapshot(&reopened, true), committed);
     assert_eq!(
         item(
@@ -874,12 +874,12 @@ async fn restart_preserves_synthetic_database_and_completion_without_reseeding()
         .set_completion(&AssignmentId::new(&target), CompletionState::Completed)
         .unwrap();
     drop(store);
-    let db2 = PocDatabase::prepare(db.path().parent().unwrap()).unwrap();
+    let db2 = common::database(db.path().parent().unwrap()).unwrap();
     let state = PocState::open(&db2, FixedClock(NOW.parse().unwrap()))
         .await
         .unwrap();
     let (_, after) = request(
-        &router(state.clone(), PORT),
+        &common::authenticated_router(state.clone(), PORT).await,
         "/api/v1/assignments?completion=all",
     )
     .await;
@@ -893,7 +893,7 @@ async fn restart_preserves_synthetic_database_and_completion_without_reseeding()
 #[tokio::test]
 async fn readiness_failure_never_listens_and_has_no_path_or_driver_cause() {
     let root = tempfile::tempdir().unwrap();
-    let db = PocDatabase::prepare(&root.path().join("poc")).unwrap();
+    let db = common::database(&root.path().join("poc")).unwrap();
     std::fs::write(db.path(), b"SYNTHETIC_PRIVATE_WEB1 invalid sqlite").unwrap();
     let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = reserved.local_addr().unwrap().port();
@@ -911,19 +911,19 @@ fn foreign_or_incomplete_directories_are_rejected_without_touching_database() {
     let root = tempfile::tempdir().unwrap();
     let bytes = b"DO_NOT_OPEN_PRIVATE_DESKTOP_DATABASE";
     std::fs::write(root.path().join("assignment-manager.db"), bytes).unwrap();
-    assert!(PocDatabase::prepare(root.path()).is_err());
+    assert!(common::database(root.path()).is_err());
     assert_eq!(
         std::fs::read(root.path().join("assignment-manager.db")).unwrap(),
         bytes
     );
     assert!(!root.path().join("SYNTHETIC-ONLY").exists());
-    assert!(PocDatabase::prepare(std::path::Path::new("relative")).is_err());
+    assert!(common::database(std::path::Path::new("relative")).is_err());
 }
 
 #[tokio::test]
 async fn actual_listener_is_ipv4_loopback_and_graceful_shutdown_reopens() {
     let root = tempfile::tempdir().unwrap();
-    let db = PocDatabase::prepare(&root.path().join("poc")).unwrap();
+    let db = common::database(&root.path().join("poc")).unwrap();
     let server = PocServer::start(&db, FixedClock(NOW.parse().unwrap()), 0)
         .await
         .unwrap();
@@ -941,8 +941,8 @@ async fn actual_listener_is_ipv4_loopback_and_graceful_shutdown_reopens() {
         .unwrap()
         .unwrap();
     let rendered = String::from_utf8(response).unwrap();
-    assert!(rendered.starts_with("HTTP/1.1 200 OK"));
-    assert!(rendered.contains("\"totalCount\":11"));
+    assert!(rendered.starts_with("HTTP/1.1 401 Unauthorized"));
+    assert!(rendered.contains("authentication_failed"));
     send.send(()).unwrap();
     tokio::time::timeout(StdDuration::from_secs(5), task)
         .await
@@ -955,7 +955,7 @@ async fn actual_listener_is_ipv4_loopback_and_graceful_shutdown_reopens() {
         .unwrap();
     assert_eq!(
         request(
-            &router(state.clone(), PORT),
+            &common::authenticated_router(state.clone(), PORT).await,
             "/api/v1/assignments?completion=all"
         )
         .await

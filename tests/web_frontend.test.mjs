@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { createHttpApi, serializeQuery } from "../frontend/http_api.js";
 import { createTauriApi } from "../frontend/tauri_api.js";
 import { createAssignmentListModel } from "../frontend/list_tasks.js";
+import { createWebApp } from "../frontend/web_auth.js";
 import { createListView } from "../frontend/list_view.js";
 import { DEFAULT_CONTROLS, buildQueryRequest } from "../frontend/presentation.js";
 
@@ -38,7 +39,7 @@ test("HTTP defaults and every filter/sort serialize without inventing local filt
   assert.equal(new URLSearchParams(serializeQuery(buildQueryRequest({ ...DEFAULT_CONTROLS, course: "unassigned" }))).has("courseId"), false);
   for (const { options } of calls) {
     assert.equal(options.mode, "same-origin");
-    assert.equal(options.credentials, "omit");
+    assert.equal(options.credentials, "same-origin");
     assert.equal(options.cache, "no-store");
     assert.equal(options.redirect, "error");
     assert.ok(options.signal instanceof AbortSignal);
@@ -57,7 +58,7 @@ test("HTTP completion always sends desired state; repeated PUT has the same URL 
   for (const call of calls) {
     assert.equal(call.url, "/api/v1/assignments/a%20%2F%3F%E6%97%A5%E6%9C%AC%E8%AA%9E/completion");
     assert.equal(call.method, "PUT");
-    assert.deepEqual(call.headers, { "Content-Type": "application/json", "X-Assignment-Manager": "web-2" });
+    assert.deepEqual(call.headers, { "Content-Type": "application/json", "X-Assignment-Manager": "web-3a" });
     assert.deepEqual(Object.keys(JSON.parse(call.body)), ["completion"]);
   }
   assert.equal(calls[0].body, calls[1].body);
@@ -285,9 +286,11 @@ function documentFixture() {
     querySelectorAll(tag) { return this.children.flatMap(c => [c, ...c.querySelectorAll(tag)]).filter(c => c.tagName === tag); }
     get options() { return this.children; }
     focus() { doc.activeElement = this; }
+    click() { return this.listeners.click?.(); }
   }
   const ids = Object.fromEntries(["assignments", "empty", "status", "count", "error", "reload", "reset-filters", "filters",
-    "completion-filter", "deadline-filter", "course-filter", "sort", "empty-title", "empty-description"].map(id => [id, new Element("div")]));
+    "completion-filter", "deadline-filter", "course-filter", "sort", "empty-title", "empty-description",
+    "auth-status", "login-view", "list-view", "web-login", "web-password", "login-form", "login-submit", "logout", "session-retry", "retry-logout"].map(id => [id, new Element("div")]));
   for (const [key, value] of Object.entries(DEFAULT_CONTROLS)) ids[key === "sort" ? "sort" : `${key}-filter`].value = value;
   const doc = { querySelector: selector => ids[selector.slice(1)], createElement: tag => new Element(tag), activeElement: null };
   return { doc, ids, elements };
@@ -312,4 +315,166 @@ test("shared view renders malicious titles as literal text and sends checkbox de
   checkbox.listeners.change(); // Even synthetic duplicate input cannot enqueue another write.
   await view.model.reload();
   assert.deepEqual(calls, [{ id: "a_1", desired: "completed" }]);
+});
+
+const sessionInfo = () => ({ authenticated: true, userId: "internal-random-user", csrfToken: "a".repeat(64),
+  expiresAt: 1800001800, absoluteExpiresAt: 1800043200 });
+const unauthorized = () => response({ error: { code: "authentication_failed" } }, 401);
+const submitLogin = ids => ids["login-form"].listeners.submit({ preventDefault() {} });
+
+test("session restore and CSRF header use cookies without exposing the opaque cookie token", async () => {
+  const calls = [];
+  const api = createHttpApi(async (url, options) => {
+    calls.push({ url, options });
+    if (url === "/api/v1/session") return response(sessionInfo());
+    return response({ id: "a_1", completion: "completed" });
+  });
+  await api.session(); await api.setCompletion("a_1", "completed");
+  assert.equal(calls[0].url, "/api/v1/session");
+  assert.equal(calls[1].options.headers["X-CSRF-Token"], sessionInfo().csrfToken);
+  assert.equal(calls[1].options.credentials, "same-origin");
+  assert.equal(calls[1].options.redirect, "error");
+  assert.equal(calls[1].options.mode, "same-origin");
+  assert.equal(calls[1].options.headers.Cookie, undefined);
+});
+
+test("initial session check shows login; password clears before login finishes and success loads assignments", async () => {
+  const { doc, ids } = documentFixture();
+  const pending = deferred(), calls = [];
+  const app = createWebApp(doc, async (url, options) => {
+    calls.push({ url, options });
+    if (url === "/api/v1/session") return unauthorized();
+    if (url === "/api/v1/auth/login") return pending.promise;
+    return response(list());
+  });
+  await app.start();
+  assert.equal(ids["list-view"].hidden, true);
+  assert.equal(ids["login-view"].hidden, false);
+  ids["web-login"].value = "owner"; ids["web-password"].value = "synthetic-password";
+  const login = submitLogin(ids);
+  assert.equal(ids["web-password"].value, "");
+  assert.equal(ids["login-submit"].disabled, true);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[1].options.body), { login: "owner", password: "synthetic-password" });
+  assert.equal(calls[1].options.headers["X-CSRF-Token"], undefined);
+  pending.resolve(response(sessionInfo())); await login;
+  assert.equal(ids["list-view"].hidden, false);
+  assert.equal(ids["login-view"].hidden, true);
+  assert.equal(ids.count.textContent, "1 / 1件の課題");
+  assert.equal(ids["web-password"].value, "");
+  for (const file of ["web_auth.js", "web_app.js", "http_api.js"]) {
+    const source = readFileSync(new URL(`../frontend/${file}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB|console\./);
+  }
+});
+
+test("reload restores session before GET and expiration or disabled account clears all assignment DOM", async () => {
+  for (const status of [401, 403]) {
+    const { doc, ids } = documentFixture(); let expired = false;
+    const app = createWebApp(doc, async url => {
+      if (url === "/api/v1/session") return response(sessionInfo());
+      if (expired) return response({ error: { code: status === 401 ? "authentication_failed" : "forbidden" } }, status);
+      return response(list());
+    });
+    await app.start(); assert.equal(ids.count.textContent, "1 / 1件の課題");
+    expired = true; await ids.reload.listeners.click();
+    assert.equal(ids["list-view"].hidden, true);
+    assert.equal(ids.assignments.children.length, 0);
+    assert.equal(ids["course-filter"].children.length, 0);
+    assert.equal(ids.count.textContent, "");
+  }
+});
+
+test("logout clears DOM immediately, sends session CSRF and cannot resurrect data from an old GET", async () => {
+  const { doc, ids } = documentFixture(); const oldRead = deferred(), logout = deferred();
+  let reads = 0; const calls = [];
+  const app = createWebApp(doc, async (url, options) => {
+    calls.push({ url, options });
+    if (url === "/api/v1/session") return response(sessionInfo());
+    if (url === "/api/v1/auth/logout") return logout.promise;
+    return ++reads === 1 ? response(list()) : oldRead.promise;
+  });
+  await app.start();
+  const reading = ids.reload.listeners.click();
+  const loggingOut = ids.logout.listeners.click();
+  assert.equal(ids["list-view"].hidden, true);
+  assert.equal(ids.assignments.children.length, 0);
+  assert.equal(ids.count.textContent, "");
+  assert.equal(calls.at(-1).options.headers["X-CSRF-Token"], sessionInfo().csrfToken);
+  oldRead.resolve(response(list([{ ...assignment(), title: "old private data" }]))); await reading;
+  assert.equal(ids.assignments.children.length, 0);
+  logout.resolve(response({ authenticated: false })); await loggingOut;
+  assert.equal(ids["login-view"].hidden, false);
+  assert.equal(ids["web-password"].value, "");
+});
+
+test("login failure, rate limiting and network errors are fixed and recover without retaining password", async () => {
+  const { doc, ids } = documentFixture(); let mode = "offline";
+  const app = createWebApp(doc, async url => {
+    if (mode === "offline") throw new Error("PRIVATE SQL path");
+    if (url === "/api/v1/session") return unauthorized();
+    if (mode === "wrong") return unauthorized();
+    if (mode === "limited") return response({ error: { code: "rate_limited", message: "PRIVATE" } }, 429);
+    if (url === "/api/v1/auth/login") return response(sessionInfo());
+    return response(list());
+  });
+  await app.start(); assert.match(ids["auth-status"].textContent, /通信/);
+  for (const value of ["wrong", "limited", "ok"]) {
+    mode = value; ids["web-login"].value = "owner"; ids["web-password"].value = "synthetic-password";
+    await submitLogin(ids); assert.equal(ids["web-password"].value, "");
+    assert.doesNotMatch(ids["auth-status"].textContent, /PRIVATE|SQL|path/);
+    if (value === "wrong") assert.match(ids["auth-status"].textContent, /確認/);
+    if (value === "limited") assert.match(ids["auth-status"].textContent, /60秒/);
+  }
+  assert.equal(ids["list-view"].hidden, false);
+});
+
+test("unconfirmed logout stays cleared and permits retry before another login", async () => {
+  const { doc, ids } = documentFixture(); let offline = true;
+  const app = createWebApp(doc, async url => {
+    if (url === "/api/v1/session") return response(sessionInfo());
+    if (url === "/api/v1/auth/logout") { if (offline) throw new Error("offline"); return response({ authenticated: false }); }
+    return response(list());
+  });
+  await app.start(); await ids.logout.listeners.click();
+  assert.equal(ids.assignments.children.length, 0);
+  assert.equal(ids["login-submit"].disabled, true);
+  assert.equal(ids["retry-logout"].hidden, false);
+  offline = false; await ids["retry-logout"].listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ids["login-submit"].disabled, false);
+  assert.equal(ids["retry-logout"].hidden, true);
+  assert.equal(ids.assignments.children.length, 0);
+});
+
+test("logout while a PUT is pending suppresses its post-write GET and data restore", async () => {
+  const { doc, ids } = documentFixture(); const put = deferred(); let reads = 0;
+  const app = createWebApp(doc, async (url, options) => {
+    if (url === "/api/v1/session") return response(sessionInfo());
+    if (url === "/api/v1/auth/logout") return response({ authenticated: false });
+    if (options.method === "PUT") return put.promise;
+    ++reads; return response(list());
+  });
+  await app.start();
+  const checkbox = ids.assignments.querySelectorAll("input")[0]; checkbox.checked = true; checkbox.listeners.change();
+  await ids.logout.listeners.click();
+  put.resolve(response({ id: "a_1", completion: "completed" }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads, 1); assert.equal(ids.assignments.children.length, 0);
+});
+
+test("a GET body still being decoded at logout cannot be accepted into the new session", async () => {
+  const body = deferred();
+  const api = createHttpApi(async url => {
+    if (url === "/api/v1/auth/logout") return response({ authenticated: false });
+    if (url === "/api/v1/session") return response(sessionInfo());
+    return { status: 200, ok: true, headers: new Headers({ "Content-Type": "application/json" }), json: () => body.promise };
+  });
+  await api.session();
+  const old = api.listAssignments(buildQueryRequest(DEFAULT_CONTROLS));
+  await new Promise(resolve => setImmediate(resolve));
+  await api.logout();
+  await api.session();
+  body.resolve(list());
+  await assert.rejects(old, { code: "authentication_failed", outcome: "rejected" });
 });

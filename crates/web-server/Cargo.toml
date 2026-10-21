@@ -12,6 +12,14 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 serde = { version = "1", features = ["derive"] }
 chrono = "0.4"
 tempfile = "3"
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+subtle = "2"
+zeroize = "1"
+rpassword = "7.5.4"
+rusqlite = "0.40.2"
+serde_json = "1"
 
 [dev-dependencies]
 rusqlite = "0.40.2"

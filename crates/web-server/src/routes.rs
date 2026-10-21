@@ -1,24 +1,28 @@
 use crate::{
     PocState, WebError,
+    auth::{self, AuthenticatedSession},
     requests::{CompletionRequest, ListRequest},
 };
 use axum::{
     Json, Router,
     body::HttpBody as _,
     extract::{
-        DefaultBodyLimit, Path, Query, Request, State,
+        DefaultBodyLimit, Extension, Path, Query, Request, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use serde::Serialize;
 
 /// Only a port can vary; there is no configurable public host/origin allowlist.
 pub fn router(state: PocState, port: u16) -> Router {
     Router::new()
+        .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/session", get(session))
         .route("/api/v1/assignments", get(assignments))
         .route("/api/v1/assignments/{id}/completion", put(completion))
         .route("/health/live", get(live))
@@ -34,6 +38,7 @@ pub fn router(state: PocState, port: u16) -> Router {
 
 async fn completion(
     State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Result<Json<crate::dto::CompletionResponse>, WebError> {
@@ -53,16 +58,88 @@ async fn completion(
         _ => WebError::InvalidRequest,
     })?;
     Ok(Json(
-        state.set_completion(id, body.completion.into()).await?,
+        state
+            .set_completion(&session.user_id, id, body.completion.into())
+            .await?,
     ))
 }
 
 async fn assignments(
     State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
     request: Result<Query<ListRequest>, QueryRejection>,
 ) -> Result<Json<crate::dto::AssignmentListDto>, WebError> {
     let Query(request) = request.map_err(|_| WebError::InvalidQuery)?;
-    Ok(Json(state.query(request.into_query()?).await?))
+    Ok(Json(
+        state.query(&session.user_id, request.into_query()?).await?,
+    ))
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    login: String,
+    password: String,
+}
+impl Drop for LoginRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
+}
+fn json_error(error: JsonRejection) -> WebError {
+    match error.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => WebError::PayloadTooLarge,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => WebError::UnsupportedMediaType,
+        _ => WebError::InvalidRequest,
+    }
+}
+async fn login(
+    State(state): State<PocState>,
+    headers: header::HeaderMap,
+    body: Result<Json<LoginRequest>, JsonRejection>,
+) -> Result<Response, WebError> {
+    let Json(mut input) = body.map_err(json_error)?;
+    let password = zeroize::Zeroizing::new(std::mem::take(&mut input.password));
+    let (token, session) = state
+        .auth()
+        .login(
+            std::mem::take(&mut input.login),
+            password,
+            auth::read_cookie(&headers)?,
+        )
+        .await?;
+    let mut response = Json(session).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        auth::cookie(&token)
+            .parse()
+            .map_err(|_| WebError::Internal)?,
+    );
+    Ok(response)
+}
+async fn session(
+    Extension(session): Extension<AuthenticatedSession>,
+) -> Json<AuthenticatedSession> {
+    Json(session)
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyBody {}
+async fn logout(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    body: Result<Json<EmptyBody>, JsonRejection>,
+) -> Result<Response, WebError> {
+    let _ = body.map_err(json_error)?;
+    state.auth().logout(session).await?;
+    let mut response = Json(serde_json::json!({"authenticated": false})).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        auth::clear_cookie()
+            .parse()
+            .map_err(|_| WebError::Internal)?,
+    );
+    Ok(response)
 }
 #[derive(Serialize)]
 struct Health {
@@ -95,12 +172,24 @@ fn check(request: &Request, port: u16, accepting: bool) -> Result<(), WebError> 
     if sites.len() > 1 || sites.first().is_some_and(|v| **v == "cross-site") {
         return Err(WebError::CrossOrigin);
     }
+    if request.uri().path().starts_with("/api/")
+        && sites.first().is_some_and(|v| {
+            **v != "same-origin" && !(request.method() == Method::GET && **v == "none")
+        })
+    {
+        return Err(WebError::CrossOrigin);
+    }
     if !accepting {
         return Err(WebError::Unavailable);
     }
-    let mutation = request.method() == Method::PUT
-        && request.uri().path().starts_with("/api/v1/assignments/")
-        && request.uri().path().ends_with("/completion");
+    let mutation = (request.method() == Method::POST
+        && matches!(
+            request.uri().path(),
+            "/api/v1/auth/login" | "/api/v1/auth/logout"
+        ))
+        || (request.method() == Method::PUT
+            && request.uri().path().starts_with("/api/v1/assignments/")
+            && request.uri().path().ends_with("/completion"));
     if request.method() != Method::GET && !mutation {
         return Err(WebError::MethodNotAllowed);
     }
@@ -113,7 +202,7 @@ fn check(request: &Request, port: u16, accepting: bool) -> Result<(), WebError> 
             || headers.get_all("x-assignment-manager").iter().count() != 1
             || headers
                 .get("x-assignment-manager")
-                .is_none_or(|v| v != "web-2")
+                .is_none_or(|v| v != "web-3a")
         {
             return Err(WebError::CrossOrigin);
         }
@@ -185,11 +274,42 @@ fn valid_percent_encoding(bytes: &[u8]) -> bool {
 
 async fn boundary(
     State((state, port)): State<(PocState, u16)>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let mut response = match check(&request, port, state.accepting()) {
-        Ok(()) => next.run(request).await,
+        Ok(()) => {
+            let path = request.uri().path();
+            let protected = path == "/api/v1/session"
+                || path == "/api/v1/auth/logout"
+                || path == "/api/v1/assignments"
+                || (path.starts_with("/api/v1/assignments/") && path.ends_with("/completion"));
+            let authorized = if protected {
+                match auth::read_cookie(request.headers()) {
+                    Ok(token) => state.auth().resolve(token).await,
+                    Err(error) => Err(error),
+                }
+                .and_then(|session| {
+                    if request.method() != Method::GET {
+                        let values: Vec<_> =
+                            request.headers().get_all("x-csrf-token").iter().collect();
+                        if values.len() != 1 {
+                            return Err(WebError::InvalidCsrf);
+                        }
+                        session
+                            .check_csrf(values[0].to_str().map_err(|_| WebError::InvalidCsrf)?)?;
+                    }
+                    request.extensions_mut().insert(session);
+                    Ok(())
+                })
+            } else {
+                Ok(())
+            };
+            match authorized {
+                Ok(()) => next.run(request).await,
+                Err(error) => error.into_response(),
+            }
+        }
         Err(error) => error.into_response(),
     };
     response.headers_mut().insert(

@@ -5,6 +5,8 @@ import {
 import { createAssignmentListModel } from "./list_tasks.js";
 
 export function createListView(api, document_ = document) {
+  let active = true;
+  const listeners = new AbortController();
   const document = document_;
   const list = document.querySelector("#assignments");
   const empty = document.querySelector("#empty");
@@ -143,6 +145,7 @@ export function createListView(api, document_ = document) {
 
   let renderedResponse = null;
   function update(state) {
+    if (!active) return;
     const focus = rememberFocus();
     currentState = state;
     writeControls(state.controls);
@@ -161,14 +164,29 @@ export function createListView(api, document_ = document) {
     restoreFocus(focus);
   }
 
-  const load = () => model.reload(readControls());
-  form.addEventListener("submit", event => event.preventDefault());
-  for (const input of Object.values(controls)) input.addEventListener("change", load);
-  reload.addEventListener("click", load);
+  const load = () => active ? model.reload(readControls()) : Promise.resolve(false);
+  form.addEventListener("submit", event => event.preventDefault(), { signal: listeners.signal });
+  for (const input of Object.values(controls)) input.addEventListener("change", load, { signal: listeners.signal });
+  reload.addEventListener("click", load, { signal: listeners.signal });
   reset.addEventListener("click", () => {
+    if (!active) return;
     writeControls({ ...DEFAULT_CONTROLS, completion: "all" });
     void load();
-  });
+  }, { signal: listeners.signal });
   update(model.snapshot());
-  return { load, model };
+  return { load, model, dispose() {
+    active = false;
+    listeners.abort();
+    model.dispose();
+    currentState = null;
+    renderedResponse = null;
+    list.replaceChildren();
+    controls.course.replaceChildren();
+    count.textContent = "";
+    status.textContent = "";
+    errorBanner.textContent = "";
+    errorBanner.hidden = true;
+    empty.hidden = true;
+    writeControls(DEFAULT_CONTROLS);
+  } };
 }

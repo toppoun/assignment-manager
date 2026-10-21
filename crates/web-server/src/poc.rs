@@ -92,7 +92,7 @@ impl PocDatabase {
     }
 }
 
-fn reject_links(path: &Path) -> Result<(), WebError> {
+pub(crate) fn reject_links(path: &Path) -> Result<(), WebError> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) => {

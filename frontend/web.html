@@ -10,7 +10,19 @@
   </head>
   <body>
     <main>
-      <div id="list-view">
+      <p id="auth-status" class="status" role="status" aria-live="polite">sessionを確認しています…</p>
+      <section id="login-view" hidden>
+        <h1>Assignment Managerにログイン</h1>
+        <p>合成データ専用のローカルデモです。大学のpasswordは入力しないでください。</p>
+        <form id="login-form">
+          <div class="field"><label for="web-login">WebログインID</label><input id="web-login" name="username" autocomplete="username" maxlength="64" required /></div>
+          <div class="field"><label for="web-password">Web専用password</label><input id="web-password" name="password" type="password" autocomplete="current-password" maxlength="256" required /></div>
+          <button id="login-submit" type="submit">ログイン</button>
+        </form>
+        <button id="session-retry" type="button">sessionを再確認</button>
+        <button id="retry-logout" type="button" hidden>ログアウトを再試行</button>
+      </section>
+      <div id="list-view" hidden>
       <header class="page-header">
         <div>
           <p class="eyebrow">Assignment Manager</p>
@@ -20,6 +32,7 @@
         </div>
         <div class="header-actions">
           <button id="reload" type="button">再読み込み</button>
+          <button id="logout" type="button">ログアウト</button>
         </div>
       </header>
       <form id="filters" class="toolbar" aria-label="課題の表示条件">

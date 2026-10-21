@@ -1,11 +1,11 @@
-# Vanilla frontend integration (Web-2)
+# Vanilla frontend integration (Web-3A)
 
 ## Entrypoints and transport
 
 | Consumer | HTML → entrypoint | Injected adapter | Completion |
 | --- | --- | --- | --- |
 | Windows Tauri | frontend/index.html → app.js | tauri_api.js | existing toggle_assignment_completion invoke |
-| Local Browser | `/` (frontend/web.html) → web_app.js | http_api.js | explicit PUT desired state |
+| Local Browser | `/` (frontend/web.html) → web_app.js → web_auth.js | http_api.js | authenticated PUT desired state + CSRF |
 
 Both call `createListView(api)` in list_view.js. There is no runtime transport
 detection or HTTP fallback. Only tauri_api.js references window.__TAURI__.
@@ -25,7 +25,7 @@ Filter/sort and badge membership remain in the Rust application/core.
 
 The HTTP adapter serializes the typed query to completion/deadline/sort/courseMode
 and optional courseId via URLSearchParams. It uses fixed relative paths,
-same-origin mode, omitted credentials, no-store, redirect rejection and a 10-second
+same-origin mode, same-origin credentials, no-store, redirect rejection and a 10-second
 AbortSignal timeout. A timeout ends the browser's wait; it is not a server rollback.
 Responses must be JSON and match the safe list/completion shape. Arbitrary errors,
 response bodies and internal messages never enter UI error text.
@@ -65,7 +65,7 @@ Use reload to observe changes made in another tab. No optimistic state is persis
 
 ## Serving and validation
 
-crates/web-server/src/assets.rs embeds only the Web entry HTML and six required
+crates/web-server/src/assets.rs embeds only the Web entry HTML and seven required
 CSS/JS assets. favicon.ico is an empty 204. There is no filesystem route or directory
 traversal resolution. Assets must be rebuilt into the server after editing.
 The server applies the localhost boundary to static and API requests alike.
@@ -79,4 +79,31 @@ cargo test --manifest-path crates/web-server/Cargo.toml --locked --offline
 
 The Node standard test runner tests the real adapters/controller and a minimal DOM
 seam for literal title rendering/checkbox intent. Browser smoke additionally verifies
-the actual DOM, requests and persistence. See [Phase report](PHASE-WEB-2.md).
+the actual DOM, requests and persistence. See [Phase report](PHASE-WEB-3A.md).
+
+## Web authentication lifecycle
+
+web_auth.js checks GET /api/v1/session before constructing the list view. A 401
+shows the login form; successful POST /api/v1/auth/login sets the HttpOnly Cookie
+and returns safe session information. The adapter retains only the CSRF token in
+memory. The password goes into the transient JSON request, and the input clears
+before awaiting its response; no browser storage is used. Password buffers inside
+the browser/network engine cannot be guaranteed to be erased by JavaScript.
+
+PUT and logout send X-CSRF-Token plus X-Assignment-Manager: web-3a and JSON.
+Login uses the same non-simple header/JSON/Origin policy without a session token.
+The browser sets Origin and Fetch Metadata itself. No UserId/tenant/DB path is
+accepted as a client ownership selector. The server resolves the Cookie owner.
+
+Logout immediately disposes the view, clears rows, Course options/counts/errors,
+and invalidates adapter and model generations. Old GET/body/PUT responses cannot
+restore data or initiate post-write reconciliation after logout. View disposal
+also aborts its control event listeners; Tauri never calls this auth lifecycle.
+401/403 responses similarly return to login. A failed logout keeps the list empty,
+blocks another login and offers a server-confirmed logout retry. Back/forward cache
+restores check the session again before showing assignments.
+
+Idle/absolute expiration is enforced by the server. On the next API request the
+UI clears expired data; it has no background keepalive. Other tabs do not yet
+receive a logout broadcast and revalidate on their next request/reload. This PoC
+supports one account and is not approved for public multi-user use.

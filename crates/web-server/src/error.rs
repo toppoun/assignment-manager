@@ -10,6 +10,12 @@ use std::{error::Error, fmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebError {
+    Unauthorized,
+    Forbidden,
+    InvalidCsrf,
+    RateLimited,
+    SetupRequired,
+    AccountExists,
     InvalidQuery,
     InvalidRequest,
     InvalidHost,
@@ -26,6 +32,12 @@ pub enum WebError {
 impl WebError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::Unauthorized => "authentication_failed",
+            Self::Forbidden => "forbidden",
+            Self::InvalidCsrf => "invalid_csrf",
+            Self::RateLimited => "rate_limited",
+            Self::SetupRequired => "bootstrap_required",
+            Self::AccountExists => "account_exists",
             Self::InvalidQuery => "invalid_query",
             Self::InvalidRequest => "invalid_request",
             Self::InvalidHost => "invalid_host",
@@ -42,6 +54,10 @@ impl WebError {
 
     pub fn status(self) -> StatusCode {
         match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden | Self::InvalidCsrf => StatusCode::FORBIDDEN,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::SetupRequired | Self::AccountExists => StatusCode::CONFLICT,
             Self::InvalidQuery | Self::InvalidRequest | Self::InvalidHost => {
                 StatusCode::BAD_REQUEST
             }
@@ -91,6 +107,11 @@ impl IntoResponse for WebError {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        if self == Self::RateLimited {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
         }
         response
     }

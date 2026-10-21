@@ -1,178 +1,134 @@
-# Web-2 local Browser UI + HTTP PoC
+# Web-3A: local authentication + Browser HTTP PoC
 
-既存shared applicationを利用する、合成データ専用・未認証のHTTP PoCです。
-**127.0.0.1:3000だけにlistenします。外部公開、reverse proxy、tunnel接続は行わないでください。**
-同一originのvanilla HTML/CSS/JavaScriptで一覧・filter/sort・完了変更を利用できます。
-認証、credential保管、大学同期、公開運用、PWAは含みません。
+合成データ専用・Web専用password認証のPoCです。
+**127.0.0.1:3000だけにbindします。外部公開、LAN、reverse proxy、tunnel運用は禁止です。**
+本番HTTPS、reverse proxy trust、deployment secret管理は未実装です。
+Cookie policyはHTTP loopback専用で、production/public flagやbind/DB pathの選択機能はありません。
+Ready for Web-3Bは次Phaseへの着手判定であり、公開運用の許可ではありません。
 
-## 起動
+## Bootstrap / start
 
-repository rootからWindows PowerShellで:
-
-```powershell
-cargo run --manifest-path crates/web-server/Cargo.toml --locked
-```
-
-初回dependency取得後は `--offline` を追加できます。Ctrl+Cで停止します。
-CLI引数は受け付けません。host/bind/DBの選択や環境変数によるpublic bindはありません。
-port 3000が使用中なら固定code `unavailable` で終了します。
-
-Browser UI:
-
-[http://127.0.0.1:3000/](http://127.0.0.1:3000/)
-
-画面には「合成データを使ったローカルデモ」と表示し、Settings/Sync操作はありません。
-JSONも確認できます:
-
-[http://127.0.0.1:3000/api/v1/assignments](http://127.0.0.1:3000/api/v1/assignments)
-
-PowerShell:
+serverを停止した状態でrepository rootから実行します。
 
 ```powershell
-$base = 'http://127.0.0.1:3000'
-Invoke-RestMethod "$base/health/live"
-$snapshot = Invoke-RestMethod "$base/api/v1/assignments?completion=all&sort=title"
-$snapshot | Select-Object totalCount, evaluatedAt, timeZone
-$snapshot.items | Select-Object title, completion, deadline, status
-$snapshot.courses | Format-Table
-Invoke-RestMethod "$base/api/v1/assignments?courseMode=unassigned"
+cargo run --manifest-path crates/web-server/Cargo.toml --locked -- bootstrap-admin
 ```
 
-curl（PowerShellではaliasを避けてcurl.exe）:
+Web専用login ID (ASCII英数字/._-、1–64 bytes)を入力し、大学とは別のpassword
+(15–256 bytes、制御文字なし)を非表示入力で2回入力します。passwordをCLI引数、
+env file、sourceへ保存しないでください。公開signup・default account・auth bypassはありません。
+既存accountはaccount_existsで拒否し、transaction失敗で不完全なaccountを残しません。
+account未作成のserver起動はbootstrap_requiredで停止します。
 
 ```powershell
-curl.exe --noproxy '*' -i 'http://127.0.0.1:3000/health/live'
-curl.exe --noproxy '*' -i 'http://127.0.0.1:3000/api/v1/assignments?deadline=today'
-curl.exe --noproxy '*' -i 'http://127.0.0.1:3000/api/v1/assignments?completion=all&completion=all'
-curl.exe --noproxy '*' -i -H 'Host: invalid.example:3000' 'http://127.0.0.1:3000/api/v1/assignments'
-curl.exe --noproxy '*' -i -H 'Origin: https://invalid.example' 'http://127.0.0.1:3000/api/v1/assignments'
+cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline
 ```
 
-最後の3件は400 invalid_query、400 invalid_host、403 cross_originを返します。
-成功・エラーともCache-Control: no-store、X-Content-Type-Options: nosniffを付けます。
-Access-Control-Allow-Origin等のCORS許可headerは返しません。
-
-Windowsでlisten先を確認:
+[Browser UI](http://127.0.0.1:3000/)からログインします。Ctrl+Cで停止します。
+CLIは引数なしまたはbootstrap-adminだけを許可。control DBのexclusive OS file lockで
+複数serverや稼働中bootstrapを拒否します。localhostと127.0.0.1は別Cookie hostです。
+Host/portとOriginの完全一致を要求し、CORS許可はありません。
 
 ```powershell
 Get-NetTCPConnection -LocalPort 3000 -State Listen |
     Select-Object LocalAddress, LocalPort, OwningProcess
 ```
 
-LocalAddressが127.0.0.1だけであることを確認します。0.0.0.0、LAN IP、::にはbindしません。
-localhostのHostも同じportで許可しますが、Originがある場合は実際のHostと完全一致した
-http://originだけを許可します。127.0.0.1とlocalhostを跨ぐOriginも拒否します。
+LocalAddressが127.0.0.1だけであることを確認してください。
 
-## Synthetic SQLite
+## Storage / isolation
 
-保存先はこのcrateの `target/web-poc/assignment-manager.db` です。
-desktop app_data_dir、macOS Application Support、OS credential storeを参照しません。
-新規directoryだけをseedし、再起動時はSYNTHETIC-ONLY markerとregular DBを検証します。
-foreign directory、marker不整合、symlink/reparse point、壊れたDBは安全なerrorで停止し、
-自動上書き・再seed・削除はしません。初期作成中断でmarkerがない場合も同様です。
+固定directoryはcrates/web-server/target/web-pocです。
 
-11課題、同名のMoodle/WebClass相当Course 2件、未所属3件、完了済み1件を含みます。
-初期defaultの未完了一覧は10件、totalCountは11です。Course IDsは初回にcoreが生成し、
-再起動で保持します。締切は2026-10-21〜29付近の固定合成日付なので、実行日によりbadgeが変わります。
-synthetic submission URLとsource markerはDBにだけ存在し、JSONには返しません。
+| File | Responsibility |
+| --- | --- |
+| assignment-manager.db | 既存synthetic課題DB、core schema v3のまま |
+| SYNTHETIC-ONLY | 既存PoC所有marker、再seed禁止 |
+| web-control.db | 独立Web control schema v1: accounts / sessions / login_attempts |
+| web-control.lock | server/bootstrapのexclusive OS lock。fileの存在だけではlock判定しない |
 
-Browserのcheckboxで変更→reload→Ctrl+C→同じcommandで起動→完了済みfilterで、
-状態とitems/coursesのID・件数が保持されることを確認できます。DBを選ぶHTTP/CLI機能はありません。
+初回だけ11課題をseedします。marker不整合、symlink/reparse point、foreign/unknown schema、
+破損DBはfail closedです。既存課題DBを変更してWeb tableを追加しません。
+認証後のUserIdがimmutable TenantRuntime.ownerと一致してから、1つのApplicationHandleへ
+query/setを送ります。request単位で3 workerを作らず、DB pathをrequestから選びません。
+NoCredentials / MemorySettings / DisabledNetworkBackendを維持し、大学HTTP client、
+real Keychain、大学設定、startup sync、sync/settings endpointはありません。
 
-## API contract
+## Authentication / session API
 
-GET /api/v1/assignments、GET /health/live、PUT /api/v1/assignments/{id}/completionです。
-GETはrequest bodyを受け付けません。completion routeのGET等は固定405です。
-static allowlist以外のpathは固定404で、HTTP toggle/settings/sync endpointはありません。
+| Method / path | Behavior |
+| --- | --- |
+| POST /api/v1/auth/login | JSON login/passwordを検証、新規Cookie + safe session JSON |
+| GET /api/v1/session | authenticated/userId/csrfToken/expiresAt/absoluteExpiresAt |
+| POST /api/v1/auth/logout | JSON {} + CSRF、server record削除、Cookie Max-Age=0 |
+| GET /api/v1/assignments | 認証されたownerの一覧 |
+| PUT /api/v1/assignments/{id}/completion | 認証されたownerの明示completion設定 + CSRF |
+| GET /health/live | 認証不要、secretなしのalive status |
 
-| Query | 許可値 | 省略時 |
-| --- | --- | --- |
-| completion | all / incomplete / completed | shared default: incomplete |
-| deadline | all / overdue / today / within_seven_days | shared default: all |
-| sort | deadline / course / title | shared default: deadline |
-| courseMode | all / unassigned / course | shared default: all |
-| courseId | courseMode=courseの時だけ必須、空白のみ/制御文字不可、256 bytes以内 | なし |
+未認証/無効/期限切れは401 authentication_failed。unknown ID・wrong password・disabled accountの
+login失敗は同じ401です。有効sessionのaccount無効化・tenant owner不一致は403。
+JSONはpassword verifier、raw session token、server secretを返しません。
+session時刻はUnix seconds。課題APIのevaluatedAtは従来どおりUTC RFC3339です。
 
-unknown/duplicate parameter、enum不正、矛盾するCourse条件、過大query、不正percent encodingは400です。
-now/local_date/utc_offset/timeZone等をclientから指定するAPIはありません。
-存在しないopaque Course IDは正常な空結果で、totalCountとCourse候補は保持します。
+Cookieはam_loopback_session、256-bit OS乱数、HttpOnly、SameSite=Strict、Path=/、
+Max-Age=43200、Domainなし。**HTTP loopback専用のためSecureなし**です。
+将来の本番HTTPSは別policyで__Host- prefix + Secure + Path=/ + Domainなしを必須とします。
+現状は本番配信経路自体がなく、Secureを外すproduction switchもありません。
 
-responseはitems / courses / totalCount / evaluatedAt / timeZone。
-Assignmentはid / title / deadline / completion / submission / hasSubmissionUrl / course / status。
-deadlineは `{kind:"date_only",value:"YYYY-MM-DD"}`、UTC RFC3339のdate_time、noneを区別します。
-必要な小数秒を保持し、DateOnlyをUTC midnightに変換しません。WebClass tagは既存Tauri同様web_classです。
-source identity、raw submission URL、credential、DB pathは返しません。
-errorは `{"error":{"code":"invalid_query"}}` 等の固定codeだけです。
-busy/unavailableは503 + Retry-After、内部storage失敗は500です。
+idle 30分、absolute 12時間をserverで検証。API活動でidleを更新しますがabsoluteは固定。
+loginでCookie/CSRFを新規発行し、提示された旧sessionを同一transactionで失効させます。
+logout後のreplayは401。reloadはCookieを利用可能ですが、server再起動では全sessionを
+削除し再ログインを要求します。account、課題、completionは保持します。
+loginは全ID合計5回/60秒 (成功・失敗を含む)、同時hash検証1件、超過は429 + Retry-After: 60。
+limit timestampも再起動で消しません。password reset/changeは今回未実装です。
 
-### Completion PUT
+## CSRF / request boundaries
 
-```http
-PUT /api/v1/assignments/{id}/completion
-Origin: http://127.0.0.1:3000
-Content-Type: application/json
-X-Assignment-Manager: web-2
+login・logout・PUTには実Hostと完全一致するOrigin、X-Assignment-Manager: web-3a、
+application/json (任意のcharset=utf-8だけを許可)が必要です。
+Fetch MetadataがあればSite=same-origin、Mode=same-origin/corsだけです。
+logout・PUTにはさらにsessionに束縛したX-CSRF-Token (constant-time比較)が必要です。
+loginはOrigin/JSON/custom header/Metadataでlogin CSRFを防御します。
+CLIはMetadata省略可能ですが、Origin/custom header/JSON/認証・CSRFは必須です。
+GET APIはsame-origin、または直接navigationのnoneを許可し、same-site/cross-site/不明値を拒否。
+mutationのnoneは拒否します。旧web-2 headerだけでは許可しません。
 
-{"completion":"completed"}
-```
+全bodyは1024 bytes上限、queryは2048 bytes。不明・重複field、不正enum/JSON/IDを拒否します。
+raw error/body/path/SQL/secretをlogやresponseへ出しません。全responseにno-store、nosniff、
+CSP、no-referrer、X-Frame-Options: DENY、CORP: same-originを設定します。
 
-`incomplete`も指定できます。成功は200 + `{"id":"…","completion":"completed"}`。
-coreの明示setを呼び、SQLite commit後に応答します。同状態の再PUTは反転せずupdated_atも不変です。
-unknown field/重複field/不正JSON/不正値/空白・制御文字等の不正IDは400、存在しないIDは404、
-Content-Type不正は415、1024 bytes超のbodyは413です。Content-Lengthのないbodyにも上限を適用します。
-JSONはapplication/json、任意の`; charset=utf-8`だけを許可します。
+## Assignment API (Web-2 contract retained)
 
-PowerShellでの合成データ操作例:
+| Query | Values / default |
+| --- | --- |
+| completion | all / incomplete (default) / completed |
+| deadline | all (default) / overdue / today / within_seven_days |
+| sort | deadline (default) / course / title |
+| courseMode | all (default) / unassigned / course |
+| courseId | courseMode=courseの場合だけ、空でないopaque CourseId |
 
-```powershell
-$base = 'http://127.0.0.1:3000'
-$snapshot = Invoke-RestMethod "$base/api/v1/assignments?completion=all"
-$id = [uri]::EscapeDataString($snapshot.items[0].id)
-$headers = @{ Origin = $base; 'X-Assignment-Manager' = 'web-2' }
-Invoke-RestMethod "$base/api/v1/assignments/$id/completion" -Method Put `
-    -ContentType 'application/json' -Headers $headers -Body '{"completion":"completed"}'
-```
+responseはitems/courses/totalCount/evaluatedAt/timeZone。DateOnlyはcalendar string、
+DateTimeはUTC RFC3339小数秒を維持。Asia/Tokyoの期限分類/sortはserver/applicationが計算します。
+raw submission URL/source identityは返しません。
 
-PUTには実Hostと完全一致するOriginと専用headerが必須です。
-Fetch Metadataがある場合、Sec-Fetch-Siteはsame-originだけ、Sec-Fetch-Modeはsame-origin/corsだけを許可します。
-CLIはFetch Metadataを省略できますが、Origin・専用header・JSONは必須です。
-これらは未認証loopback PoC向けのCSRF対策で、本番の認証・authorizationの代替にはなりません。
+認証済みPUT bodyは {"completion":"completed"} または {"completion":"incomplete"}。
+成功200は{id,completion}。SQLite commitを待って返します。同じPUTの再送は反転せず、
+同状態のupdated_atも不変。unknown IDは404。PUT応答喪失時はUIが未保存と断定せず、
+全件GETで照合してから操作を再開します。
 
-### Static frontend
+## Browser / lifecycle
 
-`/`→frontend/web.html、styles.css、web_app.js、http_api.js、list_view.js、list_tasks.js、presentation.js
-だけをinclude_bytes!で埋め込みます。favicon.icoは204です。runtime filesystem readやdirectory listingはありません。
-Tauri entrypoint/settings/sync、DB、source/config/lockfileは配信しません。asset変更後はserverを再buildしてください。
-HTML/CSS/JSにはUTF-8の正しいContent-Typeを付け、全応答にno-store、nosniff、CSP、no-referrer、
-frame拒否、CORP same-originを設定します。外部CDNへの依存はありません。
+web_auth.jsがsessionを確認し、login成功後だけ共通list viewを作成します。
+CookieはJSへ返さず、CSRFだけmemory保持。logout/401/403でrows/Course options/countsを消去し、
+古いGET/PUTからの復活を防止。失敗したlogoutは一覧を隠したまま再試行できます。
+passwordのbrowser storageはありません。titleはtextContentで描画します。
 
-## Architecture / lifecycle
+compile-time allowlistは/、styles.css、web_app.js、web_auth.js、http_api.js、list_view.js、
+list_tasks.js、presentation.jsだけ。faviconは204。filesystem serving/desktop module配信はありません。
+asset変更後はrebuildが必要。startupはowner設定検証→実query/readiness→bind。
+shutdownはadmission停止→HTTP drain→application shutdown→control DB/lock close。
 
-```text
-Browser → same-origin GET/PUT → Axum transport DTO
-  → one PocState / ApplicationHandle → local worker → SQLite v3
-  → safe application read model → Web JSON DTO
-```
-
-shared applicationのquery_assignments_with_clockと新しいset_completionを利用します。既存query_assignmentsは
-Local::now()を使う従来のままで、Tauri/SwiftUIの時計を変更しません。
-WebではserverがUTC instantを一度だけsampleし、+09:00のQueryClockを生成します。
-evaluatedAtも同じsampleで、server OS timezoneに依存しません。filter/sort/badgeは全てshared/core側です。
-Web表示もresponse.timeZone=Asia/TokyoをIntlへ指定します。DateOnlyは文字列のcalendar dateのまま表示します。
-共通のlist view/controllerへadapterを注入し、desktopは既存invoke/toggle、Webはfetch/PUTを選びます。
-自動transport fallbackはありません。[frontend統合説明](../../docs/FRONTEND-INTEGRATION.md)を参照してください。
-
-checkbox操作は希望状態を決定→二重操作防止→PUT→現在の条件でGETの順です。
-保存成功と再取得失敗を分け、PUT応答喪失時は未保存と断定せず、全件GETで実際の状態を確認します。
-確認できるまでcheckboxを停止し、再読み込みで復旧します。filter変更は通信中も可能で、古いGETは破棄します。
-
-startupはsynthetic DB検証→open_with_backend→実queryによるreadiness→loopback bind。
-initializerはmemory settingsと未設定credential portだけで、DisabledNetworkBackendは全操作を拒否します。
-startup syncや大学HTTP clientを起動する経路はありません。
-Ctrl+CはHTTP受付停止→既存HTTP request drain→ApplicationHandle.shutdown().await→終了です。
-async threadでworkerをblocking joinしません。
-
-## Checks
+## Verification
 
 ```powershell
 cargo fmt --manifest-path crates/web-server/Cargo.toml --check
@@ -181,8 +137,6 @@ cargo test --manifest-path crates/web-server/Cargo.toml --locked --offline
 node --test tests/frontend.test.mjs tests/settings.test.mjs tests/sync.test.mjs tests/web_frontend.test.mjs
 ```
 
-testsはisolated temporary DBとloopback socketだけを使い、実credentialや大学serverへ接続しません。
-clockはserver-side test seamで固定できますが、HTTPからのclock入力はありません。
-[Web-2実装・検証報告](../../docs/PHASE-WEB-2.md)に実測結果と制限を記載します。
-Web-1の履歴は[Web-1報告](../../docs/WEB-1-IMPLEMENTATION.md)にあります。
-AxumのState/Query/serveは[公式documentation](https://docs.rs/axum/0.8.9/axum/)を参照しています。
+[認証設計](../../docs/WEB-AUTHENTICATION.md)、[Web-3A検証報告](../../docs/PHASE-WEB-3A.md)、
+[frontend統合](../../docs/FRONTEND-INTEGRATION.md)を参照してください。
+WindowsでRust/Tauri buildを確認し、macOS native/XcodeはWindowsでは未検証です。

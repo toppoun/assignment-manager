@@ -36,13 +36,18 @@ Tauri側はpath解決、JSON request/DTO、日本語message、JSON settings stor
 
 ## Development
 
-Web-2の合成データ専用Browser UI + HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
-`cargo run --manifest-path crates/web-server/Cargo.toml --locked`で127.0.0.1:3000だけにlistenし、
-Browserで`http://127.0.0.1:3000/`を開くと、課題一覧・Course/締切/完了filter・並び替え・完了状態の保存を利用できます。
-ページreloadとserver再起動後も完了状態を保持します。大学通信・実credential・既存desktop DBを使用しません。
-未認証localhost PoCのため外部公開しないでください。Windowsでのsmoke手順・制約・検証結果は
-[Web-2 report](docs/PHASE-WEB-2.md)と[frontend統合説明](docs/FRONTEND-INTEGRATION.md)を参照してください。
-Webの日時表示・badgeはAsia/Tokyoで統一し、Settings/Sync操作は提供しません。認証・公開運用は未実装です。
+Web-3Aの合成データ専用Browser UI + HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
+最初にserverを停止した状態で、`cargo run --manifest-path crates/web-server/Cargo.toml --locked -- bootstrap-admin`
+を実行し、Web専用IDと大学とは別のpasswordをterminalの非表示入力で作成します。公開signupはありません。
+引数なしの同じcommandで127.0.0.1:3000だけにlistenします。
+Browserで[ローカルUI](http://127.0.0.1:3000/)へログインし、課題一覧・filter/sort・完了変更を利用できます。
+reloadでsessionを再利用し、logout・idle 30分・absolute 12時間・server再起動で失効します。
+課題の完了状態とWeb accountは再起動後も保持します。大学通信・実credential・既存desktop DBは使用しません。
+**HTTP loopback開発専用です。外部公開・LAN bind・reverse proxy・tunnel運用は禁止です。**
+本番HTTPS、Secure/__Host- Cookieによる本番配信、reverse proxy trust、deployment secret管理は未実装です。
+public/production flagや非Secure Cookieを本番へ持ち込む切替はありません。
+設計は[Web認証・session](docs/WEB-AUTHENTICATION.md)、検証結果は[Web-3A report](docs/PHASE-WEB-3A.md)、
+frontendは[統合説明](docs/FRONTEND-INTEGRATION.md)を参照してください。Web-3Bは実装していません。
 
 Tauriの[OS別prerequisites](https://v2.tauri.app/start/prerequisites/)が必要です。
 WindowsではMSVC build toolsとWebView2、macOSではXcode Command Line Toolsを使用します。

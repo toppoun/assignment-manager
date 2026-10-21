@@ -1,5 +1,5 @@
-import { createListView } from "./list_view.js";
-import { createHttpApi } from "./http_api.js";
+import { createWebApp } from "./web_auth.js";
 
-const { load } = createListView(createHttpApi());
-void load();
+const app = createWebApp();
+void app.start();
+window.addEventListener("pageshow", event => { if (event.persisted) void app.resume(); });

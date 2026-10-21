@@ -1,6 +1,7 @@
-//! Unauthenticated, synthetic-data-only, IPv4 loopback HTTP PoC.
+//! Authenticated, synthetic-data-only, IPv4 loopback HTTP PoC.
 #![forbid(unsafe_code)]
 mod assets;
+pub mod auth;
 mod dto;
 mod error;
 pub mod poc;
@@ -115,6 +116,8 @@ mod tests {
         use tower::ServiceExt;
         let root = tempfile::tempdir().unwrap();
         let db = PocDatabase::prepare(&root.path().join("poc")).unwrap();
+        crate::auth::bootstrap_admin(&db, "owner", "synthetic-unit-password-3A".to_owned().into())
+            .unwrap();
         let entered = Arc::new(Notify::new());
         let (resume, paused) = mpsc::channel();
         let server = PocServer::start(
@@ -129,13 +132,22 @@ mod tests {
         .await
         .unwrap();
         let state = server.state.clone();
+        let (token, session) = state
+            .auth()
+            .login(
+                "owner".into(),
+                "synthetic-unit-password-3A".to_owned().into(),
+                None,
+            )
+            .await
+            .unwrap();
         let address = server.local_addr();
         let (stop, signal) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(server.serve(async {
             let _ = signal.await;
         }));
         let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
-        client.write_all(format!("GET /api/v1/assignments HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        client.write_all(format!("GET /api/v1/assignments HTTP/1.1\r\nHost: {address}\r\nCookie: {}={token}\r\nConnection: close\r\n\r\n", crate::auth::COOKIE_NAME).as_bytes()).await.unwrap();
         entered.notified().await;
         stop.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -176,7 +188,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            state.query(Default::default()).await,
+            state.query(&session.user_id, Default::default()).await,
             Err(WebError::Unavailable)
         ));
     }

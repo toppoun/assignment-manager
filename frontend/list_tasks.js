@@ -13,13 +13,14 @@ export function createListTaskRunner() {
 // Shared controller: serialized local operations plus query generations. Controls
 // remain usable during I/O; a superseded response can never replace the current view.
 export function createAssignmentListModel(api, onChange = () => {}) {
+  let disposed = false;
   const run = createListTaskRunner();
   const state = { controls: { ...DEFAULT_CONTROLS }, response: null, loading: false,
     pendingId: null, needsRefresh: false, error: null, message: "", write: null };
   let generation = 0;
   let appliedGeneration = -1;
   const snapshot = () => ({ ...state, controls: { ...state.controls } });
-  const notify = () => onChange(snapshot());
+  const notify = () => { if (!disposed) onChange(snapshot()); };
 
   async function reconcile() {
     if (state.write?.kind !== "unknown") return;
@@ -67,6 +68,7 @@ export function createAssignmentListModel(api, onChange = () => {}) {
   }
 
   function reload(controls = state.controls) {
+    if (disposed) return Promise.resolve(false);
     buildQueryRequest(controls);
     if (!state.needsRefresh && state.pendingId === null) state.write = null;
     state.controls = { ...controls };
@@ -77,7 +79,7 @@ export function createAssignmentListModel(api, onChange = () => {}) {
   }
 
   function setCompletion(id, desired) {
-    if (state.pendingId !== null || state.loading || state.needsRefresh
+    if (disposed || state.pendingId !== null || state.loading || state.needsRefresh
         || !["completed", "incomplete"].includes(desired)
         || !state.response?.items.some(item => item.id === id)) return Promise.resolve(false);
     state.pendingId = id; // Set synchronously, before enqueue, to block double input.
@@ -90,8 +92,10 @@ export function createAssignmentListModel(api, onChange = () => {}) {
     return run(async () => {
       try {
         await api.setCompletion(id, desired);
+        if (disposed) return false;
         state.write = { kind: "saved", id };
       } catch (error) {
+        if (disposed) return false;
         if (error?.outcome === "rejected") {
           state.needsRefresh = true;
           state.error = operationErrorMessage("toggle", error);
@@ -110,5 +114,11 @@ export function createAssignmentListModel(api, onChange = () => {}) {
       finally { state.pendingId = null; notify(); }
     });
   }
-  return { snapshot, reload, setCompletion };
+  return { snapshot, reload, setCompletion, dispose() {
+    disposed = true;
+    ++generation;
+    state.response = null;
+    state.write = null;
+    state.pendingId = null;
+  } };
 }
