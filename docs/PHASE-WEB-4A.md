@@ -3,10 +3,14 @@
 実施日: 2026-10-22（Asia/Tokyo）。Repository: toppoun/assignment-manager。
 Branch: feature/web-migration。実行環境: macOS / aarch64-apple-darwin。
 
-**判定: BLOCKED（必須のWindows build / Windows Browser manual smoke未確認）。**
-Web-4Aの実装、Mac上のRust/Node回帰と合成Browser部分smokeは完了。
-Windows MSVC targetを持つ環境で下記の残項目を検証するまでReady for Web-4Bとはしない。
-Web-4B、実大学通信、公開配信は実装していない。
+**最終判定: Ready（2026-10-22、Windows gate完了。追補§17参照）。**
+Windows x86_64 MSVCでTauri build、Rust/Node回帰、全manifestのfmt/clippy、
+隔離Mock Browser smoke 19項目、Windows KeyProvider検証がPASSした。
+詳細は[Windows検証報告](PHASE-WINDOWS-VERIFICATION.md)を参照。
+Web-4B3 Preflightの実大学接続gateは独立して**BLOCKED**を維持する。
+
+以下§1–16は当初のMac検証時点の履歴であり、その中のWindows「未確認」「BLOCKED」や
+Web-4B「未実装」は当時の記録。最新のWindows結果と判定は§17を適用する。
 
 ## 1. Changed files
 
@@ -278,4 +282,61 @@ listenはlsofで127.0.0.1:3000だけ。使い捨てserverは正常終了し、�
 - MockはSSO/protocol/real networkを立証しない。大学接続・production安全性は別Phaseの明示許可が必要。
 - Web-4Bは実装していない。
 
-**BLOCKED**
+**当初判定（Mac検証時点）: BLOCKED。Windows gateは下記§17で解消。**
+
+## 17. Windows final verification（2026-10-22追補）
+
+検証HEAD: `ea384dfac97eec1c37523a7f59e94829fcd8eaea`。
+Branch: `feature/web-migration`。開始時working treeはclean、commit/pushなし。
+環境: Windows x64 / 25H2 / build 26200.9711、Rust/Cargo 1.97.1、
+`stable-x86_64-pc-windows-msvc`、MSVC toolset 14.44.35207、Node v24.12.0。
+
+| 必須項目 | Windows結果 |
+| --- | --- |
+| Tauri `cargo build --manifest-path src-tauri/Cargo.toml --locked --features custom-protocol` | PASS |
+| Web all-features / default | 61 / 49 tests PASS。Windows専用ignored testは別実行で1 PASS |
+| core / application / macos-bridge Rust / Tauri Rust | 346+11 doctests / 34+3 doctests / 18 / 18 PASS |
+| frontend `node --test` | 76 PASS |
+| 5 manifestsのfmt / clippy all-targets/all-features `-D warnings` | 全PASS |
+| Windows Browser smoke | 下記19項目すべてPASS |
+| Windows KeyProvider | 一時entryの作成・再open・非上書き・削除・missing key fail closedをPASS |
+| Web-4B1〜4B3回帰 | NetworkPolicy / GuardedResolver / secured backend / run budgets / 隔離HTTPS E2E PASS |
+
+BrowserはWindows上のCodex内蔵Chromiumを使用。
+README指定の`sync_browser_smoke`を`serve paced` / `serve webclass-partial` / `serve both-failure`で実行した。
+使用先は`crates/web-server/target/web-4a-browser-smoke`とその専用Windows鍵だけ。
+通常`web-poc`、既存Web Vault、Tauri/native DB・鍵は変更していない。
+
+| # | Browser確認 | 結果 |
+| --- | --- | --- |
+| 1 | Login | PASS。専用synthetic accountでlogin |
+| 2 | Synthetic Moodle/WebClass Settings | PASS。本人確認後に公開mock定数だけを保存 |
+| 3 | Assignment list | PASS。初期11件、Asia/Tokyo表示 |
+| 4 | Sync開始 | PASS。Browser操作から非同期jobを受付 |
+| 5 | Running表示 | PASS。paced同期中表示・ボタン無効化 |
+| 6 | Moodle/WebClass別結果 | PASS。初回各created=1、一覧13件へ自動更新 |
+| 7 | 課題追加・更新 | PASS。追加後、専用DBの合成タイトル1件をstale fixtureにして再同期、Moodle updated=1 |
+| 8 | 再同期duplicateなし | PASS。両created=0 / unchanged=1、全13件 |
+| 9 | Completion保持 | PASS。Browserで完了にしたMoodle課題を再同期・更新・restart後も保持 |
+| 10 | WebClass部分失敗後reload | PASS。stale WebClassタイトルをcommitしてから失敗、手動reloadなしでv0表示へ更新 |
+| 11 | Both failure表示 | PASS。両sourceの安全な通信失敗message |
+| 12 | 同時Sync操作 | PASS。追加HTTP要求も202で同じactive run、queueなし |
+| 13 | 複数Browser tabからSync | PASS。2 tab同時操作で両方running→同じ初回結果 |
+| 14 | 同期中Settings変更409 | PASS。Browser拒否messageと両sourceのPUT/DELETE全4件409 sync_running |
+| 15 | Logout中job継続 | PASS。logout→再loginでもrunning継続、その後正常完了 |
+| 16 | Server restart後 | PASS。旧session401、旧run404、lastRun=null、Vault両設定・13件・completion保持 |
+| 17 | Browser console | PASS。検証した両tabのwarn/errorは0件 |
+| 18 | 127.0.0.1だけlisten | PASS。netstatで127.0.0.1:3000だけ、終了後listen消失 |
+| 19 | 大学HTTP通信0件 | PASS。MockはHTTP clientを作らず、tripwire / secured deny testsもPASS。OS全体のpacket captureではない |
+
+初回sandbox内では一時DB作成の`Internal`と一部core HTTP fixture失敗があった。
+通常Windows権限で再実行して全suiteがPASS。失敗を合格数に含めず、
+reparse point拒否・認証・Vault・DNS/TLS制限などを緩和していない。
+Windows固有の実装不具合は見つからず、production code・lockfileの修正は不要だった。
+
+![Windows Browser: 部分失敗後reloadとcompletion保持](phase-windows-sync-partial.png)
+
+全実行command、19項目の詳細、process restartと鍵の証拠・限界は
+[PHASE-WINDOWS-VERIFICATION.md](PHASE-WINDOWS-VERIFICATION.md)を参照。
+
+**Ready — Web-4AのWindows必須gateは解消。Web-4B3 Preflightの実大学接続gateはBLOCKEDのまま。**
