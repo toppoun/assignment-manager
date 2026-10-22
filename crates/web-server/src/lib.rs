@@ -9,6 +9,8 @@ pub mod keys;
 pub mod poc;
 mod requests;
 mod routes;
+#[cfg(feature = "secured-synthetic")]
+pub mod secured_synthetic;
 mod state;
 #[cfg(feature = "synthetic-sync")]
 pub mod synthetic;
@@ -35,7 +37,7 @@ pub struct PocServer {
 }
 impl PocServer {
     /// Dedicated offline test/example entry point, absent from normal builds.
-    #[cfg(feature = "synthetic-sync")]
+    #[cfg(any(feature = "synthetic-sync", feature = "secured-synthetic"))]
     pub async fn from_synthetic_state(state: PocState, port: u16) -> Result<Self, WebError> {
         Self::bind(state, port).await
     }

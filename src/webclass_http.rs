@@ -66,8 +66,8 @@ impl WebClassClient {
         Self::from_transport(Transport::desktop(http))
     }
 
-    /// Internal offline test seam; production callers always use the fixed origin.
-    #[cfg(test)]
+    /// Private test/fixed offline fixture seam; never a caller-supplied public API.
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
     pub(crate) fn set_test_origin(&mut self, origin: Url) {
         assert!(origin.host_str().is_some_and(|h| h == "localhost"
             || h == "127.0.0.1"

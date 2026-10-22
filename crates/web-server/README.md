@@ -260,3 +260,34 @@ coordinator/worker経由で検証します。任意CA/DNSを公開するproducti
 Web-4B3の未実行手順は[Phase Web-4B2](../../docs/PHASE-WEB-4B2.md)を参照してください。
 判定はReady for Web-4B3（Mac/offline統合のみ）。大学実通信・公開運用の許可ではありません。
 Web-4AのWindows未検証・最終BLOCKEDは維持します。
+
+## Web-4B3 preflight / fixed synthetic HTTPS runtime
+
+[Preflight報告](../../docs/PHASE-WEB-4B3-PREFLIGHT.md)の判定は **BLOCKED**。
+Mac/offlineのWeb HTTP→secured HTTPS→parser/import→SQLite→Browser検証は完了しましたが、
+実Moodle exact host/path、現行IdP/LMS、大学利用条件、Mac Web鍵の永続管理と実接続専用runtimeは未確定です。
+[実接続手順](../../docs/WEB-REAL-SYNC-SMOKE-PLAN.md)は将来の明示承認後だけに使います。
+通常binaryはall-featuresでもDisabledNetworkBackend、synthetic-sync exampleはMockのままです。
+
+新しい専用exampleは固定synthetic.invalidの4 hostsと自分がbindしたloopback TLS peersだけへ通信します。
+SecuredCoreSyncBackend、既存coordinator/application/core parser/importをそのまま使います。
+任意CA/DNS/policyの設定口、大学への切替flagはありません。fixture CAをOSへinstallしません。
+これはoffline検証用build featureで、all-featuresにも固定fixtureが含まれますが通常binaryは選択しません。
+
+```sh
+TMPDIR=/private/tmp cargo run --manifest-path crates/web-server/Cargo.toml --locked --offline \
+  --features secured-synthetic --example secured_browser_smoke -- paced
+```
+
+127.0.0.1:3000限定。Web loginは `synthetic-smoke` / `synthetic-web-only-password-4b3`。
+本人確認に同じWeb passwordを使い、設定は次の公開された合成値だけにしてください。
+
+- Moodle: `https://moodle.synthetic.invalid/calendar/export_execute.php?token=synthetic-secret`
+- WebClass: `student-test` / `synthetic-password`
+
+保存後に「同期状態を確認」を押してから同期します。初回はMoodle1/WebClass9件をimportします。
+scenarioは省略/both-success、moodle-failure、webclass-failure、both-failure、auth-expired、body-limit、paced。
+pacedはMoodle responseを2秒待機するmanual表示確認用です。既存のdeterministic race testsはchannelを使用します。
+新しい一時DBとmemory鍵だけを使い、Ctrl+Cでdrainして破棄します。process restartの永続検証には使いません。
+Macの通常起動/init-vault-keyは引き続きvault_unavailableで停止し、native Keychainへのfallbackはありません。
+実secretを入れないでください。Windows build / smoke未完了・Web-4A BLOCKEDは維持します。

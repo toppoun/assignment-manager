@@ -150,3 +150,16 @@ Moodleの保存時validationは通信許可ではなく、Web fetchには別のe
 Moodle実host/pathは未設定でfail closed。暗号化Vault、boolean-only status、owner/reauth/CSRF、
 jobとcredential mutationの排他は変更していない。実credentialの使用は今回行っていない。
 Web-4AのWindows検証は未完了・最終BLOCKEDのまま。Web-4B2はまだ実装していない。
+
+## Web-4B3 Mac preflight addendum
+
+[Preflight](PHASE-WEB-4B3-PREFLIGHT.md)でMacの通常local_provider/initが
+VaultUnavailableで停止し、memory/native Keychainへfallbackしないことを再確認した。
+WebVault自体は専用synthetic runtimeへMemoryKeyProviderを明示注入するとMacでも動く。
+HTTP E2Eでのruntime再生成は同じArc providerを保持する同一process内だけ。
+process restartを跨ぐ鍵保持を保証せず、新しいmemory鍵で既存bindingを上書きしない。
+専用Browser exampleは毎回新しい一時DB/鍵を使い、終了時に破棄する。
+
+Mac Web専用KeyProviderのservice/installation identity、明示init/load-only、ACL、unlock、
+rotation、DBと独立した鍵backup/restoreは設計/review待ち。実secret永続保存の実装は追加していない。
+既存Mac native/Tauri KeychainとWindows Credential Managerに変更なし。

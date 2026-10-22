@@ -7,6 +7,12 @@ publish = false
 [features]
 # Offline test/example runtime only. The normal executable never selects it.
 synthetic-sync = []
+# Dedicated offline HTTPS fixture; normal executable still selects Disabled.
+secured-synthetic = ["assignment-manager/synthetic-https-fixture"]
+
+[[example]]
+name = "secured_browser_smoke"
+required-features = ["secured-synthetic"]
 
 [[example]]
 name = "sync_browser_smoke"
@@ -35,6 +41,7 @@ keyring-core = "1"
 windows-native-keyring-store = { version = "1", default-features = false }
 
 [dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rusqlite = "0.40.2"
 serde_json = "1"
 tower = { version = "0.5", features = ["util"] }

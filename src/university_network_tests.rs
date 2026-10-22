@@ -157,6 +157,8 @@ fn addr(ip: &str) -> SocketAddr {
 }
 fn resolve(lookup: Arc<dyn Resolve>, host: &str) -> Result<Vec<SocketAddr>, NetworkError> {
     let resolver = GuardedResolver {
+        #[cfg(feature = "synthetic-https-fixture")]
+        fixture_peers: Vec::new(),
         hosts: vec![HOST.into()],
         lookup,
         peer: None,

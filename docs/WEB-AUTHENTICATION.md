@@ -190,3 +190,12 @@ Moodleの保存時validationは通信許可ではなく、Web fetchには別のe
 Moodle実host/pathは未設定でfail closed。暗号化Vault、boolean-only status、owner/reauth/CSRF、
 jobとcredential mutationの排他は変更していない。実credentialの使用は今回行っていない。
 Web-4AのWindows検証は未完了・最終BLOCKEDのまま。Web-4B2はまだ実装していない。
+
+## Web-4B3 synthetic secured HTTP verification
+
+[Preflight](PHASE-WEB-4B3-PREFLIGHT.md)で、実loopback HTTPの認証/CSRF/recent reauth/Vaultから
+secured synthetic HTTPS、既存parser/import、SQLite、Browserまでを接続して検証した。
+認証/owner/coordinator/admissionの本体と通常binaryのDisabled選択は変更していない。
+固定fixtureのCA/DNSは専用offline検証featureだけで、任意値をrequest/env/browserから渡せない。
+all-featuresでも通常binaryからfixture/real backendは選択できない。
+現時点の実接続gateはBLOCKED、実大学HTTP/DNSと実credentialは使用していない。

@@ -156,7 +156,7 @@ impl Error for HoseiAuthError {}
 pub struct HoseiAuthenticator {
     policy: Option<NetworkPolicy>,
     run: Option<Arc<crate::university_network::RunBudget>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
     test_endpoints: Option<AuthEndpoints>,
 }
 
@@ -171,23 +171,37 @@ impl HoseiAuthenticator {
         Self {
             policy: None,
             run: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "synthetic-https-fixture"))]
             test_endpoints: None,
         }
     }
 
     /// Construct an explicitly secured Web authenticator; performs no request.
     pub fn for_web(policy: NetworkPolicy) -> Self {
-        Self {
-            policy: Some(policy.clone()),
-            run: None,
-            #[cfg(test)]
-            test_endpoints: policy.test.auth.as_ref().map(|origins| AuthEndpoints {
+        #[cfg(feature = "synthetic-https-fixture")]
+        let fixture_endpoints = policy
+            .synthetic
+            .as_ref()
+            .map(|_| synthetic::auth_endpoints());
+        #[cfg(all(test, not(feature = "synthetic-https-fixture")))]
+        let fixture_endpoints: Option<AuthEndpoints> = None;
+        #[cfg(test)]
+        let fixture_endpoints = policy
+            .test
+            .auth
+            .as_ref()
+            .map(|origins| AuthEndpoints {
                 hoppii: origins[0].clone(),
                 idp: origins[1].clone(),
                 webclass: origins[2].clone(),
                 timeout: TIMEOUT,
-            }),
+            })
+            .or(fixture_endpoints);
+        Self {
+            policy: Some(policy.clone()),
+            run: None,
+            #[cfg(any(test, feature = "synthetic-https-fixture"))]
+            test_endpoints: fixture_endpoints,
         }
     }
 
@@ -201,7 +215,14 @@ impl HoseiAuthenticator {
         &self,
         credentials: HoseiCredentials<'_>,
     ) -> Result<WebClassClient, HoseiAuthError> {
-        #[cfg(test)]
+        #[cfg(feature = "synthetic-https-fixture")]
+        if self.policy.as_ref().is_some_and(|p| p.synthetic.is_some())
+            && (credentials.university_id != synthetic::UNIVERSITY_ID
+                || credentials.password != synthetic::UNIVERSITY_PASSWORD)
+        {
+            return Err(HoseiAuthError::ClientInitialization);
+        }
+        #[cfg(any(test, feature = "synthetic-https-fixture"))]
         if let Some(endpoints) = &self.test_endpoints {
             return self.login_with_endpoints(credentials, endpoints);
         }
@@ -229,6 +250,14 @@ impl HoseiAuthenticator {
         session.webclass_sso()?;
 
         let client = WebClassClient::from_transport(session.http.clone());
+        #[cfg(all(feature = "synthetic-https-fixture", not(test)))]
+        let client = {
+            let mut client = client;
+            if self.policy.as_ref().is_some_and(|p| p.synthetic.is_some()) {
+                client.set_test_origin(endpoints.webclass.clone());
+            }
+            client
+        };
         #[cfg(test)]
         let client = {
             let mut client = client;
@@ -2067,3 +2096,8 @@ mod tests {
         assert_safe_error(parse_webclass_js_redirect(&html).unwrap_err(), &secrets);
     }
 }
+
+#[cfg(feature = "synthetic-https-fixture")]
+#[allow(dead_code)] // Shared protocol fixture also has helpers used only by unit tests.
+#[path = "synthetic_university.rs"]
+pub mod synthetic;

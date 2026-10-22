@@ -301,3 +301,15 @@ CLI/envによる実backend切替、実大学通信、実credential入力、Web-4
 [Phase Web-4B2](docs/PHASE-WEB-4B2.md)を参照してください。
 判定はReady for Web-4B3（Mac/offlineコード統合gate）。実通信の自動許可ではありません。
 Web-4AのWindows build / Browser smokeは未完了、同phase最終判定はBLOCKEDのままです。
+
+## Web-4B3 preflight (2026-10-22)
+
+固定loopback HTTPS大学fixtureを使い、実Web HTTP APIの認証/Vault/coordinatorから
+SecuredCoreSyncBackend、既存parser/import、SQLite、Browser一覧までの合成E2Eを追加しました。
+通常binaryはDisabled、既存synthetic-syncはMockを維持します。大学通信・実credential使用・commit/pushは行っていません。
+
+判定は **BLOCKED**。Moodle exact host/path、現行IdP/LMSと大学利用条件、Mac Web専用永続鍵管理、
+実接続専用runtimeのreviewが残ります。実接続は別途明示承認が必要です。
+[Preflight報告](docs/PHASE-WEB-4B3-PREFLIGHT.md)、[将来の手動smoke手順](docs/WEB-REAL-SYNC-SMOKE-PLAN.md)、
+[隔離exampleの起動方法](crates/web-server/README.md#web-4b3-preflight--fixed-synthetic-https-runtime)を参照してください。
+Windows Web-4A build/smoke未完了・BLOCKEDは引き続き維持します。

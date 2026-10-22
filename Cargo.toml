@@ -3,6 +3,10 @@ name = "assignment-manager"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Fixed loopback-only university fixture for explicit offline tests/examples.
+synthetic-https-fixture = ["dep:rustls"]
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 ical = { version = "0.11", default-features = false, features = ["ical"] }
@@ -12,6 +16,8 @@ scraper = { version = "0.27", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "time"] }
+
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

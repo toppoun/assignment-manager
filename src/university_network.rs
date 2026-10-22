@@ -35,6 +35,8 @@ const MAX_DNS_ANSWERS: usize = 64;
 #[derive(Clone, Default)]
 pub struct NetworkPolicy {
     moodle: Option<(String, String)>,
+    #[cfg(feature = "synthetic-https-fixture")]
+    pub(crate) synthetic: Option<Arc<crate::webclass_auth::synthetic::FixedNetwork>>,
     #[cfg(test)]
     pub(crate) test: TestNetwork,
 }
@@ -64,6 +66,12 @@ impl NetworkPolicy {
     }
 
     fn validate(&self, url: &Url, source: Source) -> Result<(), NetworkError> {
+        #[cfg(feature = "synthetic-https-fixture")]
+        if self.synthetic.is_some() {
+            // A fixture policy can never fall through to the university origins,
+            // even if with_moodle_calendar is called on its public clone.
+            return crate::webclass_auth::synthetic::validate(url, source);
+        }
         #[cfg(test)]
         if self.test.origins.iter().any(|o| o.origin() == url.origin()) {
             return if url.username().is_empty()
@@ -95,6 +103,10 @@ impl NetworkPolicy {
     }
 
     fn hosts(&self, source: Source) -> Vec<String> {
+        #[cfg(feature = "synthetic-https-fixture")]
+        if self.synthetic.is_some() {
+            return crate::webclass_auth::synthetic::hosts(source);
+        }
         #[cfg(test)]
         if !self.test.origins.is_empty() {
             return self
@@ -322,6 +334,8 @@ impl Resolve for SystemLookup {
 struct GuardedResolver {
     hosts: Vec<String>,
     lookup: Arc<dyn Resolve>,
+    #[cfg(feature = "synthetic-https-fixture")]
+    fixture_peers: Vec<std::net::SocketAddr>,
     #[cfg(test)]
     peer: Option<SocketAddr>,
     #[cfg(test)]
@@ -333,6 +347,8 @@ impl Resolve for GuardedResolver {
             return Box::pin(async { Err(NetworkError::Policy.into()) });
         }
         let lookup = self.lookup.resolve(name);
+        #[cfg(feature = "synthetic-https-fixture")]
+        let fixture_peers = self.fixture_peers.clone();
         #[cfg(test)]
         let peer = self.peer;
         #[cfg(test)]
@@ -348,6 +364,8 @@ impl Resolve for GuardedResolver {
                 let test_peer = peer == Some(addr) || (loopback_origins && addr.ip().is_loopback());
                 #[cfg(not(test))]
                 let test_peer = false;
+                #[cfg(feature = "synthetic-https-fixture")]
+                let test_peer = test_peer || fixture_peers.contains(&addr);
                 if checked.len() == MAX_DNS_ANSWERS || (!test_peer && !public_ip(addr.ip())) {
                     return Err(NetworkError::Policy.into());
                 }
@@ -421,11 +439,23 @@ impl Transport {
         cookies: Option<Arc<SessionCookies>>,
     ) -> Result<Self, NetworkError> {
         let lookup: Arc<dyn Resolve> = Arc::new(SystemLookup);
+        #[cfg(feature = "synthetic-https-fixture")]
+        let lookup: Arc<dyn Resolve> = policy
+            .synthetic
+            .clone()
+            .map(|n| n as Arc<dyn Resolve>)
+            .unwrap_or(lookup);
         #[cfg(test)]
         let lookup = policy.test.lookup.clone().unwrap_or(lookup);
         let resolver = GuardedResolver {
             hosts: policy.hosts(source),
             lookup,
+            #[cfg(feature = "synthetic-https-fixture")]
+            fixture_peers: policy
+                .synthetic
+                .as_ref()
+                .map(|n| n.peers())
+                .unwrap_or_default(),
             #[cfg(test)]
             peer: policy.test.peer,
             #[cfg(test)]
@@ -454,9 +484,23 @@ impl Transport {
         if let Some(cookies) = &cookies {
             builder = builder.cookie_provider(Arc::clone(cookies));
         }
+        #[cfg(feature = "synthetic-https-fixture")]
+        if policy.synthetic.is_some() {
+            // Fixed fixture CA only; no arbitrary CA or TLS-verifier input API.
+            builder = builder.tls_certs_only([reqwest::Certificate::from_der(include_bytes!(
+                "../fixtures/network/ca.der"
+            ))
+            .map_err(|_| NetworkError::Initialization)?]);
+        }
         #[cfg(test)]
         {
-            builder = policy.test.configure(builder);
+            #[cfg(feature = "synthetic-https-fixture")]
+            let fixture = policy.synthetic.is_some();
+            #[cfg(not(feature = "synthetic-https-fixture"))]
+            let fixture = false;
+            if !fixture {
+                builder = policy.test.configure(builder);
+            }
         }
         let client = reqwest::blocking::ClientBuilder::from(builder)
             // Blocking Response::Read polls outside Tokio. Its finite wait timeout

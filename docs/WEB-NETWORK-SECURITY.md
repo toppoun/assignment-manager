@@ -212,3 +212,19 @@ Cookie上限は黙ってevictせずpoisonし、origin分離を維持する。des
 通常Web binaryはall-featuresでもDisabledNetworkBackend。任意CA/DNS/HTTP例外のproduction API、
 CLI/envによるreal backend有効化はない。今回のReadyはoffline integration gateだけ。
 Web-4AのWindows build/smokeは未完了・最終BLOCKEDのまま。
+
+## Web-4B3 fixed offline HTTPS fixture
+
+[Preflight](PHASE-WEB-4B3-PREFLIGHT.md)で跨crateの成功E2Eを追加した。
+既存の汎用TestNetwork/任意CA・resolver seamはcfg(test)内部のまま。
+加えて、明示的なoffline検証用build feature `synthetic-https-fixture` は、固定CA/4 synthetic hostsと
+fixture自身のloopback listenersだけを持つ固定factoryを提供する。
+all-featuresではこの固定facilityもcompileされるため、「全例外がcfg(test)だけ」というWeb-4B1時点の
+説明からこの点が変わった。任意CA/DNS入力のproduction APIを提供するものではない。
+
+fixed policyはproduction originsへfallbackせず、with_moodle_calendarでも許可先を拡張できない。
+unknown DNS nameはOS resolverへ渡さない。HTTPS/443/TLS/SNI/hostnameと既存資源上限を維持し、
+Moodleは既知の合成URLだけ、WebClassは既知の合成ID/passwordだけを送信前に受理する。
+通常Web binaryはall-featuresでもDisabled固定。fixture起動もreal backendの選択もHTTP/env/CLIで
+通常binaryへ追加していない。専用secured-synthetic exampleだけが固定factoryを使う。
+大学exact host/path/current originsの未確認を埋める証拠にはしない。実通信は別途の明示承認が必要。
