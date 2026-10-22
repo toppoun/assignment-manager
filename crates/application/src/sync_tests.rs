@@ -50,6 +50,7 @@ pub(crate) fn import(store: &mut SqliteStore) -> Result<SyncCounts, SyncFailure>
 
 #[derive(Default)]
 struct FakeNetwork {
+    begins: usize,
     moodle_calls: usize,
     login_calls: usize,
     webclass_calls: usize,
@@ -63,6 +64,9 @@ struct FakeNetwork {
 }
 impl SyncBackend for FakeNetwork {
     type Session = usize;
+    fn begin_run(&mut self) {
+        self.begins += 1;
+    }
     fn moodle(
         &mut self,
         _url: SecretText,
@@ -488,4 +492,71 @@ fn credential_read_errors_are_source_local_and_invalidate_cached_session() {
     );
     assert!(matches!(webclass, SourceSyncResult::Success { .. }));
     assert_eq!(service.backend.login_calls, 2);
+}
+
+#[test]
+fn run_budget_hook_is_once_per_run_even_when_both_sources_are_unconfigured_or_fail() {
+    let mut service = service(false, false);
+    service.run();
+    service.run();
+    assert_eq!(service.backend.begins, 2);
+    assert_eq!(service.backend.moodle_calls, 0);
+    service
+        .credentials
+        .save_moodle(SecretText::new(URL.into()))
+        .unwrap();
+    service
+        .credentials
+        .save_webclass(credentials(ID, PASSWORD))
+        .unwrap();
+    service.backend.moodle_failure = Some(SyncFailure::NetworkFailed);
+    service.run();
+    assert_eq!(service.backend.begins, 3);
+    assert_eq!(service.backend.webclass_calls, 1);
+}
+
+#[test]
+fn secured_application_handle_missing_policy_rejects_feed_without_outbound() {
+    use crate::test_support::{MemorySettings, block_on};
+    let dir = tempfile::tempdir().unwrap();
+    block_on(async {
+        let application = crate::ApplicationHandle::open_with_backend(
+            Ok(dir.path().join("secured.sqlite")),
+            || Ok((MemorySettings::default(), fake())),
+            SecuredCoreSyncBackend::new(NetworkPolicy::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            report(application.sync_now().await.unwrap()),
+            (
+                SourceSyncResult::NotConfigured,
+                SourceSyncResult::NotConfigured
+            )
+        );
+        application
+            .save_moodle_config(SecretText::new(URL.into()))
+            .await
+            .unwrap();
+        let denied = application.sync_now().await.unwrap();
+        assert!(denied.should_reload());
+        assert_eq!(
+            report(denied),
+            (
+                SourceSyncResult::Failed {
+                    error: SyncFailure::InvalidConfiguration
+                },
+                SourceSyncResult::NotConfigured
+            )
+        );
+        assert!(
+            application
+                .query_assignments(AssignmentQuery::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        application.shutdown().await;
+        assert!(application.is_shutdown_complete());
+    });
 }

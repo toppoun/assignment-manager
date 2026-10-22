@@ -5,10 +5,12 @@ pub(crate) mod tests;
 use assignment_manager::{
     moodle_http::{MoodleClient, MoodleExportKind, MoodleFeed},
     persistence::{AssignmentImportSummary, SqliteStore},
+    secured_sync::SecuredSyncClients,
     sync::{
         self, MoodleSyncError, WebClassCredentialProvider, WebClassReauthSyncError,
         WebClassSyncError,
     },
+    university_network::NetworkPolicy,
     webclass_auth::{HoseiAuthError, HoseiAuthenticator, HoseiCredentials},
     webclass_http::WebClassClient,
 };
@@ -160,9 +162,11 @@ impl SyncSecrets for SettingsWorker {
     }
 }
 
-/// Test seam replaces transport, never production credentials or core behavior.
+/// Trusted backend port. Synthetic substitutions remain offline test adapters.
 pub trait SyncBackend {
     type Session;
+    /// Run-wide resource accounting; desktop and synthetic backends need no hook.
+    fn begin_run(&mut self) {}
     fn moodle(
         &mut self,
         url: SecretText,
@@ -177,24 +181,98 @@ pub trait SyncBackend {
     ) -> Result<SyncCounts, SyncFailure>;
 }
 
-pub(crate) struct CoreSyncBackend;
-impl SyncBackend for CoreSyncBackend {
+/// Implementation shared by the desktop and secured factories. Fields are private.
+pub struct CoreSyncBackend<F> {
+    clients: F,
+}
+pub(crate) struct DesktopClients;
+trait ClientFactory {
+    fn validate_session(&self, _session: &WebClassClient) -> Result<(), SyncFailure> {
+        Ok(())
+    }
+    fn begin_run(&mut self) {}
+    fn validate_moodle(&self, _url: &str) -> Result<(), SyncFailure> {
+        Ok(())
+    }
+    fn moodle(&self) -> Result<MoodleClient, SyncFailure>;
+    fn authenticator(&self) -> HoseiAuthenticator;
+}
+impl ClientFactory for DesktopClients {
+    fn moodle(&self) -> Result<MoodleClient, SyncFailure> {
+        MoodleClient::new().map_err(|_| SyncFailure::Unexpected)
+    }
+    fn authenticator(&self) -> HoseiAuthenticator {
+        HoseiAuthenticator::new()
+    }
+}
+impl ClientFactory for SecuredSyncClients {
+    fn validate_session(&self, session: &WebClassClient) -> Result<(), SyncFailure> {
+        if self.owns_session(session) {
+            Ok(())
+        } else {
+            Err(SyncFailure::InvalidConfiguration)
+        }
+    }
+    fn begin_run(&mut self) {
+        SecuredSyncClients::begin_run(self);
+    }
+    fn validate_moodle(&self, url: &str) -> Result<(), SyncFailure> {
+        self.validate_moodle_url(url)
+            .map_err(|_| SyncFailure::InvalidConfiguration)
+    }
+    fn moodle(&self) -> Result<MoodleClient, SyncFailure> {
+        SecuredSyncClients::moodle(self).map_err(|_| SyncFailure::Unexpected)
+    }
+    fn authenticator(&self) -> HoseiAuthenticator {
+        SecuredSyncClients::authenticator(self)
+    }
+}
+impl CoreSyncBackend<DesktopClients> {
+    pub(crate) fn desktop() -> Self {
+        Self {
+            clients: DesktopClients,
+        }
+    }
+}
+/// Web-only backend, explicitly injected by trusted Rust code. No policy means
+/// no construction; default Moodle policy rejects all feeds. Normal Web binary
+/// continues to use DisabledNetworkBackend. Policy changes require a new runtime.
+///
+/// A trusted policy is mandatory:
+/// ```compile_fail
+/// use assignment_manager_application::SecuredCoreSyncBackend;
+/// let backend = SecuredCoreSyncBackend::new();
+/// ```
+pub type SecuredCoreSyncBackend = CoreSyncBackend<SecuredSyncClients>;
+impl SecuredCoreSyncBackend {
+    pub fn new(policy: NetworkPolicy) -> Self {
+        Self {
+            clients: SecuredSyncClients::new(policy),
+        }
+    }
+}
+impl<F: ClientFactory> SyncBackend for CoreSyncBackend<F> {
     type Session = WebClassClient;
+    fn begin_run(&mut self) {
+        self.clients.begin_run();
+    }
     fn moodle(
         &mut self,
         url: SecretText,
         store: &mut SqliteStore,
     ) -> Result<SyncCounts, SyncFailure> {
+        self.clients.validate_moodle(url.expose())?;
         let feed = MoodleFeed::new(MOODLE_SCOPE, MoodleExportKind::CourseRelated, url.expose())
             .map_err(|_| SyncFailure::InvalidConfiguration)?;
         drop(url);
-        let client = MoodleClient::new().map_err(|_| SyncFailure::Unexpected)?;
+        let client = self.clients.moodle()?;
         sync::sync_moodle_once(&client, &feed, store)
             .map(Into::into)
             .map_err(Into::into)
     }
     fn login(&mut self, credentials: WebClassCredentials) -> Result<WebClassClient, SyncFailure> {
-        HoseiAuthenticator::new()
+        self.clients
+            .authenticator()
             .login(HoseiCredentials::new(
                 credentials.university_id.expose(),
                 credentials.password.expose(),
@@ -207,14 +285,20 @@ impl SyncBackend for CoreSyncBackend {
         credentials: &mut impl WebClassCredentialProvider,
         store: &mut SqliteStore,
     ) -> Result<SyncCounts, SyncFailure> {
+        self.clients.validate_session(session)?;
         // Core owns AuthExpired -> credential callback -> login -> retry once.
-        sync::sync_webclass_all_with_reauth(session, &HoseiAuthenticator::new(), credentials, store)
-            .map(|summary| SyncCounts {
-                created: summary.assignments_created,
-                updated: summary.assignments_updated,
-                unchanged: summary.assignments_unchanged,
-            })
-            .map_err(Into::into)
+        sync::sync_webclass_all_with_reauth(
+            session,
+            &self.clients.authenticator(),
+            credentials,
+            store,
+        )
+        .map(|summary| SyncCounts {
+            created: summary.assignments_created,
+            updated: summary.assignments_updated,
+            unchanged: summary.assignments_unchanged,
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -250,6 +334,7 @@ impl<B: SyncBackend, C: SyncSecrets> SyncService<B, C> {
         }
     }
     pub fn run(&mut self) -> SyncReport {
+        self.backend.begin_run();
         // Secrets are loaded per source just before use, not retained across runs.
         let moodle = match self.credentials.moodle() {
             Ok(None) => SourceSyncResult::NotConfigured,

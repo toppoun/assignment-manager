@@ -11,3 +11,5 @@ pub mod university_network;
 pub mod webclass;
 pub mod webclass_auth;
 pub mod webclass_http;
+
+pub mod secured_sync;

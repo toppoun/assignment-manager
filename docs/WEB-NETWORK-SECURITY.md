@@ -1,13 +1,14 @@
-# University HTTP transport security (Web-4B1)
+# University HTTP transport security (Web-4B1 / Web-4B2)
 
-2026-10-22 / macOS。実大学への接続・実credential利用・Web syncへの接続は行わない。
+2026-10-22 / macOS。実大学への接続・実credential利用は行わない。
+Web-4B2でsecured backendを明示注入できるようにした。通常Web binaryはDisabledのまま。
 本書の「Web」は明示的な `MoodleClient::for_web` / `HoseiAuthenticator::for_web` の保証を指す。
 desktop constructorへserver用SSRF保証を付与したという意味ではない。
 
 ## Architecture and boundary
 
 ```text
-future secured CoreSyncBackend (NOT implemented/wired in Web-4B1)
+SecuredCoreSyncBackend (explicit Rust injection only; ordinary Web binary disabled)
   -> MoodleClient::for_web(NetworkPolicy)
   -> HoseiAuthenticator::for_web(NetworkPolicy)
        -> AuthSession -> same Transport -> WebClassClient
@@ -55,7 +56,7 @@ WebClassClientへのraw client constructorは `cfg(test)` のみ。認証後・�
 未消費bodyは `bytes/text/json/read_to_end` で回収・drainせずResponseをdropする。
 これらのbodyをparserへ渡さないため、未消費body全体をbufferする経路はない。
 status/redirect段階で拒否するresponseも同じ。消費する全bodyは1箇所の `read_text` を通る。
-group取得数・全sync時間の上限はこのper-request policyの保証外（Web-4B2以降の課題）。
+group取得数・全sync時間は単独constructorのper-request保証外。Web-4B2のfactoryが別途run予算を付与する。
 
 ## URL and origin policy
 
@@ -148,7 +149,7 @@ blocking builder/responseの挙動はlock済み0.13.5のローカルソースも
 | OpenAM callback JSON ×3 | 256 KiB | fixture最大1,174 bytes。既知callback treeに200倍以上の余裕 |
 
 値は安全側の初期提案であり、実大学payloadの最大値を測定したものではない。
-Web-4B2の明示smokeでサイズのみ記録し、必要時は種別ごとにreviewして変更する。
+実大学payloadのサイズ測定は未実施。Web-4B3で別途承認された検証時にサイズのみを測り、必要時は種別ごとにreviewする。
 既存正常fixture/parser contractは全て維持する。
 
 Content-Lengthは早期拒否にのみ利用し、`Read::take(limit + 1)` で実bodyをbounded readする。
@@ -184,6 +185,30 @@ TLS正常系はprivate synthetic CAのみをtrustする標準WebPKI verifierを�
 これは大学証明書・hosting network・Windows verifierの実検証ではない。
 
 policyはimmutableでhot reload経路を持たない。将来のpolicy更新時はruntime/sessionを再生成する。
-今回の完了は安全なtransport constructorとoffline tests。実host/path・SSO継続性・hosting適合性、
-per-run/course数制限、egress firewall、公開用HTTPS/key/backup、Windows build/smokeは未確認/未実装。
+Web-4B1の完了は安全なtransport constructorとoffline tests。Web-4B2でbackend統合と
+per-run/course制限を追加した。実host/path・実SSO/hosting適合性、egress firewall、
+公開用HTTPS/key/backup、Windows build/smokeは未確認/未実装。
 [Phase Web-4B1](PHASE-WEB-4B1.md)に検証結果とWeb-4B2の接続計画を記す。
+
+
+## Secured backend / whole-run budgets (Web-4B2)
+
+[Phase Web-4B2](PHASE-WEB-4B2.md)でprivate client factoryによるapplication統合を追加した。
+同じimmutable policyがMoodle、初回login、reauth、cached WebClassClientへ伝播する。
+runごとの予算resetはsessionを再作成しない。別runtimeのsessionはbudget identity照合で拒否。
+policy変更はadmission停止→drain→runtime再生成を必要とし、credential revisionとは独立する。
+
+secured integrationは180秒の協調的deadline、512 requests、response lifetimeを含め同時1通信、
+累積128 MiB body、128 courses/累積256 groups、4,096 parsed records/import batchを上限とする。
+Cookieはexact origin最大3、session lifetime累積1,024更新/256 KiB、1 header4 KiB。
+超過時は固定failureで停止し、既存commitを保持。shared sync/importを複製・batch分割しない。
+Web-4B1 constructorを単独で使う場合のper-request制限と、factoryが付与するrun制限を区別する。
+
+数値の根拠、制限をかける位置、safe error mapping、分割E2E証拠はphase報告を参照。
+180秒はparser/SQLite commit/credential provider/OS DNSの強制cancel保証ではなく、
+shutdownもworker終了までdrainする。body予算は消費した本文でありwire全体のbyte計測ではない。
+Cookie上限は黙ってevictせずpoisonし、origin分離を維持する。desktopにはrun/Cookie予算を適用しない。
+
+通常Web binaryはall-featuresでもDisabledNetworkBackend。任意CA/DNS/HTTP例外のproduction API、
+CLI/envによるreal backend有効化はない。今回のReadyはoffline integration gateだけ。
+Web-4AのWindows build/smokeは未完了・最終BLOCKEDのまま。

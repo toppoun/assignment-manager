@@ -64,6 +64,9 @@ pub fn sync_moodle_once(
         .fetch_calendar(feed)
         .map_err(|_| MoodleSyncError::Fetch)?;
     let events = parse_calendar(&raw).map_err(|_| MoodleSyncError::Parse)?;
+    client
+        .check_sync_records(events.len())
+        .map_err(|_| MoodleSyncError::Validation)?;
     let observation = AssignmentObservation::try_new(
         SyncScope::MoodleFeed(feed.scope().to_owned()),
         events
@@ -90,6 +93,9 @@ pub fn sync_moodle_once(
         .collect();
     let mut resolutions = HashMap::new();
     for event in &events {
+        client
+            .check_sync_records(0)
+            .map_err(|_| MoodleSyncError::Fetch)?;
         let key = ExternalRecordKey {
             origin: OriginKind::Moodle,
             scope: feed.scope().to_owned(),
@@ -121,6 +127,9 @@ pub fn sync_moodle_once(
         };
         resolutions.insert(key, MoodleCourseResolution::new(course_id, category));
     }
+    client
+        .check_sync_records(batch.as_slice().len())
+        .map_err(|_| MoodleSyncError::Validation)?;
     store
         .import_assignment_batch_with_observation_and_courses(
             &batch,
@@ -181,6 +190,9 @@ pub fn sync_webclass_group_once(
     group_id: &str,
     store: &mut SqliteStore,
 ) -> Result<AssignmentImportSummary, WebClassSyncError> {
+    client
+        .check_sync_group()
+        .map_err(|_| WebClassSyncError::Fetch)?;
     let raw = client
         .fetch_contents_json(group_id)
         .map_err(|error| match error {
@@ -188,6 +200,9 @@ pub fn sync_webclass_group_once(
             _ => WebClassSyncError::Fetch,
         })?;
     let contents = parse_contents(&raw).map_err(|_| WebClassSyncError::Parse)?;
+    client
+        .check_sync_records(contents.len())
+        .map_err(|_| WebClassSyncError::Validation)?;
     let observation = AssignmentObservation::try_new(
         SyncScope::WebClassContents(group_id.to_owned()),
         contents
@@ -210,6 +225,9 @@ pub fn sync_webclass_group_once(
         .validate_candidates(&batch)
         .map_err(|_| WebClassSyncError::Validation)?;
     let observed_at = Utc::now();
+    client
+        .check_sync_records(batch.as_slice().len())
+        .map_err(|_| WebClassSyncError::Validation)?;
     store
         .import_assignment_batch_with_observation(&batch, &observation, observed_at)
         .map_err(|_| WebClassSyncError::Persistence)
@@ -260,6 +278,9 @@ pub fn sync_webclass_all_once(
         _ => WebClassSyncError::Fetch,
     })?;
     let courses = parse_courses(&raw).map_err(|_| WebClassSyncError::Parse)?;
+    client
+        .check_sync_courses(courses.len())
+        .map_err(|_| WebClassSyncError::CourseValidation)?;
     let observation = WebClassCourseListObservation::try_new(
         courses
             .iter()
@@ -276,6 +297,9 @@ pub fn sync_webclass_all_once(
         ..Default::default()
     };
     for course in courses {
+        client
+            .check_sync_courses(0)
+            .map_err(|_| WebClassSyncError::Fetch)?;
         if store
             .find_webclass_course_id(&course.group_id)
             .map_err(|_| WebClassSyncError::CoursePersistence)?

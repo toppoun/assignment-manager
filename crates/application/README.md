@@ -136,9 +136,20 @@ and bounded responses while retaining the existing parsers, authentication flow,
 and sync functions. Desktop constructors remain available. Shared body reads are
 bounded in both modes; the application orchestration and its APIs are unchanged.
 
-`CoreSyncBackend` still selects the existing desktop constructors. A future trusted
-Web factory must inject the same policy into Moodle, initial login and reauth;
-HTTP must stay in the existing core layer. No secured production backend is wired
-in this phase. Ordinary Web remains DisabledNetworkBackend; MockSyncBackend stays
-in isolated tests/examples. See [Web-4B1](../../docs/PHASE-WEB-4B1.md).
+`ApplicationHandle::open` keeps the desktop factory. Explicit trusted Rust callers
+can inject `SecuredCoreSyncBackend::new(NetworkPolicy)` using `open_with_backend`.
+The common CoreSyncBackend implementation uses a private factory, so Moodle,
+initial WebClass login and reauth all select the same secured policy. No policy
+argument is optional and a missing Moodle exact host/path fails closed.
+
+SyncService calls the backend's default-no-op `begin_run` once before both sources.
+The secured factory resets shared Web-only resource accounting while retaining the
+cached session and cookie jar. Credential revision still controls session invalidation;
+policy changes require draining and replacing the runtime. Sessions from another
+factory/runtime are rejected. Existing sync/import/completion implementations are reused.
+
+Ordinary Web remains DisabledNetworkBackend; MockSyncBackend stays in isolated
+examples. The core's synthetic CA/DNS seam stays cfg(test)-only; transport E2E and
+application/Web boundary tests are intentionally split. See
+[Web-4B2](../../docs/PHASE-WEB-4B2.md) for limits, cancellation gaps and evidence.
 Web-4A Windows validation remains incomplete and its final status remains BLOCKED.

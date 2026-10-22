@@ -203,6 +203,17 @@ impl MoodleClient {
         })
     }
 
+    pub(crate) fn set_run_budget(
+        &mut self,
+        run: std::sync::Arc<crate::university_network::RunBudget>,
+    ) {
+        self.http.set_run_budget(Some(run));
+    }
+    pub(crate) fn check_sync_records(&self, count: usize) -> Result<(), NetworkError> {
+        self.http
+            .checkpoint(count, crate::university_network::MAX_RECORDS, false)
+    }
+
     /// Return the response text without interpreting iCalendar or creating candidates.
     /// Redirects return `HttpStatus` without reading or requesting their Location.
     pub fn fetch_calendar(&self, feed: &MoodleFeed) -> Result<String, MoodleHttpError> {

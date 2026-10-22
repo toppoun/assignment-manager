@@ -69,7 +69,9 @@ impl WebClassClient {
     /// Internal offline test seam; production callers always use the fixed origin.
     #[cfg(test)]
     pub(crate) fn set_test_origin(&mut self, origin: Url) {
-        assert!(matches!(origin.host_str(), Some("127.0.0.1" | "localhost")));
+        assert!(origin.host_str().is_some_and(|h| h == "localhost"
+            || h == "127.0.0.1"
+            || h.ends_with(".synthetic.invalid")));
         self.base_url = origin;
     }
 
@@ -85,6 +87,24 @@ impl WebClassClient {
         let mut url = self.endpoint(CONTENTS_PATH);
         url.query_pairs_mut().append_pair("group_id", group_id);
         self.fetch_json(url)
+    }
+
+    pub(crate) fn shares_run(
+        &self,
+        run: &std::sync::Arc<crate::university_network::RunBudget>,
+    ) -> bool {
+        self.http.shares_run(run)
+    }
+    pub(crate) fn check_sync_courses(&self, count: usize) -> Result<(), NetworkError> {
+        self.http
+            .checkpoint(count, crate::university_network::MAX_COURSES, false)
+    }
+    pub(crate) fn check_sync_records(&self, count: usize) -> Result<(), NetworkError> {
+        self.http
+            .checkpoint(count, crate::university_network::MAX_RECORDS, false)
+    }
+    pub(crate) fn check_sync_group(&self) -> Result<(), NetworkError> {
+        self.http.checkpoint(0, 0, true)
     }
 
     fn endpoint(&self, path: &str) -> Url {

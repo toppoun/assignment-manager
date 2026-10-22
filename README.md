@@ -55,13 +55,13 @@ AES-256-GCMでUserId/record種別に束縛した認証情報と課題completion�
 server再起動ではWeb sessionを失効させ、再ログインを要求します。課題schema v3、desktop/native DBは維持します。
 **127.0.0.1:3000のHTTP開発専用です。外部公開・LAN bind・reverse proxy・tunnel運用は禁止です。**
 本番HTTPS/Secure Cookie、proxy trust、production鍵provider/ACL、backup/restoreは未実装です。
-Web-4B1で大学HTTP用の安全なtransport constructorとoffline testsを追加しました。通常Web backendへの接続は未実装です。
+Web-4B1で大学HTTP用の安全なtransport constructorとoffline testsを追加しました。通常Web binaryへの接続は無効のまま、Web-4B2で明示注入用backendを統合しました。
 [Web認証](docs/WEB-AUTHENTICATION.md)、[Vault設計](docs/WEB-CREDENTIAL-VAULT.md)、
 [Web-4A報告](docs/PHASE-WEB-4A.md)、[frontend統合](docs/FRONTEND-INTEGRATION.md)を参照してください。
 非同期Sync API・bounded polling・部分失敗時の再取得を実装し、通常serverはDisabledNetworkBackendを維持します。
 mockは専用synthetic-sync featureの隔離test/exampleでのみ明示注入します。Windows検証の未完了項目はWeb-4A報告を参照してください。
 [Web-4B1報告](docs/PHASE-WEB-4B1.md)と[大学通信policy](docs/WEB-NETWORK-SECURITY.md)を参照してください。
-Moodle実host/pathは未設定でfail closedです。実大学通信・Web-4B2実装は行っていません。
+Moodle実host/pathは未設定でfail closedです。Web-4B2は隔離offline検証まで完了し、実大学通信は行っていません。
 Web-4AのWindows build/smokeは未完了で、Web-4A最終判定はBLOCKEDのままです。
 
 Tauriの[OS別prerequisites](https://v2.tauri.app/start/prerequisites/)が必要です。
@@ -287,3 +287,17 @@ Phase 8D2（Windows、2026-10-04）: 実server manual smokeでMoodle 15件、Web
 - MVP stabilization: UI整理、source submission state / mismatch warning設計、sync status、timetable、Course management
 - macOS native: SwiftUI shell、Rust bridge、Keychain、Assignment UI、timetable、WidgetKit
 - macOS実機/Keychainは未検証。今回macOS固有UIやSwiftUI実装は追加していません。
+
+
+## Web-4B2 secured backend integration (2026-10-22)
+
+共有applicationへ`SecuredCoreSyncBackend`とtrusted immutable NetworkPolicyを統合しました。
+Moodle、WebClass初回login/reauth、cached sessionが同じsecured transport policyを使い、
+既存sync/import/SQLite v3/completion/revisionの契約を維持します。Web専用のrun資源上限も追加しました。
+通常Web binaryはall-featuresでもDisabledNetworkBackend固定、既存synthetic exampleはMockSyncBackendです。
+CLI/envによる実backend切替、実大学通信、実credential入力、Web-4B3実装/実行は行っていません。
+
+結果・changed files・資源上限とcancelの限界・隔離E2E・回帰・将来の実通信検証計画は
+[Phase Web-4B2](docs/PHASE-WEB-4B2.md)を参照してください。
+判定はReady for Web-4B3（Mac/offlineコード統合gate）。実通信の自動許可ではありません。
+Web-4AのWindows build / Browser smokeは未完了、同phase最終判定はBLOCKEDのままです。

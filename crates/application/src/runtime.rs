@@ -68,10 +68,10 @@ impl ApplicationHandle {
         database: Result<PathBuf, ApplicationError>,
         initialize_settings: impl FnOnce() -> Result<(S, C), ApplicationError> + Send + 'static,
     ) -> Result<Self, ApplicationError> {
-        Self::open_with_backend(database, initialize_settings, CoreSyncBackend)
+        Self::open_with_backend(database, initialize_settings, CoreSyncBackend::desktop())
     }
 
-    /// Transport substitution for synthetic/offline tests; not a frontend API.
+    /// Explicit trusted backend injection (secured Web or synthetic tests); not a frontend API.
     pub fn open_with_backend<
         S: SettingsStore + 'static,
         C: CredentialStore + 'static,

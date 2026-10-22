@@ -674,3 +674,96 @@ mod mock {
         state.shutdown().await;
     }
 }
+
+// The core's isolated CA/DNS seam is intentionally unavailable to this crate.
+// This half of the split E2E verifies the genuine secured backend through the
+// authenticated API/Vault/coordinator/worker boundary, with denied URLs only.
+#[cfg(feature = "synthetic-sync")]
+#[tokio::test]
+async fn secured_backend_through_api_vault_coordinator_fails_closed_without_network() {
+    use assignment_manager::university_network::NetworkPolicy;
+    use assignment_manager_application::SecuredCoreSyncBackend;
+    use assignment_manager_web_server::{synthetic, vault};
+    let root = tempfile::tempdir().unwrap();
+    let db = common::database(&root.path().join("secured-poc")).unwrap();
+    let provider = common::keys(&db);
+    vault::initialize_with_provider(&db, provider.as_ref()).unwrap();
+    let state = synthetic::open(
+        &db,
+        SystemClock,
+        auth::SystemAuthClock,
+        provider,
+        SecuredCoreSyncBackend::new(NetworkPolicy::default()),
+    )
+    .await
+    .unwrap();
+    let app = router(state.clone(), PORT);
+    let (cookie, csrf) = common::login(&app, PORT).await;
+    let (_, _, start) = send(&app, post("secured-empty", &cookie, &csrf)).await;
+    let run = wait_finished(&app, start["statusUrl"].as_str().unwrap(), &cookie).await;
+    assert_eq!(run["shouldReload"], false);
+    assert_eq!(run["report"]["moodle"]["status"], "not_configured");
+    assert_eq!(
+        send(
+            &app,
+            write(
+                "/api/v1/auth/reauth",
+                json!({"password":common::PASSWORD}),
+                Some(&cookie),
+                Some(&csrf)
+            )
+        )
+        .await
+        .0,
+        204
+    );
+    let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    trap.set_nonblocking(true).unwrap();
+    let url = format!(
+        "https://127.0.0.1:{}/private?token=synthetic-secured-secret",
+        trap.local_addr().unwrap().port()
+    );
+    assert_eq!(
+        send(
+            &app,
+            write(
+                "/api/v1/settings/moodle",
+                json!({"calendarUrl":url}),
+                Some(&cookie),
+                Some(&csrf)
+            )
+        )
+        .await
+        .0,
+        204
+    );
+    let (_, _, start) = send(&app, post("secured-denied", &cookie, &csrf)).await;
+    let run = wait_finished(&app, start["statusUrl"].as_str().unwrap(), &cookie).await;
+    assert_eq!(run["state"], "finished");
+    assert_eq!(run["shouldReload"], true);
+    assert_eq!(
+        run["report"]["moodle"],
+        json!({"status":"failed","error":"invalid_configuration"})
+    );
+    assert_eq!(run["report"]["webclass"]["status"], "not_configured");
+    assert!(!run.to_string().contains("synthetic-secured-secret"));
+    assert!(!run.to_string().contains("127.0.0.1"));
+    assert_eq!(
+        trap.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let control = rusqlite::Connection::open(auth::control_path(&db)).unwrap();
+    let payload: Vec<u8> = control
+        .query_row(
+            "SELECT envelope FROM web_credentials WHERE kind='moodle'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !payload
+            .windows("synthetic-secured-secret".len())
+            .any(|w| w == b"synthetic-secured-secret")
+    );
+    state.shutdown().await;
+}

@@ -304,6 +304,15 @@ fn tls_server(
     SocketAddr,
     thread::JoinHandle<(Option<String>, TcpListener)>,
 ) {
+    tls_server_delayed(raw, Duration::ZERO)
+}
+fn tls_server_delayed(
+    raw: Vec<u8>,
+    delay: Duration,
+) -> (
+    SocketAddr,
+    thread::JoinHandle<(Option<String>, TcpListener)>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let peer = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -332,6 +341,7 @@ fn tls_server(
                     .to_ascii_lowercase()
                     .contains(&format!("host: {sni}\r\n"))
             );
+            thread::sleep(delay);
             let _ = stream.write_all(&raw);
             let _ = stream.flush();
         }
@@ -784,4 +794,131 @@ fn secured_total_deadline_stops_a_body_that_keeps_sending_small_chunks() {
     secret_safe(&error);
     assert!(started.elapsed() >= Duration::from_secs(12));
     assert!(started.elapsed() < Duration::from_secs(22));
+}
+
+#[test]
+fn whole_run_request_concurrency_group_record_deadline_and_byte_limits_fail_closed() {
+    let run = Arc::new(RunBudget::default());
+    assert!(run.acquire().is_err()); // no admitted run
+    run.begin();
+    let first = run.acquire().unwrap();
+    assert!(run.acquire().is_err()); // response lease owns the only slot
+    drop(first);
+    for _ in 1..RUN_REQUESTS {
+        drop(run.acquire().unwrap());
+    }
+    assert!(run.acquire().is_err());
+    run.begin();
+    run.checkpoint(MAX_COURSES, MAX_COURSES, false).unwrap();
+    assert!(run.checkpoint(MAX_COURSES + 1, MAX_COURSES, false).is_err());
+    run.checkpoint(MAX_RECORDS, MAX_RECORDS, false).unwrap();
+    assert!(run.checkpoint(MAX_RECORDS + 1, MAX_RECORDS, false).is_err());
+    for _ in 0..RUN_GROUPS {
+        run.checkpoint(0, 0, true).unwrap();
+    }
+    assert!(run.checkpoint(0, 0, true).is_err());
+    run.begin();
+    run.0.lock().unwrap().bytes = RUN_BYTES;
+    assert!(run.acquire().is_err());
+    run.begin();
+    run.0.lock().unwrap().started = Some(Instant::now() - RUN_TIME);
+    assert!(run.acquire().is_err());
+    assert!(run.checkpoint(0, 0, false).is_err());
+    run.begin();
+    drop(run.acquire().unwrap());
+}
+
+#[test]
+fn cumulative_bytes_and_whole_run_deadline_bound_actual_tls_body_reads() {
+    for deadline in [false, true] {
+        let (peer, server) = tls_server(response(b"12345", "Content-Length: 5\r\n"));
+        let policy = tls_policy(peer, Arc::new(FakeLookup::new(vec![vec![peer]])));
+        let run = Arc::new(RunBudget::default());
+        run.begin();
+        let mut http = Transport::secured(policy, Source::Moodle, None).unwrap();
+        http.set_run_budget(Some(run.clone()));
+        let response = http.send(http.get(Url::parse(URL).unwrap())).unwrap();
+        if deadline {
+            run.0.lock().unwrap().started = Some(Instant::now() - RUN_TIME);
+        } else {
+            run.0.lock().unwrap().bytes = RUN_BYTES - 2;
+        }
+        assert!(read_text(response, BodyKind::MoodleIcs).is_err());
+        server.join().unwrap();
+        assert!(!run.0.lock().unwrap().active);
+    }
+}
+
+#[test]
+fn web_cookie_budget_never_evicts_isolation_or_grows_unbounded() {
+    let url = Url::parse(IDP_ORIGIN).unwrap();
+    for mode in 0..4 {
+        let cookies = SessionCookies::new(true);
+        match mode {
+            0 => {
+                for n in 0..1025 {
+                    cookies.add_cookie_str(&format!("c{n}=synthetic; Path=/"), &url);
+                }
+            }
+            1 => cookies.add_cookie_str(&format!("a={}", "x".repeat(4096)), &url),
+            2 => {
+                for n in 0..100 {
+                    cookies.add_cookie_str(&format!("c{n}={}", "x".repeat(4090)), &url);
+                }
+            }
+            _ => {
+                for n in 0..4 {
+                    cookies.add_cookie_str(
+                        "a=b",
+                        &Url::parse(&format!("https://origin{n}.synthetic.invalid")).unwrap(),
+                    );
+                }
+            }
+        }
+        assert!(cookies.exhausted());
+        let usage = *cookies.usage.lock().unwrap();
+        assert!(usage.0 <= 1024 && usage.1 <= 256 * 1024);
+        assert!(cookies.origins.lock().unwrap().len() <= 3);
+        cookies.add_cookie_str("late=secret", &url);
+        assert_eq!(usage, *cookies.usage.lock().unwrap());
+    }
+}
+
+#[test]
+fn remaining_run_time_clamps_a_real_tls_request_timeout() {
+    let (peer, server) = tls_server_delayed(
+        response(b"ok", "Content-Length: 2\r\n"),
+        Duration::from_millis(600),
+    );
+    let policy = tls_policy(peer, Arc::new(FakeLookup::new(vec![vec![peer]])));
+    let run = Arc::new(RunBudget::default());
+    let mut http = Transport::secured(policy, Source::Moodle, None).unwrap();
+    http.set_run_budget(Some(run.clone()));
+    run.begin();
+    run.0.lock().unwrap().started = Some(Instant::now() - (RUN_TIME - Duration::from_millis(300)));
+    let start = Instant::now();
+    assert_eq!(
+        http.send(http.get(Url::parse(URL).unwrap())).unwrap_err(),
+        NetworkError::Timeout
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    server.join().unwrap();
+    assert!(!run.0.lock().unwrap().active);
+}
+
+#[test]
+fn secured_sync_private_dns_rejection_never_connects_to_fixture_tripwire() {
+    let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+    let lookup = Arc::new(FakeLookup::new(vec![vec![trap.local_addr().unwrap()]]));
+    let mut policy = policy();
+    policy.test.lookup = Some(lookup.clone());
+    let mut clients = crate::secured_sync::SecuredSyncClients::new(policy);
+    clients.begin_run();
+    let mut store = crate::persistence::SqliteStore::open(":memory:").unwrap();
+    assert_eq!(
+        crate::sync::sync_moodle_once(&clients.moodle().unwrap(), &feed(URL), &mut store),
+        Err(crate::sync::MoodleSyncError::Fetch)
+    );
+    assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    assert_no_connection(&trap);
 }

@@ -18,7 +18,9 @@ mod sync_service;
 mod sync_worker;
 
 pub use runtime::ApplicationHandle;
-pub use sync_service::{SourceSyncResult, SyncBackend, SyncCounts, SyncFailure, SyncReport};
+pub use sync_service::{
+    SecuredCoreSyncBackend, SourceSyncResult, SyncBackend, SyncCounts, SyncFailure, SyncReport,
+};
 pub use sync_worker::SyncStatus;
 
 #[cfg(test)]

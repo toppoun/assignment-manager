@@ -1,4 +1,4 @@
-//! Web egress policy and shared bounded HTTP transport. No server/backend wiring.
+//! Web egress policy and shared bounded HTTP transport. No executable activation.
 //! The reqwest resolver returns only the addresses it has just validated: there
 //! is no separate validation lookup followed by an unguarded connection lookup.
 use std::{
@@ -8,7 +8,7 @@ use std::{
     io::Read,
     net::IpAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 
 use reqwest::{
     Url,
-    blocking::{Client, RequestBuilder, Response},
+    blocking::{Client, RequestBuilder, Response as HttpResponse},
     cookie::{CookieStore, Jar},
     dns::{Addrs, Name, Resolve, Resolving},
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, HeaderValue, REFERER},
@@ -102,6 +102,7 @@ impl NetworkPolicy {
                 .origins
                 .iter()
                 .filter_map(|o| o.host_str().map(String::from))
+                .chain(self.moodle.iter().map(|(host, _)| host.clone()))
                 .collect();
         }
         match source {
@@ -111,6 +112,104 @@ impl NetworkPolicy {
                 .map(|o| Url::parse(o).unwrap().host_str().unwrap().to_owned())
                 .collect(),
         }
+    }
+}
+
+// These Web-only budgets are deliberately not configurable from browser/env input.
+// See PHASE-WEB-4B2.md for sizing evidence and cooperative deadline limitations.
+pub(crate) const RUN_TIME: Duration = Duration::from_secs(180);
+pub(crate) const RUN_REQUESTS: usize = 512;
+pub(crate) const RUN_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_COURSES: usize = 128;
+pub(crate) const MAX_RECORDS: usize = 4096;
+pub(crate) const RUN_GROUPS: usize = 2 * MAX_COURSES; // full retry once
+
+#[derive(Default)]
+struct RunState {
+    started: Option<Instant>,
+    requests: usize,
+    bytes: usize,
+    groups: usize,
+    active: bool,
+}
+#[derive(Default)]
+pub(crate) struct RunBudget(Mutex<RunState>);
+impl RunBudget {
+    pub(crate) fn begin(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = RunState {
+            started: Some(Instant::now()),
+            ..Default::default()
+        };
+    }
+    fn remaining(state: &RunState) -> Result<Duration, NetworkError> {
+        state
+            .started
+            .and_then(|t| RUN_TIME.checked_sub(t.elapsed()))
+            .filter(|t| !t.is_zero())
+            .ok_or(NetworkError::ResourceLimit)
+    }
+    fn acquire(self: &Arc<Self>) -> Result<RequestLease, NetworkError> {
+        let mut state = self.0.lock().map_err(|_| NetworkError::ResourceLimit)?;
+        Self::remaining(&state)?;
+        if state.active || state.requests >= RUN_REQUESTS || state.bytes >= RUN_BYTES {
+            return Err(NetworkError::ResourceLimit);
+        }
+        state.requests += 1;
+        state.active = true;
+        Ok(RequestLease(Arc::clone(self)))
+    }
+    fn checkpoint(&self, records: usize, maximum: usize, group: bool) -> Result<(), NetworkError> {
+        let mut state = self.0.lock().map_err(|_| NetworkError::ResourceLimit)?;
+        Self::remaining(&state)?;
+        if records > maximum || (group && state.groups >= RUN_GROUPS) {
+            return Err(NetworkError::ResourceLimit);
+        }
+        state.groups += usize::from(group);
+        Ok(())
+    }
+}
+struct RequestLease(Arc<RunBudget>);
+impl Drop for RequestLease {
+    fn drop(&mut self) {
+        self.0.0.lock().unwrap_or_else(|e| e.into_inner()).active = false;
+    }
+}
+/// Keeps the external-request slot until the body has been consumed or dropped.
+pub(crate) struct Response {
+    inner: HttpResponse,
+    lease: Option<RequestLease>,
+}
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UniversityResponse([redacted])")
+    }
+}
+impl std::ops::Deref for Response {
+    type Target = HttpResponse;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl Read for Response {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let limit = if let Some(lease) = &self.lease {
+            let state = lease.0.0.lock().unwrap_or_else(|e| e.into_inner());
+            RunBudget::remaining(&state).map_err(std::io::Error::other)?;
+            // Read at most one byte beyond the cumulative limit, to detect excess.
+            buf.len().min(RUN_BYTES.saturating_sub(state.bytes) + 1)
+        } else {
+            buf.len()
+        };
+        let n = self.inner.read(&mut buf[..limit])?;
+        if let Some(lease) = &self.lease {
+            let mut state = lease.0.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.bytes = state.bytes.saturating_add(n);
+            RunBudget::remaining(&state).map_err(std::io::Error::other)?;
+            if state.bytes > RUN_BYTES {
+                return Err(std::io::Error::other(NetworkError::ResourceLimit));
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -182,6 +281,7 @@ pub enum NetworkError {
     BodyTooLarge,
     Encoding,
     Decode,
+    ResourceLimit,
 }
 impl fmt::Display for NetworkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -194,6 +294,7 @@ impl fmt::Display for NetworkError {
             Self::BodyTooLarge => "university response exceeded size limit",
             Self::Encoding => "university response encoding rejected",
             Self::Decode => "university response is not UTF-8",
+            Self::ResourceLimit => "university sync resource limit exceeded",
         })
     }
 }
@@ -302,12 +403,16 @@ fn public_ip(ip: IpAddr) -> bool {
 pub(crate) struct Transport {
     client: Client,
     policy: Option<(NetworkPolicy, Source)>,
+    cookies: Option<Arc<SessionCookies>>,
+    run: Option<Arc<RunBudget>>,
 }
 impl Transport {
     pub(crate) fn desktop(client: Client) -> Self {
         Self {
             client,
             policy: None,
+            cookies: None,
+            run: None,
         }
     }
     pub(crate) fn secured(
@@ -346,8 +451,8 @@ impl Transport {
                 "/",
                 env!("CARGO_PKG_VERSION")
             ));
-        if let Some(cookies) = cookies {
-            builder = builder.cookie_provider(cookies);
+        if let Some(cookies) = &cookies {
+            builder = builder.cookie_provider(Arc::clone(cookies));
         }
         #[cfg(test)]
         {
@@ -363,6 +468,8 @@ impl Transport {
         Ok(Self {
             client,
             policy: Some((policy, source)),
+            cookies,
+            run: None,
         })
     }
     pub(crate) fn get(&self, url: Url) -> RequestBuilder {
@@ -371,8 +478,25 @@ impl Transport {
     pub(crate) fn post(&self, url: Url) -> RequestBuilder {
         self.client.post(url)
     }
+    pub(crate) fn set_run_budget(&mut self, run: Option<Arc<RunBudget>>) {
+        self.run = run;
+    }
+    pub(crate) fn shares_run(&self, run: &Arc<RunBudget>) -> bool {
+        self.run.as_ref().is_some_and(|r| Arc::ptr_eq(r, run))
+    }
     pub(crate) fn is_secured(&self) -> bool {
         self.policy.is_some()
+    }
+    pub(crate) fn checkpoint(
+        &self,
+        records: usize,
+        maximum: usize,
+        group: bool,
+    ) -> Result<(), NetworkError> {
+        if let Some(run) = &self.run {
+            run.checkpoint(records, maximum, group)?;
+        }
+        Ok(())
     }
     pub(crate) fn send(&self, request: RequestBuilder) -> Result<Response, NetworkError> {
         let mut request = request.build().map_err(|_| NetworkError::Request)?;
@@ -394,13 +518,25 @@ impl Transport {
         request
             .headers_mut()
             .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-        self.client.execute(request).map_err(|e| {
+        if self.cookies.as_ref().is_some_and(|c| c.exhausted()) {
+            return Err(NetworkError::ResourceLimit);
+        }
+        let lease = self.run.as_ref().map(|run| run.acquire()).transpose()?;
+        if let Some(lease) = &lease {
+            let state = lease.0.0.lock().map_err(|_| NetworkError::ResourceLimit)?;
+            *request.timeout_mut() = Some(REQUEST_TIMEOUT.min(RunBudget::remaining(&state)?));
+        }
+        let inner = self.client.execute(request).map_err(|e| {
             if e.is_timeout() {
                 NetworkError::Timeout
             } else {
                 NetworkError::Request
             }
-        })
+        })?;
+        if self.cookies.as_ref().is_some_and(|c| c.exhausted()) {
+            return Err(NetworkError::ResourceLimit);
+        }
+        Ok(Response { inner, lease })
     }
 }
 
@@ -460,24 +596,29 @@ pub(crate) fn read_text(mut response: Response, kind: BodyKind) -> Result<String
 pub(crate) struct SessionCookies {
     desktop: Option<Jar>,
     origins: Mutex<HashMap<String, Jar>>,
+    usage: Mutex<(usize, usize)>,
+    exhausted: std::sync::atomic::AtomicBool,
 }
 impl SessionCookies {
     pub(crate) fn new(isolated: bool) -> Self {
         Self {
             desktop: (!isolated).then(Jar::default),
             origins: Mutex::new(HashMap::new()),
+            usage: Mutex::new((0, 0)),
+            exhausted: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+    fn exhausted(&self) -> bool {
+        self.exhausted.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub(crate) fn add_cookie_str(&self, cookie: &str, url: &Url) {
         if let Some(jar) = &self.desktop {
             jar.add_cookie_str(cookie, url);
+        } else if let Ok(value) = HeaderValue::from_str(cookie) {
+            self.set_cookies(&mut std::iter::once(&value), url);
         } else {
-            self.origins
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(url.origin().ascii_serialization())
-                .or_default()
-                .add_cookie_str(cookie, url);
+            self.exhausted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -485,13 +626,31 @@ impl CookieStore for SessionCookies {
     fn set_cookies(&self, headers: &mut dyn Iterator<Item = &HeaderValue>, url: &Url) {
         if let Some(jar) = &self.desktop {
             jar.set_cookies(headers, url);
-        } else {
-            self.origins
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(url.origin().ascii_serialization())
+            return;
+        }
+        let mut origins = self.origins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let origin = url.origin().ascii_serialization();
+        // Cumulative received cookie updates bound even expired/path-varying Jar entries.
+        let values: Vec<_> = headers.take(1025).cloned().collect();
+        let bytes: usize = values.iter().map(|h| h.as_bytes().len()).sum();
+        if self.exhausted()
+            || usage.0 + values.len() > 1024
+            || usage.1 + bytes > 256 * 1024
+            || values.iter().any(|h| h.as_bytes().len() > 4096)
+            || (!values.is_empty() && !origins.contains_key(&origin) && origins.len() >= 3)
+        {
+            self.exhausted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        usage.0 += values.len();
+        usage.1 += bytes;
+        if !values.is_empty() {
+            origins
+                .entry(origin)
                 .or_default()
-                .set_cookies(headers, url);
+                .set_cookies(&mut values.iter(), url);
         }
     }
     fn cookies(&self, url: &Url) -> Option<HeaderValue> {
@@ -515,6 +674,7 @@ impl CookieStore for SessionCookies {
 #[derive(Clone, Default)]
 pub(crate) struct TestNetwork {
     pub(crate) origins: Vec<Url>,
+    pub(crate) auth: Option<[Url; 3]>,
     pub(crate) lookup: Option<Arc<dyn Resolve>>,
     pub(crate) peer: Option<SocketAddr>,
     pub(crate) root: Option<reqwest::Certificate>,

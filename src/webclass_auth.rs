@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, ORIGIN, REFERER};
 use reqwest::{StatusCode, Url};
 use scraper::{Html, Selector};
@@ -15,8 +15,8 @@ use serde_json::Value;
 use crate::webclass_http::{WebClassClient, WebClassHttpError};
 
 use crate::university_network::{
-    BodyKind, HOPPII_ORIGIN, IDP_ORIGIN, NetworkError, NetworkPolicy, SessionCookies, Source,
-    Transport, WEBCLASS_ORIGIN, read_text,
+    BodyKind, HOPPII_ORIGIN, IDP_ORIGIN, NetworkError, NetworkPolicy, Response, SessionCookies,
+    Source, Transport, WEBCLASS_ORIGIN, read_text,
 };
 
 const USER_PAGE: &str = "/portal/u001/index.php";
@@ -155,6 +155,7 @@ impl Error for HoseiAuthError {}
 /// retains its immutable policy across first login and the core's reauth once.
 pub struct HoseiAuthenticator {
     policy: Option<NetworkPolicy>,
+    run: Option<Arc<crate::university_network::RunBudget>>,
     #[cfg(test)]
     test_endpoints: Option<AuthEndpoints>,
 }
@@ -169,6 +170,7 @@ impl HoseiAuthenticator {
     pub fn new() -> Self {
         Self {
             policy: None,
+            run: None,
             #[cfg(test)]
             test_endpoints: None,
         }
@@ -177,10 +179,20 @@ impl HoseiAuthenticator {
     /// Construct an explicitly secured Web authenticator; performs no request.
     pub fn for_web(policy: NetworkPolicy) -> Self {
         Self {
-            policy: Some(policy),
+            policy: Some(policy.clone()),
+            run: None,
             #[cfg(test)]
-            test_endpoints: None,
+            test_endpoints: policy.test.auth.as_ref().map(|origins| AuthEndpoints {
+                hoppii: origins[0].clone(),
+                idp: origins[1].clone(),
+                webclass: origins[2].clone(),
+                timeout: TIMEOUT,
+            }),
         }
+    }
+
+    pub(crate) fn set_run_budget(&mut self, run: Arc<crate::university_network::RunBudget>) {
+        self.run = Some(run);
     }
 
     /// Log in once and verify `/courses` as a JSON array before returning the client.
@@ -201,7 +213,7 @@ impl HoseiAuthenticator {
         credentials: HoseiCredentials<'_>,
         endpoints: &AuthEndpoints,
     ) -> Result<WebClassClient, HoseiAuthError> {
-        let session = AuthSession::with_policy(endpoints, self.policy.clone())?;
+        let session = AuthSession::with_policy(endpoints, self.policy.clone(), self.run.clone())?;
         let auth_url = session.discover_openam()?;
         let success = session.authenticate(&auth_url, credentials)?;
         let success_url = resolve_destination(
@@ -265,14 +277,15 @@ struct AuthSession<'a> {
 impl<'a> AuthSession<'a> {
     #[cfg(test)]
     fn new(endpoints: &'a AuthEndpoints) -> Result<Self, HoseiAuthError> {
-        Self::with_policy(endpoints, None)
+        Self::with_policy(endpoints, None, None)
     }
     fn with_policy(
         endpoints: &'a AuthEndpoints,
         policy: Option<NetworkPolicy>,
+        run: Option<Arc<crate::university_network::RunBudget>>,
     ) -> Result<Self, HoseiAuthError> {
         let jar = Arc::new(SessionCookies::new(policy.is_some()));
-        let http = if let Some(policy) = policy {
+        let mut http = if let Some(policy) = policy {
             Transport::secured(policy, Source::WebClass, Some(Arc::clone(&jar)))
                 .map_err(|_| HoseiAuthError::ClientInitialization)?
         } else {
@@ -295,6 +308,7 @@ impl<'a> AuthSession<'a> {
                     .map_err(|_| HoseiAuthError::ClientInitialization)?,
             )
         };
+        http.set_run_budget(run);
         Ok(Self {
             http,
             jar,
@@ -314,6 +328,7 @@ impl<'a> AuthSession<'a> {
             AuthStep::HoppiiToIdp,
         )?;
         let idp_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::HoppiiToIdp)?;
+        drop(response);
         let response = self.send(self.http.get(idp_url), AuthStep::IdpToOpenAm)?;
         let xui_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::IdpToOpenAm)?;
         parse_xui_auth_url(&xui_url, &self.endpoints.idp)
@@ -398,6 +413,7 @@ impl<'a> AuthSession<'a> {
             if consent_url.path() != CONSENT {
                 return Err(HoseiAuthError::ProtocolChanged(AuthStep::Consent));
             }
+            drop(response);
             self.consent(&consent_url)?
         } else {
             response
@@ -482,6 +498,7 @@ impl<'a> AuthSession<'a> {
         if !response.status().is_success() {
             return Err(HoseiAuthError::HttpStatus(step, response.status()));
         }
+        drop(response);
         self.send(self.http.get(return_url), AuthStep::Saml)
     }
 
@@ -509,6 +526,7 @@ impl<'a> AuthSession<'a> {
             } else {
                 request
             };
+            drop(response);
             response = self.send(request, redirect_step)?;
             response_step = redirect_step;
         }
@@ -587,11 +605,9 @@ impl<'a> AuthSession<'a> {
         for followed in 0..=MAX_REDIRECTS {
             let base = response.url().clone();
             let target = if is_redirect(response.status()) {
-                Some(redirect_destination(
-                    &response,
-                    &self.endpoints.webclass,
-                    step,
-                )?)
+                let target = redirect_destination(&response, &self.endpoints.webclass, step)?;
+                drop(response);
+                Some(target)
             } else {
                 let text = read_ok(response, step)?;
                 match parse_webclass_js_redirect(&text) {

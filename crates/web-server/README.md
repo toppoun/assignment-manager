@@ -244,5 +244,19 @@ SettingsがURLの保存を受理しても、それは通信先の承認ではあ
 
 [Phase Web-4B1](../../docs/PHASE-WEB-4B1.md)、
 [大学HTTP security設計](../../docs/WEB-NETWORK-SECURITY.md)を参照してください。
-Web-4B1はMac/offline transport gateでReady for Web-4B2ですが、Web-4B2はまだ実装していません。
+Web-4B1はMac/offline transport gate。Web-4B2でbackend内部の統合とoffline検証を追加しました。
 Web-4AのWindows build / Browser smokeは引き続き未完了で、Web-4A最終判定はBLOCKEDです。
+
+
+## Secured backend integration (Web-4B2)
+
+共有applicationに`SecuredCoreSyncBackend::new(NetworkPolicy)`を追加しました。
+通常binaryは引き続きDisabledNetworkBackend固定で、CLI/envから有効化できません。
+MockSyncBackendのexampleも維持します。新しいsecured成功経路はcore内部の合成HTTPS/CA/DNSと
+既存SSO→parser→SQLiteで検証し、Web側は明示注入した実backendのpolicy拒否を認証API/Vault/
+coordinator/worker経由で検証します。任意CA/DNSを公開するproduction設定はありません。
+
+全runの時間・request/bytes・course/group/batch・Cookie上限、協調的deadlineの限界、
+Web-4B3の未実行手順は[Phase Web-4B2](../../docs/PHASE-WEB-4B2.md)を参照してください。
+判定はReady for Web-4B3（Mac/offline統合のみ）。大学実通信・公開運用の許可ではありません。
+Web-4AのWindows未検証・最終BLOCKEDは維持します。

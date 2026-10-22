@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -284,12 +284,7 @@ struct RecordedRequest {
     body: String,
 }
 
-fn read_request(stream: &mut TcpStream) -> RecordedRequest {
-    // Accepted sockets inherit nonblocking mode on Windows.
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+fn read_request(stream: &mut impl Read) -> RecordedRequest {
     let mut bytes = Vec::new();
     let mut chunk = [0; 4096];
     let end = loop {
@@ -410,7 +405,9 @@ impl Exchange {
         if self.forbid_referer {
             assert!(!request.headers.contains_key("referer"));
         }
-        if !request.headers["host"].starts_with("localhost:") {
+        if !request.headers["host"].starts_with("localhost:")
+            && request.headers["host"] != "idp.synthetic.invalid"
+        {
             assert!(
                 request
                     .headers
@@ -487,6 +484,10 @@ fn script_with_probe(
                     Err(error) => panic!("loopback mock did not receive expected request: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             exchange.assert_request(&read_request(&mut stream));
             before_response();
             let body = exchange
@@ -528,6 +529,9 @@ struct FullFlow {
 
 impl FullFlow {
     fn new(consent: bool) -> Self {
+        Self::with_origins(consent, None)
+    }
+    fn with_origins(consent: bool, origins: Option<[Url; 3]>) -> Self {
         let listeners = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
         let endpoints = AuthEndpoints {
             hoppii: Url::parse(&format!("http://{}", listeners[0].local_addr().unwrap())).unwrap(),
@@ -540,6 +544,16 @@ impl FullFlow {
             webclass: Url::parse(&format!("http://{}", listeners[2].local_addr().unwrap()))
                 .unwrap(),
             timeout: Duration::from_secs(3),
+        };
+        let endpoints = if let Some([hoppii, idp, webclass]) = origins {
+            AuthEndpoints {
+                hoppii,
+                idp,
+                webclass,
+                timeout: Duration::from_secs(3),
+            }
+        } else {
+            endpoints
         };
         let idp_sso = endpoint(&endpoints.idp, "/idp/sso?request=synthetic-request-id");
         let auth = parse_xui_auth_url(&xui_url(&endpoints.idp), &endpoints.idp).unwrap();
@@ -2060,6 +2074,7 @@ mod reauth_sync_tests {
         (
             HoseiAuthenticator {
                 policy: None,
+                run: None,
                 test_endpoints: Some(flow.endpoints),
             },
             servers,
@@ -2525,3 +2540,6 @@ mod reauth_sync_tests {
         }
     }
 }
+
+#[path = "secured_sync_tests.rs"]
+mod secured_backend_tests;
