@@ -139,7 +139,7 @@ adapter/model generationで古いGET/PUTの復活とlogout後のreconciliation�
 
 UIは次のAPI/reloadで失効を知る。background keepaliveやtab間logout通知は今回ない。
 他tabの既表示snapshotは次のrequestまで残り得る。一般公開・multi-user承認の根拠にはしない。
-WebVault + DisabledNetworkBackendを使用し、startup syncはOFF。大学同期/実通信は追加していない。
+WebVault + DisabledNetworkBackendを使用し、startup syncはOFF。Web-4A手動Sync APIは認証とowner確認を必須にし、大学への実通信は追加していない。
 
 ## Recent reauthentication (Web-3B)
 
@@ -169,3 +169,24 @@ control v1→v2はtransactionでsession columnとVault tablesを追加し、acco
 rate-limit timestampを保持する。server openではその後、従来のrestart policyでsession行だけを削除する。
 Future/partial/corrupt schemaは停止し、migration failureで旧DBをresetしない。
 鍵custody、暗号化format、nonce履歴、backup制約は[Vault設計](WEB-CREDENTIAL-VAULT.md)を参照。
+
+
+## Manual sync authentication (Web-4A)
+
+POST /api/v1/sync、GET /api/v1/sync/status、GET /api/v1/sync/runs/{runId} は
+既存Cookie resolve（disabled/logout/expiryを含む）とTenantRuntime owner照合を必須とする。
+POSTはさらにsession-bound CSRF、Origin/Host/Fetch Metadata/JSON/web-3a headerを検証。
+通常manual syncにrecent reauthは要求しない。owner単位のrun admissionと5新規run/60秒、
+bounded memory key/historyを追加した。詳細は[Phase Web-4A](PHASE-WEB-4A.md)。
+既に認証・admission済みjobはlogoutと並行して完了し得る。run IDは認可の代わりにならず、
+旧sessionや別ownerでは照会できない。通常binaryの大学通信は無効のまま。
+
+
+## University transport preparation (Web-4B1)
+
+[Web-4B1](PHASE-WEB-4B1.md)でcoreに[安全な大学HTTP constructor](WEB-NETWORK-SECURITY.md)を追加した。
+通常Web serverは引き続きDisabledNetworkBackendで、実大学backendへは接続していない。
+Moodleの保存時validationは通信許可ではなく、Web fetchには別のexact host/pathとDNS policyが必要。
+Moodle実host/pathは未設定でfail closed。暗号化Vault、boolean-only status、owner/reauth/CSRF、
+jobとcredential mutationの排他は変更していない。実credentialの使用は今回行っていない。
+Web-4AのWindows検証は未完了・最終BLOCKEDのまま。Web-4B2はまだ実装していない。

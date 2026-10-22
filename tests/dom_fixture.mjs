@@ -17,7 +17,7 @@ export function documentFixture() {
   }
   const ids = Object.fromEntries(["assignments", "empty", "status", "count", "error", "reload", "reset-filters", "filters",
     "completion-filter", "deadline-filter", "course-filter", "sort", "empty-title", "empty-description",
-    "view-navigation", "settings-view", "show-list", "show-settings",
+    "web-sync-panel", "web-sync-now", "web-sync-refresh", "web-sync-message", "web-sync-error", "web-sync-results", "view-navigation", "settings-view", "show-list", "show-settings",
     "settings-message", "settings-error", "reauth-status", "moodle-status", "webclass-status", "reauth-form", "reauth-submit", "reauth-password", "settings-reload", "moodle-form", "webclass-form", "moodle-save", "moodle-remove", "webclass-save", "webclass-remove", "moodle-url", "webclass-id", "webclass-password",
     "auth-status", "login-view", "list-view", "web-login", "web-password", "login-form", "login-submit", "logout", "session-retry", "retry-logout"].map(id => [id, new Element("div")]));
   for (const [key, value] of Object.entries(DEFAULT_CONTROLS)) ids[key === "sort" ? "sort" : `${key}-filter`].value = value;

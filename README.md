@@ -36,7 +36,7 @@ Tauri側はpath解決、JSON request/DTO、日本語message、JSON settings stor
 
 ## Development
 
-Web-3Bの合成データ専用Browser UI + HTTP PoCは[crates/web-server](crates/web-server/README.md)にあります。
+Web-4Aの合成データ専用Browser UI + 非同期Sync API PoCは[crates/web-server](crates/web-server/README.md)にあります。
 serverを停止し、次の明示的な管理操作を順に実行します。
 
 ```powershell
@@ -54,10 +54,15 @@ Settingsの保存・置換・削除にはWeb専用passwordによる再認証（5
 AES-256-GCMでUserId/record種別に束縛した認証情報と課題completionは再起動後も保持します。
 server再起動ではWeb sessionを失効させ、再ログインを要求します。課題schema v3、desktop/native DBは維持します。
 **127.0.0.1:3000のHTTP開発専用です。外部公開・LAN bind・reverse proxy・tunnel運用は禁止です。**
-本番HTTPS/Secure Cookie、proxy trust、production鍵provider/ACL、backup/restore、大学別SSRF/egress制御は未実装です。
+本番HTTPS/Secure Cookie、proxy trust、production鍵provider/ACL、backup/restoreは未実装です。
+Web-4B1で大学HTTP用の安全なtransport constructorとoffline testsを追加しました。通常Web backendへの接続は未実装です。
 [Web認証](docs/WEB-AUTHENTICATION.md)、[Vault設計](docs/WEB-CREDENTIAL-VAULT.md)、
-[Web-3B報告](docs/PHASE-WEB-3B.md)、[frontend統合](docs/FRONTEND-INTEGRATION.md)を参照してください。
-Ready for Web-4は次Phaseの設計上の着手判定で、公開運用の承認ではありません。
+[Web-4A報告](docs/PHASE-WEB-4A.md)、[frontend統合](docs/FRONTEND-INTEGRATION.md)を参照してください。
+非同期Sync API・bounded polling・部分失敗時の再取得を実装し、通常serverはDisabledNetworkBackendを維持します。
+mockは専用synthetic-sync featureの隔離test/exampleでのみ明示注入します。Windows検証の未完了項目はWeb-4A報告を参照してください。
+[Web-4B1報告](docs/PHASE-WEB-4B1.md)と[大学通信policy](docs/WEB-NETWORK-SECURITY.md)を参照してください。
+Moodle実host/pathは未設定でfail closedです。実大学通信・Web-4B2実装は行っていません。
+Web-4AのWindows build/smokeは未完了で、Web-4A最終判定はBLOCKEDのままです。
 
 Tauriの[OS別prerequisites](https://v2.tauri.app/start/prerequisites/)が必要です。
 WindowsではMSVC build toolsとWebView2、macOSではXcode Command Line Toolsを使用します。

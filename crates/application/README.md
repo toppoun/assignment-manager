@@ -106,3 +106,39 @@ does not. Existing SyncService drops old cached sessions before the next run wit
 a new revision. Web-3B uses DisabledNetworkBackend and never establishes a session
 or runs startup/manual sync. Session-bound reauthentication is Web transport policy
 and is not imposed on desktop/UniFFI. See [Web vault](../../docs/WEB-CREDENTIAL-VAULT.md).
+
+
+## Web sync adapter (Web-4A)
+
+WebSyncCoordinator keeps a server-owned task awaiting the existing `sync_now()`;
+HTTP handlers never await the long sync directly. The shared SyncWorker, source
+results, revision/session invalidation and `should_reload()` are unchanged.
+The Web owner-bound admission boundary also excludes credential mutations. A
+mutation's guard stays in a detached task until the SettingsWorker reply, even
+when its HTTP request disappears. A status precheck alone would be insufficient.
+Do not call `begin_shutdown()` on the application before accepted Web jobs and
+mutations drain: those jobs still need the settings sender for fresh credentials.
+Completion uses its separate worker and core IMMEDIATE transactions; imports
+preserve the user-owned completion value in either commit order.
+
+The ordinary Web runtime always injects DisabledNetworkBackend. Only the isolated
+synthetic test/example runtime injects MockSyncBackend. It simulates transport and
+retry outcomes and calls the existing core import/update path; it does not validate
+real SSO, cookies or university protocol compatibility. No shared public API,
+worker cancellation API, core network path or desktop policy changed.
+
+
+## University transport boundary (Web-4B1)
+
+Core now provides explicit `MoodleClient::for_web(NetworkPolicy)` and
+`HoseiAuthenticator::for_web(NetworkPolicy)` constructors. They enforce Web egress
+and bounded responses while retaining the existing parsers, authentication flow,
+and sync functions. Desktop constructors remain available. Shared body reads are
+bounded in both modes; the application orchestration and its APIs are unchanged.
+
+`CoreSyncBackend` still selects the existing desktop constructors. A future trusted
+Web factory must inject the same policy into Moodle, initial login and reauth;
+HTTP must stay in the existing core layer. No secured production backend is wired
+in this phase. Ordinary Web remains DisabledNetworkBackend; MockSyncBackend stays
+in isolated tests/examples. See [Web-4B1](../../docs/PHASE-WEB-4B1.md).
+Web-4A Windows validation remains incomplete and its final status remains BLOCKED.

@@ -27,13 +27,20 @@
         <button id="show-settings" type="button" aria-controls="settings-view" aria-pressed="false">設定</button>
         <button id="logout" type="button">ログアウト</button>
       </nav>
+      <section id="web-sync-panel" class="sync-panel" aria-label="手動同期と前回結果" aria-busy="false" hidden>
+        <button id="web-sync-now" type="button" disabled>同期</button>
+        <button id="web-sync-refresh" type="button">同期状態を確認</button>
+        <p id="web-sync-message" class="status" role="status" aria-live="polite"></p>
+        <p id="web-sync-error" class="error" role="alert" hidden></p>
+        <ul id="web-sync-results" aria-label="前回同期のサービス別結果"></ul>
+      </section>
       <div id="list-view" hidden>
       <header class="page-header">
         <div>
           <p class="eyebrow">Assignment Manager</p>
           <h1>課題一覧</h1>
           <p class="description">合成データを使ったローカルデモ · 表示時刻 Asia/Tokyo</p>
-          <p class="description">合成認証情報の保存のみ利用できます。大学との通信・同期は行いません。</p>
+          <p class="description">通常サーバーの大学通信は無効です。隔離した検証環境では合成データだけを同期します。</p>
         </div>
         <div class="header-actions">
           <button id="reload" type="button">再読み込み</button>

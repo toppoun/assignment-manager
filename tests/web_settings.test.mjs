@@ -135,8 +135,9 @@ test("navigation, tab/view disposal and logout clear every secret; late settings
   fill(ids); ids["reauth-form"].listeners.submit({preventDefault(){}}); await new Promise(resolve=>setImmediate(resolve));
   fill(ids); ids["moodle-form"].listeners.submit({preventDefault(){}}); empty(ids);
   await ids.logout.click(); empty(ids); assert.equal(ids["settings-view"].hidden,true); assert.equal(ids["view-navigation"].hidden,true);
+  const readsAtLogout = statusReads;
   pending.resolve(response(null,204)); await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(statusReads,3); assert.equal(ids["settings-message"].textContent,"");
+  assert.equal(statusReads,readsAtLogout); assert.equal(ids["settings-message"].textContent,"");
 });
 
 test("Web uses no secret storage or crypto; password input autocomplete and limits are explicit",()=>{
@@ -147,4 +148,14 @@ test("Web uses no secret storage or crypto; password input autocomplete and limi
   const html=readFileSync(new URL("../frontend/web.html",import.meta.url),"utf8");
   for(const id of ["moodle-url","webclass-password","reauth-password"]) assert.match(html,new RegExp(`<input[^>]*id="${id}"[^>]*type="password"[^>]*autocomplete="off"[^>]*maxlength="\\d+"`));
   assert.doesNotMatch(html,/id="startup-sync"|id="sync-now"/);
+});
+
+test("sync_running 409 keeps session, rejects credential mutation and shows safe Japanese message",async()=>{
+  let signedOut=0;
+  const api=createHttpApi(async()=>response({error:{code:"sync_running",message:"PRIVATE"}},409),()=>signedOut++);
+  await assert.rejects(api.saveMoodle(secrets[0]),{code:"sync_running",outcome:"rejected"}); assert.equal(signedOut,0);
+  const {doc,ids}=documentFixture(); let writes=0;
+  const view=createWebSettingsView({...baseApi(),settingsStatus:async()=>flags(true,true),saveMoodle:async()=>{writes++;throw {code:"sync_running",outcome:"rejected"};}},doc);
+  await view.load(); fill(ids); await view.reauthenticate(); fill(ids); assert.equal(await view.mutate("save_moodle"),false);
+  assert.equal(writes,1); assert.equal(view.snapshot().outcome,"rejected"); assert.match(view.snapshot().error,/同期中は認証情報を変更できません/); safe(view.snapshot()); empty(ids);
 });

@@ -4,6 +4,9 @@ use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
+use crate::university_network::{
+    BodyKind, NetworkError, NetworkPolicy, Source, Transport, read_text, strict_url,
+};
 use reqwest::blocking::Client;
 use reqwest::{StatusCode, Url};
 
@@ -49,6 +52,7 @@ pub struct MoodleFeed {
     scope: String,
     export_kind: MoodleExportKind,
     url: Url,
+    web_syntax_valid: bool,
 }
 
 impl MoodleFeed {
@@ -96,6 +100,7 @@ impl MoodleFeed {
             scope,
             export_kind,
             url,
+            web_syntax_valid: strict_url(secret_url).is_ok(),
         })
     }
 
@@ -160,7 +165,7 @@ impl Error for MoodleHttpError {}
 
 /// Never follows redirects, including same-origin redirects, or sends an automatic Referer.
 pub struct MoodleClient {
-    http: Client,
+    http: Transport,
 }
 
 impl MoodleClient {
@@ -177,33 +182,52 @@ impl MoodleClient {
             .timeout(timeout)
             .user_agent(USER_AGENT)
             .referer(false)
+            .retry(reqwest::retry::never())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .build()
             .map_err(|_| MoodleHttpError::ClientInitialization)?;
-        Ok(Self { http })
+        Ok(Self {
+            http: Transport::desktop(http),
+        })
+    }
+
+    /// Web-only transport: exact policy, validated connection DNS, no proxy.
+    /// Does not enable a backend or make any request during construction.
+    pub fn for_web(policy: NetworkPolicy) -> Result<Self, MoodleHttpError> {
+        Ok(Self {
+            http: Transport::secured(policy, Source::Moodle, None)
+                .map_err(|_| MoodleHttpError::ClientInitialization)?,
+        })
     }
 
     /// Return the response text without interpreting iCalendar or creating candidates.
     /// Redirects return `HttpStatus` without reading or requesting their Location.
     pub fn fetch_calendar(&self, feed: &MoodleFeed) -> Result<String, MoodleHttpError> {
-        let response = self.http.get(feed.url.clone()).send().map_err(|error| {
-            if error.is_timeout() {
-                MoodleHttpError::Timeout
-            } else {
-                MoodleHttpError::Request
-            }
-        })?;
+        if self.http.is_secured() && !feed.web_syntax_valid {
+            return Err(MoodleHttpError::Request);
+        }
+        let response = self
+            .http
+            .send(self.http.get(feed.url.clone()))
+            .map_err(|error| {
+                if error == NetworkError::Timeout {
+                    MoodleHttpError::Timeout
+                } else {
+                    MoodleHttpError::Request
+                }
+            })?;
         let status = response.status();
         if !status.is_success() {
             return Err(MoodleHttpError::HttpStatus(status));
         }
-        let body = response.bytes().map_err(|error| {
-            if error.is_timeout() {
-                MoodleHttpError::Timeout
-            } else {
-                MoodleHttpError::BodyRead
-            }
-        })?;
-        String::from_utf8(body.to_vec()).map_err(|_| MoodleHttpError::BodyDecode)
+        read_text(response, BodyKind::MoodleIcs).map_err(|error| match error {
+            NetworkError::Timeout => MoodleHttpError::Timeout,
+            NetworkError::Decode => MoodleHttpError::BodyDecode,
+            _ => MoodleHttpError::BodyRead,
+        })
     }
 }
 

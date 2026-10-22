@@ -1,10 +1,13 @@
 import { createListView } from "./list_view.js";
 import { createHttpApi } from "./http_api.js";
+import { createWebSyncView } from "./web_sync.js";
 import { createWebSettingsView } from "./web_settings.js";
 
 export function createWebApp(document_ = document, fetch_ = (...args) => globalThis.fetch(...args)) {
   const get = id => document_.querySelector(`#${id}`);
   let view = null;
+  let syncView = null;
+  let settingsVisible = false;
   let authenticated = false;
   let generation = 0;
   let pending = false;
@@ -13,6 +16,8 @@ export function createWebApp(document_ = document, fetch_ = (...args) => globalT
   function signedOut() {
     ++generation;
     authenticated = false;
+    syncView?.dispose(); syncView = null;
+    get("web-sync-panel").hidden = true;
     get("view-navigation").hidden = true;
     get("settings-view").hidden = true;
     view?.dispose(); view = null;
@@ -27,17 +32,22 @@ export function createWebApp(document_ = document, fetch_ = (...args) => globalT
     get("login-view").hidden = true;
     authenticated = true;
     get("view-navigation").hidden = false;
+    syncView?.dispose();
+    syncView = createWebSyncView(api, () => settingsVisible ? Promise.resolve(true) : view?.load(), document_);
+    get("web-sync-panel").hidden = false;
     await showView(false);
   }
   async function showView(settings) {
     if (!authenticated) return;
     view?.dispose();
+    settingsVisible = settings;
     get("list-view").hidden = settings;
     get("settings-view").hidden = !settings;
     get("show-list").setAttribute("aria-pressed", String(!settings));
     get("show-settings").setAttribute("aria-pressed", String(settings));
     view = settings ? createWebSettingsView(api, document_) : createListView(api, document_);
     await view.load();
+    if (!settings && authenticated) void syncView?.load();
   }
   get("show-list").addEventListener("click", () => showView(false));
   get("show-settings").addEventListener("click", () => showView(true));

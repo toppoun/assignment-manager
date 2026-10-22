@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use reqwest::cookie::CookieStore;
+use reqwest::cookie::{CookieStore, Jar};
 use serde_json::json;
 
 use super::*;
@@ -183,6 +183,10 @@ fn destination_validation_checks_scheme_host_port_and_userinfo() {
         "https://idp.hosei.ac.jp.example.invalid/?token=synthetic-openam-token",
         "//outside.example.invalid/",
         "https://student-test:synthetic-password@idp.hosei.ac.jp/openam/",
+        "https://@idp.hosei.ac.jp/openam/",
+        "https://%69dp.hosei.ac.jp/openam/",
+        "https://IDP.hosei.ac.jp/openam/",
+        " https://idp.hosei.ac.jp/openam/",
         "javascript:location.href='synthetic-private-body'",
         "https://[broken",
     ] {
@@ -333,6 +337,7 @@ struct Exchange {
     response_headers: Vec<(&'static str, String)>,
     body: String,
     response_bytes: Option<Vec<u8>>,
+    allow_body_disconnect: bool,
 }
 
 impl Exchange {
@@ -350,6 +355,7 @@ impl Exchange {
             response_headers: vec![("Content-Type", "text/html".to_owned())],
             body: body.to_owned(),
             response_bytes: None,
+            allow_body_disconnect: false,
         }
     }
     fn redirect(method: &'static str, target: &str, location: &str) -> Self {
@@ -497,7 +503,10 @@ fn script_with_probe(
             }
             headers.push_str("\r\n");
             stream.write_all(headers.as_bytes()).unwrap();
-            stream.write_all(body).unwrap();
+            let write = stream.write_all(body);
+            if !exchange.allow_body_disconnect {
+                write.unwrap();
+            }
         }
         listener
     })
@@ -729,6 +738,85 @@ impl FullFlow {
             finish(server);
         }
         result
+    }
+}
+
+// Reuse the confirmed protocol script through the secured constructor. The
+// loopback origins are cfg(test)-only and cannot be configured in a web binary.
+#[test]
+fn secured_web_full_sso_and_consent_preserve_protocol_and_return_guarded_session() {
+    for consent in [false, true] {
+        let mut flow = FullFlow::new(consent);
+        let mut policy = NetworkPolicy::default();
+        policy.test.origins = vec![
+            flow.endpoints.hoppii.clone(),
+            flow.endpoints.idp.clone(),
+            flow.endpoints.webclass.clone(),
+        ];
+        for exchanges in &mut flow.exchanges {
+            for exchange in exchanges {
+                for (name, value) in &mut exchange.headers {
+                    if *name == "referer" {
+                        let mut url = Url::parse(value).unwrap();
+                        url.set_query(None);
+                        url.set_fragment(None);
+                        *value = url.into();
+                    }
+                }
+            }
+        }
+        flow.run(&HoseiAuthenticator::for_web(policy), true)
+            .unwrap();
+    }
+}
+
+#[test]
+fn secured_auth_body_limits_cover_openam_saml_consent_and_webclass_html() {
+    for (consent, origin_index, exchange_index, step, limit) in [
+        (false, 1, 1, AuthStep::OpenAmInitial, 256 * 1024),
+        (false, 1, 2, AuthStep::OpenAmCredentials, 256 * 1024),
+        (false, 1, 3, AuthStep::OpenAmScripted2, 256 * 1024),
+        (false, 1, 4, AuthStep::Saml, 1024 * 1024),
+        (true, 1, 5, AuthStep::Consent, 1024 * 1024),
+        (false, 0, 6, AuthStep::WebClassSso, 1024 * 1024),
+        (false, 2, 1, AuthStep::WebClassRedirect, 1024 * 1024),
+    ] {
+        let mut flow = FullFlow::new(consent);
+        let mut policy = NetworkPolicy::default();
+        policy.test.origins = vec![
+            flow.endpoints.hoppii.clone(),
+            flow.endpoints.idp.clone(),
+            flow.endpoints.webclass.clone(),
+        ];
+        // Earlier Referers are sanitized exactly as in the secure full-flow test.
+        for exchanges in &mut flow.exchanges {
+            for exchange in exchanges {
+                for (name, value) in &mut exchange.headers {
+                    if *name == "referer" {
+                        let mut url = Url::parse(value).unwrap();
+                        url.set_query(None);
+                        *value = url.into();
+                    }
+                }
+            }
+        }
+        flow.exchanges[origin_index][exchange_index].body = "x".repeat(limit + 1);
+        flow.exchanges[origin_index][exchange_index].allow_body_disconnect = true;
+        let reached = match origin_index {
+            1 => [1, exchange_index + 1, 0],
+            0 => [exchange_index + 1, 5, 0],
+            2 => [7, 5, exchange_index + 1],
+            _ => unreachable!(),
+        };
+        for (exchanges, len) in flow.exchanges.iter_mut().zip(reached) {
+            exchanges.truncate(len);
+        }
+        let error = flow
+            .run(&HoseiAuthenticator::for_web(policy), false)
+            .err()
+            .unwrap();
+        assert_eq!(error, HoseiAuthError::Request(step));
+        assert_safe(error);
     }
 }
 
@@ -1257,6 +1345,13 @@ fn hoppii_final_user_page_is_required_before_csso() {
 
 #[test]
 fn untrusted_destinations_stop_before_any_outbound_request() {
+    untrusted_destinations(false);
+}
+#[test]
+fn secured_untrusted_saml_consent_and_redirect_destinations_stop_before_send() {
+    untrusted_destinations(true);
+}
+fn untrusted_destinations(secured: bool) {
     let trap = TcpListener::bind("127.0.0.1:0").unwrap();
     trap.set_nonblocking(true).unwrap();
     let malicious = format!(
@@ -1363,8 +1458,30 @@ fn untrusted_destinations_stop_before_any_outbound_request() {
             }
             _ => unreachable!(),
         }
+        let authenticator = if secured {
+            let mut policy = NetworkPolicy::default();
+            policy.test.origins = vec![
+                flow.endpoints.hoppii.clone(),
+                flow.endpoints.idp.clone(),
+                flow.endpoints.webclass.clone(),
+            ];
+            for exchanges in &mut flow.exchanges {
+                for exchange in exchanges {
+                    for (name, value) in &mut exchange.headers {
+                        if *name == "referer" {
+                            let mut url = Url::parse(value).unwrap();
+                            url.set_query(None);
+                            *value = url.into();
+                        }
+                    }
+                }
+            }
+            HoseiAuthenticator::for_web(policy)
+        } else {
+            HoseiAuthenticator::new()
+        };
         let error = flow
-            .run(&HoseiAuthenticator::new(), false)
+            .run(&authenticator, false)
             .err()
             .expect("destination must be blocked");
         let expected_error = if expected == AuthStep::WebClassRedirect {
@@ -1440,7 +1557,11 @@ fn request_failure_redacts_the_raw_url_and_transport_cause() {
     drop(listener);
     let endpoints = AuthEndpoints::production();
     let session = AuthSession::new(&endpoints).unwrap();
-    let error = send(session.http.get(url), AuthStep::OpenAmCredentials)
+    let error = session
+        .send(
+            session.http.get(Url::parse(&url).unwrap()),
+            AuthStep::OpenAmCredentials,
+        )
         .err()
         .unwrap();
     assert_eq!(error, HoseiAuthError::Request(AuthStep::OpenAmCredentials));
@@ -1596,7 +1717,7 @@ fn finite_timeout_covers_headers_and_response_body_without_exposing_secrets() {
         };
         let session = AuthSession::new(&endpoints).unwrap();
         let step = AuthStep::OpenAmCredentials;
-        let result = send(
+        let result = session.send(
             session
                 .http
                 .get(endpoint(&origin, "/?secret=synthetic-password")),
@@ -1938,6 +2059,7 @@ mod reauth_sync_tests {
             .collect();
         (
             HoseiAuthenticator {
+                policy: None,
                 test_endpoints: Some(flow.endpoints),
             },
             servers,

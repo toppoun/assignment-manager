@@ -1,10 +1,10 @@
-# Web-3B: encrypted Web vault + authenticated Settings
+# Web-4A: asynchronous Sync API + offline mock integration
 
 合成データ専用・Web専用password認証のPoCです。
 **127.0.0.1:3000だけにbindします。外部公開、LAN、reverse proxy、tunnel運用は禁止です。**
 本番HTTPS、reverse proxy trust、deployment secret管理は未実装です。
 Cookie policyはHTTP loopback専用で、production/public flagやbind/DB pathの選択機能はありません。
-Ready for Web-4は次Phaseへの着手判定であり、公開運用の許可ではありません。
+本Phaseはmock統合までです。公開運用・実大学接続を許可する判定ではありません。
 
 ## Bootstrap / start
 
@@ -53,7 +53,7 @@ LocalAddressが127.0.0.1だけであることを確認してください。
 認証後のUserIdがimmutable TenantRuntime.ownerと一致してから、1つのApplicationHandleへ
 query/setを送ります。request単位で3 workerを作らず、DB pathをrequestから選びません。
 WebVaultがshared CredentialStoreを実装し、MemorySettings（startup sync OFF）とDisabledNetworkBackendを維持します。
-大学HTTP clientは構築せず、大学ログイン/fetch、startup sync、sync endpointはありません。
+大学HTTP clientは構築せず、大学ログイン/fetchとstartup syncは行いません。手動Sync APIはDisabledNetworkBackendを使います。
 
 ## Authentication / session API
 
@@ -91,10 +91,10 @@ limit timestampも再起動で消しません。password reset/changeは今回�
 
 ## CSRF / request boundaries
 
-login・logout・reauth・Settings PUT/DELETE・completion PUTには実Hostと完全一致するOrigin、X-Assignment-Manager: web-3a、
+login・logout・reauth・Sync POST・Settings PUT/DELETE・completion PUTには実Hostと完全一致するOrigin、X-Assignment-Manager: web-3a、
 application/json (任意のcharset=utf-8だけを許可)が必要です。
 Fetch MetadataがあればSite=same-origin、Mode=same-origin/corsだけです。
-logout・reauth・Settings PUT/DELETE・completion PUTにはさらにsessionに束縛したX-CSRF-Token (constant-time比較)が必要です。
+logout・reauth・Sync POST・Settings PUT/DELETE・completion PUTにはさらにsessionに束縛したX-CSRF-Token (constant-time比較)が必要です。
 loginはOrigin/JSON/custom header/Metadataでlogin CSRFを防御します。
 CLIはMetadata省略可能ですが、Origin/custom header/JSON/認証・CSRFは必須です。
 GET APIはsame-origin、または直接navigationのnoneを許可し、same-site/cross-site/不明値を拒否。
@@ -132,9 +132,9 @@ CookieはJSへ返さず、CSRFだけmemory保持。logout/401/一般403でrows/C
 passwordのbrowser storageはありません。titleはtextContentで描画します。
 
 compile-time allowlistは/、styles.css、web_app.js、web_auth.js、http_api.js、list_view.js、
-list_tasks.js、presentation.js、web_settings.js、settings.jsだけ。faviconは204。filesystem serving/desktop module配信はありません。
+list_tasks.js、presentation.js、web_settings.js、settings.js、web_sync.js、sync.jsだけ。faviconは204。filesystem serving/desktop transport・viewの配信はありません。sync.jsの共通presentation関数だけを再利用します。
 asset変更後はrebuildが必要。startupはowner設定検証→実query/readiness→bind。
-shutdownはadmission停止→HTTP drain→application shutdown→control DB/lock close。
+shutdownはHTTP/job admission停止→HTTP drain→job/Settings mutation drain→application shutdown→control DB/lock close。
 
 ## Verification
 
@@ -177,4 +177,72 @@ normal serverと同時起動せず、同じ127.0.0.1:3000で合成値だけを�
 
 Linux/VPS provider、鍵rotation/re-encryption CLI、鍵のbackup/restore、ACLの運用設計は未実装です。
 鍵とciphertextを同じbackupへ入れないでください。path移動ではOS entryのinstallation identityが変わるため、
-現状のままdirectoryを移動するrestore手順は提供していません。Web-4開始前にもegress/SSRF制御が必要です。
+現状のままdirectoryを移動するrestore手順は提供していません。実大学通信の前にはegress/SSRF制御が必要です。
+
+
+## Asynchronous manual sync (Web-4A)
+
+| Method / path | Contract |
+| --- | --- |
+| POST /api/v1/sync | JSON `{}`、Idempotency-Key必須、202 `{runId,state,statusUrl}` |
+| GET /api/v1/sync/status | `{running,activeRunId,lastRun}`、同期を開始しない |
+| GET /api/v1/sync/runs/{runId} | running / finished + report / failed + safe error、未知runは404 |
+
+すべてsessionとTenantRuntime ownerを検証します。POSTにはCSRFと既存Origin/Host/Metadata/JSON/custom headerを要求。
+通常同期にrecent reauthは不要です。source resultはnot_configured / success(counts) / failed(error code)。
+`finished`は全source成功の意味ではなく、`shouldReload`は部分失敗・全失敗でもtrueになり得ます。
+worker/report喪失はstate=failed、job_failed、shouldReload=trueです。防御的なalready_runningはshared should_reload()を維持してfalseです。
+
+WebSyncCoordinatorはowner単位の短いmemory admission lockで、同期jobとcredential save/deleteを排他にします。
+同期中の設定変更は409 sync_running、設定mutation中の新規同期は503 busy。Settingsの受付済み操作もserver taskがreplyまで保持します。
+同userのactive jobは1件。別keyの重複要求も同じactive runへ対応し、queueを作りません。
+新規runは5件/60秒。Idempotency-KeyはASCII英数字と `._-` の1–128文字、ownerごとのSHA-256だけmemoryに保存。
+最大128key・128履歴、keyは受付から1時間（実行中は保留）、結果は完了から1時間まで。live keyを容量のために追い出さず429で拒否。
+同key再送は元のrunを返し、完了済みの再送では202のstateもfinished/failedになります。各POST bodyは常に同じ空objectです。
+単一processの保証です。restart・期限後のdedup保証はなく、過去runは404、lastRun=null。partial SQLite commitは保持します。
+
+通常binaryはfeatureの有無に関係なくDisabledNetworkBackendです。実大学への切替flag/envはありません。
+`synthetic-sync` featureの専用test/exampleだけがMockSyncBackendを明示注入します。
+mockは公開synthetic定数以外を拒否し、coreのvalidated batch/import/updateを使います。HTTP client/authenticatorは構築しません。
+
+```powershell
+cargo test --manifest-path crates/web-server/Cargo.toml --locked --offline --all-features
+cargo run --manifest-path crates/web-server/Cargo.toml --features synthetic-sync --example sync_browser_smoke -- bootstrap
+cargo run --manifest-path crates/web-server/Cargo.toml --features synthetic-sync --example sync_browser_smoke -- init-vault-key
+cargo run --manifest-path crates/web-server/Cargo.toml --features synthetic-sync --example sync_browser_smoke -- serve both-success
+```
+
+Windows専用の固定 `target/web-4a-browser-smoke` とその保護鍵だけを使います。通常DB/Vaultを削除・初期化しません。
+scenarioはboth-success / moodle-failure / webclass-partial / both-failure / auth-expired / paced。
+pacedは各sourceを10秒待機させるmanual専用modeで、実行中表示・Settings409・複数tabを再現します。自動race testsはchannelを使います。変更には停止後に別scenarioで再起動します。
+Web loginはsynthetic-smoke、passwordはbootstrapで入力した値。
+設定にはMoodle `https://example.invalid/synthetic-calendar`、大学ID `synthetic-student`、password `synthetic-university-password`だけを使ってください。
+これらは公開されたmock専用値で、大学への認証能力を持ちません。
+
+portableなUI確認だけなら、専用exampleの `ephemeral webclass-partial` を使用できます。
+新しい一時DBとmemory鍵を毎回生成し、Web loginはsynthetic-smoke / synthetic-web-only-password-4aです。
+終了時に一時環境を破棄し、再起動でcredentialは引き継ぎません。通常serverへのfallbackや永続Vaultの検証には使いません。
+
+Browserは1.5秒間隔・最大120回だけrunning runをpollします。10秒HTTP timeoutとserver完了を区別し、結果不明なら状態再確認を案内。
+通信断で自動的に別runを始めず、lost POSTは利用者が同期ボタンを押したときだけ同keyで再確認します。
+Settings遷移でも監視を維持し、logout/新session/disposeで古い結果とtimerを破棄します。
+完了後は現在のfilter/sortを維持して一覧を再取得し、completion pendingと同じlist queueで調停します。
+
+今回の検証結果、Windows未実施項目と公開前の未実装境界は[Phase Web-4A](../../docs/PHASE-WEB-4A.md)を参照してください。
+
+
+## Secure university transport preparation (Web-4B1)
+
+Mac上でcore HTTP層へ明示Web constructor、exact origin/path policy、DNS-to-connect制御、
+proxy/redirect/retry制限、bounded body読取を追加しました。通常binaryは引き続き
+DisabledNetworkBackendで、all-featuresでも実大学通信へ切り替わりません。
+既存synthetic-syncのMockSyncBackend / WebSyncCoordinatorは維持します。
+
+Moodle実hostname/pathは未確定のため未設定で拒否します。WebClassの3 originsは既存codeで
+確認した値で、現在の大学稼働確認ではありません。policyのenv/CLI設定やhidden switchはありません。
+SettingsがURLの保存を受理しても、それは通信先の承認ではありません。
+
+[Phase Web-4B1](../../docs/PHASE-WEB-4B1.md)、
+[大学HTTP security設計](../../docs/WEB-NETWORK-SECURITY.md)を参照してください。
+Web-4B1はMac/offline transport gateでReady for Web-4B2ですが、Web-4B2はまだ実装していません。
+Web-4AのWindows build / Browser smokeは引き続き未完了で、Web-4A最終判定はBLOCKEDです。

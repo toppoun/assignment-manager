@@ -30,6 +30,7 @@ pub enum WebError {
     VaultUnavailable,
     ReauthRequired,
     ReauthFailed,
+    SyncRunning,
 }
 
 impl WebError {
@@ -55,6 +56,7 @@ impl WebError {
             Self::VaultUnavailable => "vault_unavailable",
             Self::ReauthRequired => "reauth_required",
             Self::ReauthFailed => "reauth_failed",
+            Self::SyncRunning => "sync_running",
         }
     }
 
@@ -66,6 +68,7 @@ impl WebError {
             }
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::SetupRequired | Self::AccountExists => StatusCode::CONFLICT,
+            Self::SyncRunning => StatusCode::CONFLICT,
             Self::InvalidQuery | Self::InvalidRequest | Self::InvalidHost => {
                 StatusCode::BAD_REQUEST
             }

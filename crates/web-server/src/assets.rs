@@ -30,6 +30,14 @@ pub(crate) async fn serve(uri: Uri) -> Response {
             "text/javascript; charset=utf-8",
             include_bytes!("../../../frontend/web_settings.js"),
         ),
+        "/web_sync.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../../frontend/web_sync.js"),
+        ),
+        "/sync.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../../frontend/sync.js"),
+        ),
         "/settings.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("../../../frontend/settings.js"),

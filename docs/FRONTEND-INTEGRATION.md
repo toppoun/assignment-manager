@@ -1,4 +1,4 @@
-# Vanilla frontend integration (Web-3B)
+# Vanilla frontend integration (Web-4A)
 
 ## Entrypoints and transport
 
@@ -11,7 +11,7 @@ Both call `createListView(api)` in list_view.js. There is no runtime transport
 detection or HTTP fallback. Only tauri_api.js references window.__TAURI__.
 settings_view.js and desktop sync continue using the same invoke function.
 The Web module graph imports the shared settings.js presentation/clearing helpers,
-but never desktop settings_view.js, sync.js or tauri_api.js. Those desktop modules
+and the shared presentation functions from sync.js, but never desktop settings_view.js, sync_view.js or tauri_api.js. Those desktop modules
 remain absent from the HTTP asset allowlist. No framework, npm dependency, bundler,
 CDN, service worker or browser storage was added.
 
@@ -58,7 +58,7 @@ All checkboxes are temporarily blocked (a conservative choice for this small PoC
 
 The desktop adapter preserves its existing toggle command and definite command
 error behavior. It has no HTTP retry capability. Source sync refreshes still queue
-behind active local operations. Sync exists only in the desktop entrypoint. Web Settings has its own HTTP lifecycle.
+behind active local operations. Desktop sync retains its invoke lifecycle. Web sync uses its own HTTP job controller.
 
 Multiple tabs can set the same state idempotently; opposing writes follow DB commit
 order. Tabs do not auto-refresh each other and there is no conflict-version API.
@@ -66,7 +66,7 @@ Use reload to observe changes made in another tab. No optimistic state is persis
 
 ## Serving and validation
 
-crates/web-server/src/assets.rs embeds only the Web entry HTML and nine required
+crates/web-server/src/assets.rs embeds only the Web entry HTML and required
 CSS/JS assets. favicon.ico is an empty 204. There is no filesystem route or directory
 traversal resolution. Assets must be rebuilt into the server after editing.
 The server applies the localhost boundary to static and API requests alike.
@@ -134,3 +134,37 @@ Generation and active-view checks suppress stale status/write/reauth results aft
 disposal, including automatic follow-up GETs and old finally blocks clearing a new
 view's inputs. Pending operations reject duplicate submission. The server remains
 the authority for proof expiry even when a view still shows the previous proof label.
+
+
+## Web sync lifecycle (Web-4A)
+
+`web_sync.js` owns server-job observation for one authenticated lifetime. It uses
+`sourceResultPresentation` / `syncButtonState` from sync.js, without importing
+sync_view.js or any desktop Settings/invoke module. Its panel survives Settings
+navigation; changing credential settings still requires server reauth and receives
+a safe Japanese rejection for 409 sync_running. A recreated list view restores its
+native select options before reading the initial query; the DOM test models native
+select value rejection when an option is missing.
+
+POST sends JSON `{}`, CSRF, custom header and a crypto.randomUUID Idempotency-Key.
+The HTTP adapter requires 202 and validates a fixed relative status URL plus a
+64-hex run ID. Source codes/counts and terminal shouldReload are validated. A
+finished job may contain two failed sources. Worker loss is a distinct failed job.
+
+Only running jobs poll, at 1.5-second intervals and at most 120 requests per
+observation attempt. Every HTTP request has the existing 10-second timeout. A
+poll error/timeout retains uncertainty and does not fabricate a source failure.
+Explicit state refresh resumes the known run; it does not create jobs. An
+ambiguous POST retains its key; only an explicit sync-button action retries it.
+Navigation/refresh never resends POST. The server's one-hour memory dedup boundary
+still applies, and restart can remove both run history and dedup records.
+
+Source results remain visible as the previous result while the next job runs.
+On terminal shouldReload, the current view loads with its current controls through
+the existing list queue. Completion and sync commit independently under core
+SQLite transactions; a queued refresh waits for pending completion reconciliation.
+Settings navigation skips rendering a hidden/disposed list; returning creates a
+fresh list query. Logout/401/403/session replacement disposes the sync controller,
+clears its panel, cancels its local wait timer and ignores in-flight results and
+follow-up reads. This never cancels the server job. No browser storage, Service
+Worker, cross-tab messaging or desktop sync behavior was added.

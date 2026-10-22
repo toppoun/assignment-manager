@@ -1,6 +1,7 @@
 import { configuredPresentation, clearSecretInputs } from "./settings.js";
 
 const errorMessage = error => ({
+  sync_running: "同期中は認証情報を変更できません。同期終了後に再試行してください。",
   reauth_required: "変更前にWeb専用passwordで再認証してください。",
   reauth_failed: "Web専用passwordを確認してください。",
   rate_limited: "認証試行が多すぎます。60秒待ってください。",

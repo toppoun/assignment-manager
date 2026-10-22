@@ -733,3 +733,13 @@ root core、Windows Tauri、macOS SwiftUI、UniFFI、Keychainを維持し、Web�
 最も重要な公開前条件は、Webログインとowner検証、user-bound暗号化vault、SSRFを含むserver egress制御、永続volumeとrestore、hostingでの大学SSO適合性の確認である。大学credentialを第三者serverへ預ける責任を明示し、単一ユーザーを理由にこれらを省略しない。
 
 **Ready for Web-1** — 指定baseの実ソースで、shared handleからsafe read modelを取得する経路、synthetic transport seam、SQLite v3、clock projectionが確認できた。必要なのは独立Web adapterと小さなclock注入口であり、全体再設計を先行させるblockerはない。判定対象は「大学通信なし・synthetic DB・loopback限定」のPoC開始であり、インターネット公開準備完了ではない。
+
+
+## Web-4B1 implementation addendum (2026-10-22)
+
+上記Web-0は当時の調査記録。Web-4B1で[大学HTTP transport policy](WEB-NETWORK-SECURITY.md)と
+明示Web constructor、DNS-to-connect検証、bounded body読取を追加した。
+[Web-4B1報告](PHASE-WEB-4B1.md)のMac/offline gateはReady for Web-4B2。
+Moodle実host/pathは未設定でfail closed、通常Web serverはDisabledNetworkBackendのまま。
+実大学接続・Web-4B2実装・公開運用へは進んでいない。
+Web-4AのWindows build/smokeは未完了で、同phase最終判定はBLOCKEDを維持する。

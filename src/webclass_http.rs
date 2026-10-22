@@ -3,11 +3,14 @@
 use std::error::Error;
 use std::fmt;
 
+#[cfg(test)]
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, REFERER, USER_AGENT};
 use reqwest::{StatusCode, Url};
 
-const ORIGIN: &str = "https://lms2025.hosei.ac.jp";
+use crate::university_network::{
+    BodyKind, NetworkError, Transport, WEBCLASS_ORIGIN as ORIGIN, read_text,
+};
 const COURSES_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/courses";
 const CONTENTS_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
 const DASHBOARD_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/dashboard";
@@ -45,22 +48,22 @@ impl Error for WebClassHttpError {}
 
 /// Uses an existing authenticated HTTP client without logging in or inspecting cookies.
 pub struct WebClassClient {
-    http: Client,
+    http: Transport,
     base_url: Url,
 }
 
 impl WebClassClient {
-    /// Accept the authenticated client supplied by the authentication module.
-    ///
-    /// The caller must build it with `reqwest::redirect::Policy::none()`,
-    /// `reqwest::retry::never()`, and a finite timeout (for example, 15 seconds).
-    /// reqwest cannot inspect or change these policies on an already built client.
-    /// This constructor trusts that crate-internal contract; it creates no HTTP client.
-    pub(crate) fn from_http(http: Client) -> Self {
+    /// The authentication module transfers the same guarded transport and jar.
+    pub(crate) fn from_transport(http: Transport) -> Self {
         Self {
             http,
-            base_url: Url::parse(ORIGIN).expect("the fixed WebClass origin is a valid URL"),
+            base_url: Url::parse(ORIGIN).expect("fixed WebClass origin"),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_http(http: Client) -> Self {
+        Self::from_transport(Transport::desktop(http))
     }
 
     /// Internal offline test seam; production callers always use the fixed origin.
@@ -93,13 +96,15 @@ impl WebClassClient {
     fn fetch_json(&self, url: Url) -> Result<String, WebClassHttpError> {
         let response = self
             .http
-            .get(url)
-            .header(ACCEPT, "application/json")
-            .header(REFERER, self.endpoint(DASHBOARD_PATH).as_str())
-            .header(USER_AGENT, APPLICATION_USER_AGENT)
-            .send()
+            .send(
+                self.http
+                    .get(url)
+                    .header(ACCEPT, "application/json")
+                    .header(REFERER, self.endpoint(DASHBOARD_PATH).as_str())
+                    .header(USER_AGENT, APPLICATION_USER_AGENT),
+            )
             .map_err(|error| {
-                if error.is_timeout() {
+                if error == NetworkError::Timeout {
                     WebClassHttpError::Timeout
                 } else {
                     WebClassHttpError::Request
@@ -139,14 +144,16 @@ impl WebClassClient {
             return Err(WebClassHttpError::UnexpectedResponse);
         }
 
-        let body = response.bytes().map_err(|error| {
-            if error.is_timeout() {
-                WebClassHttpError::Timeout
-            } else {
-                WebClassHttpError::BodyRead
-            }
+        let kind = if is_html {
+            BodyKind::AuthHtml
+        } else {
+            BodyKind::WebClassJson
+        };
+        let text = read_text(response, kind).map_err(|error| match error {
+            NetworkError::Timeout => WebClassHttpError::Timeout,
+            NetworkError::Decode => WebClassHttpError::BodyDecode,
+            _ => WebClassHttpError::BodyRead,
         })?;
-        let text = String::from_utf8(body.to_vec()).map_err(|_| WebClassHttpError::BodyDecode)?;
 
         if is_json {
             Ok(text)

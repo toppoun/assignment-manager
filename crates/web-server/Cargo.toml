@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Offline test/example runtime only. The normal executable never selects it.
+synthetic-sync = []
+
+[[example]]
+name = "sync_browser_smoke"
+required-features = ["synthetic-sync"]
+
 [dependencies]
 assignment-manager = { path = "../.." }
 assignment-manager-application = { path = "../application" }

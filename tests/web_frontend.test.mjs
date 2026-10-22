@@ -5,7 +5,15 @@ import { readFileSync } from "node:fs";
 import { createHttpApi, serializeQuery } from "../frontend/http_api.js";
 import { createTauriApi } from "../frontend/tauri_api.js";
 import { createAssignmentListModel } from "../frontend/list_tasks.js";
-import { createWebApp } from "../frontend/web_auth.js";
+import { createWebApp as createActualWebApp } from "../frontend/web_auth.js";
+// Auth/list regression fixtures keep their counters scoped to assignment I/O.
+function createWebApp(doc, fetch_) {
+  return createActualWebApp(doc, (url, options) => {
+    if (url === "/api/v1/sync/status") return Promise.resolve(response({ running: false, activeRunId: null, lastRun: null }));
+    if (url === "/api/v1/settings/status") return Promise.resolve(response({ moodleConfigured: false, webclassConfigured: false }));
+    return fetch_(url, options);
+  });
+}
 import { createListView } from "../frontend/list_view.js";
 import { DEFAULT_CONTROLS, buildQueryRequest } from "../frontend/presentation.js";
 
@@ -456,4 +464,18 @@ test("a GET body still being decoded at logout cannot be accepted into the new s
   await api.session();
   body.resolve(list());
   await assert.rejects(old, { code: "authentication_failed", outcome: "rejected" });
+});
+
+test("recreating a disposed list view restores native select options before its first query", async () => {
+  const { doc, ids } = documentFixture();
+  const select = ids["course-filter"]; let selected = "all";
+  Object.defineProperty(select, "value", {
+    get: () => selected,
+    set: value => { selected = select.children.some(option => option.value === value) ? value : ""; },
+  });
+  const queries = []; const api = { listAssignments: async query => { queries.push(query); return list(); } };
+  const initial = createListView(api, doc); await initial.load(); initial.dispose();
+  const next = createListView(api, doc); await next.load();
+  assert.equal(queries.length, 2); assert.deepEqual(queries.at(-1).course, { kind: "all" });
+  next.dispose();
 });

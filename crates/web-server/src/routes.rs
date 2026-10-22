@@ -32,6 +32,12 @@ pub fn router(state: PocState, port: u16) -> Router {
             "/api/v1/auth/reauth",
             post(reauth).layer(DefaultBodyLimit::max(1024)),
         )
+        .route(
+            "/api/v1/sync",
+            post(start_sync).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/api/v1/sync/status", get(sync_status))
+        .route("/api/v1/sync/runs/{runId}", get(sync_run))
         .route("/api/v1/settings/status", get(settings_status))
         .route(
             "/api/v1/settings/moodle",
@@ -303,7 +309,7 @@ fn check(request: &Request, port: u16, accepting: bool) -> Result<(), WebError> 
     let mutation = (request.method() == Method::POST
         && matches!(
             request.uri().path(),
-            "/api/v1/auth/login" | "/api/v1/auth/logout" | "/api/v1/auth/reauth"
+            "/api/v1/auth/login" | "/api/v1/auth/logout" | "/api/v1/auth/reauth" | "/api/v1/sync"
         ))
         || (request.method() == Method::PUT
             && request.uri().path().starts_with("/api/v1/assignments/")
@@ -412,6 +418,8 @@ async fn boundary(
             let protected = path == "/api/v1/session"
                 || path == "/api/v1/auth/logout"
                 || path == "/api/v1/auth/reauth"
+                || path == "/api/v1/sync"
+                || path.starts_with("/api/v1/sync/")
                 || path.starts_with("/api/v1/settings/")
                 || path == "/api/v1/assignments"
                 || (path.starts_with("/api/v1/assignments/") && path.ends_with("/completion"));
@@ -480,4 +488,44 @@ fn finish(mut response: Response) -> Response {
         header::HeaderValue::from_static("same-origin"),
     );
     response
+}
+
+async fn start_sync(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    headers: header::HeaderMap,
+    body: Result<Json<EmptyBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<crate::web_sync::AcceptedDto>), WebError> {
+    let _ = body.map_err(json_error)?;
+    let values: Vec<_> = headers.get_all("idempotency-key").iter().collect();
+    if values.len() != 1 {
+        return Err(WebError::InvalidRequest);
+    }
+    let key = values[0].to_str().map_err(|_| WebError::InvalidRequest)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(state.sync().start(&session.user_id, key)?),
+    ))
+}
+async fn sync_status(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    request: Request,
+) -> Result<Json<crate::web_sync::StatusDto>, WebError> {
+    if request.uri().query().is_some() {
+        return Err(WebError::InvalidQuery);
+    }
+    Ok(Json(state.sync().status(&session.user_id)?))
+}
+async fn sync_run(
+    State(state): State<PocState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    path: Result<Path<String>, PathRejection>,
+    request: Request,
+) -> Result<Json<crate::web_sync::RunDto>, WebError> {
+    if request.uri().query().is_some() {
+        return Err(WebError::InvalidQuery);
+    }
+    let Path(id) = path.map_err(|_| WebError::NotFound)?;
+    Ok(Json(state.sync().run(&session.user_id, &id)?))
 }

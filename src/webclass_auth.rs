@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::blocking::{Client, RequestBuilder, Response};
-use reqwest::cookie::Jar;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, ORIGIN, REFERER};
 use reqwest::{StatusCode, Url};
 use scraper::{Html, Selector};
@@ -15,9 +14,11 @@ use serde_json::Value;
 
 use crate::webclass_http::{WebClassClient, WebClassHttpError};
 
-const HOPPII_ORIGIN: &str = "https://hoppii2025.hosei.ac.jp";
-const IDP_ORIGIN: &str = "https://idp.hosei.ac.jp";
-const WEBCLASS_ORIGIN: &str = "https://lms2025.hosei.ac.jp";
+use crate::university_network::{
+    BodyKind, HOPPII_ORIGIN, IDP_ORIGIN, NetworkError, NetworkPolicy, SessionCookies, Source,
+    Transport, WEBCLASS_ORIGIN, read_text,
+};
+
 const USER_PAGE: &str = "/portal/u001/index.php";
 const PORTAL_PUBLIC: &str = "/portal/index.php?next=";
 const PORTAL_LOGIN: &str = "/portal/login/login.php?next=";
@@ -150,14 +151,11 @@ impl fmt::Display for HoseiAuthError {
 
 impl Error for HoseiAuthError {}
 
-/// Stateless authenticator. Every login creates a new client and an in-memory cookie jar.
-#[cfg(not(test))]
-pub struct HoseiAuthenticator;
-
-// Private per-instance endpoint selection lets application tests call the public
-// login API through the existing localhost protocol mocks. Absent in production.
-#[cfg(test)]
+/// Each login creates a fresh transport and memory cookie jar. Web construction
+/// retains its immutable policy across first login and the core's reauth once.
 pub struct HoseiAuthenticator {
+    policy: Option<NetworkPolicy>,
+    #[cfg(test)]
     test_endpoints: Option<AuthEndpoints>,
 }
 
@@ -169,15 +167,19 @@ impl Default for HoseiAuthenticator {
 
 impl HoseiAuthenticator {
     pub fn new() -> Self {
-        #[cfg(not(test))]
-        {
-            Self
+        Self {
+            policy: None,
+            #[cfg(test)]
+            test_endpoints: None,
         }
-        #[cfg(test)]
-        {
-            Self {
-                test_endpoints: None,
-            }
+    }
+
+    /// Construct an explicitly secured Web authenticator; performs no request.
+    pub fn for_web(policy: NetworkPolicy) -> Self {
+        Self {
+            policy: Some(policy),
+            #[cfg(test)]
+            test_endpoints: None,
         }
     }
 
@@ -199,7 +201,7 @@ impl HoseiAuthenticator {
         credentials: HoseiCredentials<'_>,
         endpoints: &AuthEndpoints,
     ) -> Result<WebClassClient, HoseiAuthError> {
-        let session = AuthSession::new(endpoints)?;
+        let session = AuthSession::with_policy(endpoints, self.policy.clone())?;
         let auth_url = session.discover_openam()?;
         let success = session.authenticate(&auth_url, credentials)?;
         let success_url = resolve_destination(
@@ -214,7 +216,7 @@ impl HoseiAuthenticator {
         session.establish_hoppii_session()?;
         session.webclass_sso()?;
 
-        let client = WebClassClient::from_http(session.http.clone());
+        let client = WebClassClient::from_transport(session.http.clone());
         #[cfg(test)]
         let client = {
             let mut client = client;
@@ -255,26 +257,44 @@ impl AuthEndpoints {
 }
 
 struct AuthSession<'a> {
-    http: Client,
-    jar: Arc<Jar>,
+    http: Transport,
+    jar: Arc<SessionCookies>,
     endpoints: &'a AuthEndpoints,
 }
 
 impl<'a> AuthSession<'a> {
+    #[cfg(test)]
     fn new(endpoints: &'a AuthEndpoints) -> Result<Self, HoseiAuthError> {
-        let jar = Arc::new(Jar::default());
-        let builder = Client::builder()
-            .cookie_provider(Arc::clone(&jar))
-            .timeout(endpoints.timeout)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .referer(false);
-        #[cfg(test)]
-        let builder = builder.no_proxy();
-        let http = builder
-            .build()
-            .map_err(|_| HoseiAuthError::ClientInitialization)?;
+        Self::with_policy(endpoints, None)
+    }
+    fn with_policy(
+        endpoints: &'a AuthEndpoints,
+        policy: Option<NetworkPolicy>,
+    ) -> Result<Self, HoseiAuthError> {
+        let jar = Arc::new(SessionCookies::new(policy.is_some()));
+        let http = if let Some(policy) = policy {
+            Transport::secured(policy, Source::WebClass, Some(Arc::clone(&jar)))
+                .map_err(|_| HoseiAuthError::ClientInitialization)?
+        } else {
+            let builder = Client::builder()
+                .cookie_provider(Arc::clone(&jar))
+                .timeout(endpoints.timeout)
+                .user_agent(USER_AGENT)
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .referer(false)
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd();
+            #[cfg(test)]
+            let builder = builder.no_proxy();
+            Transport::desktop(
+                builder
+                    .build()
+                    .map_err(|_| HoseiAuthError::ClientInitialization)?,
+            )
+        };
         Ok(Self {
             http,
             jar,
@@ -282,13 +302,19 @@ impl<'a> AuthSession<'a> {
         })
     }
 
+    fn send(&self, request: RequestBuilder, step: AuthStep) -> Result<Response, HoseiAuthError> {
+        self.http
+            .send(request)
+            .map_err(|error| transport_error(error, step))
+    }
+
     fn discover_openam(&self) -> Result<Url, HoseiAuthError> {
-        let response = send(
+        let response = self.send(
             self.http.get(endpoint(&self.endpoints.hoppii, USER_PAGE)),
             AuthStep::HoppiiToIdp,
         )?;
         let idp_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::HoppiiToIdp)?;
-        let response = send(self.http.get(idp_url), AuthStep::IdpToOpenAm)?;
+        let response = self.send(self.http.get(idp_url), AuthStep::IdpToOpenAm)?;
         let xui_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::IdpToOpenAm)?;
         parse_xui_auth_url(&xui_url, &self.endpoints.idp)
     }
@@ -311,14 +337,14 @@ impl<'a> AuthSession<'a> {
         credentials: HoseiCredentials<'_>,
     ) -> Result<OpenAmSuccess, HoseiAuthError> {
         let initial = read_ok(
-            send(self.openam_post(auth_url), AuthStep::OpenAmInitial)?,
+            self.send(self.openam_post(auth_url), AuthStep::OpenAmInitial)?,
             AuthStep::OpenAmInitial,
         )?;
         let state = parse_openam_state(&initial)
             .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::OpenAmInitial))?;
         drop(initial);
         let raw = credential_payload(state, credentials)?;
-        let response = send(
+        let response = self.send(
             self.openam_post(auth_url).json(&raw),
             AuthStep::OpenAmCredentials,
         );
@@ -332,7 +358,7 @@ impl<'a> AuthSession<'a> {
             .validate_scripted2()
             .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::OpenAmScripted2))?;
         let raw = state.into_raw();
-        let response = send(
+        let response = self.send(
             self.openam_post(auth_url).json(&raw),
             AuthStep::OpenAmScripted2,
         );
@@ -365,7 +391,7 @@ impl<'a> AuthSession<'a> {
     }
 
     fn saml_to_hoppii(&self, success_url: Url) -> Result<(), HoseiAuthError> {
-        let response = send(self.http.get(success_url), AuthStep::Saml)?;
+        let response = self.send(self.http.get(success_url), AuthStep::Saml)?;
         let response = if is_redirect(response.status()) {
             let consent_url =
                 redirect_destination(&response, &self.endpoints.idp, AuthStep::Consent)?;
@@ -384,7 +410,7 @@ impl<'a> AuthSession<'a> {
             .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::Saml))?;
         let action =
             resolve_destination(&base, form.action(), &self.endpoints.hoppii, AuthStep::Saml)?;
-        let response = send(
+        let response = self.send(
             self.http.post(action).form(&form_pairs(&form)),
             AuthStep::HoppiiAcs,
         )?;
@@ -425,7 +451,7 @@ impl<'a> AuthSession<'a> {
         api.query_pairs_mut()
             .append_pair("_action", "getAttributes");
         let text = read_ok(
-            send(
+            self.send(
                 self.http
                     .post(api.clone())
                     .header("Accept-API-Version", "protocol=1.0,resource=1.0")
@@ -450,13 +476,13 @@ impl<'a> AuthSession<'a> {
         }
         api.set_query(None);
         api.query_pairs_mut().append_pair("_action", "agree");
-        let response = send(self.http.post(api)
+        let response = self.send(self.http.post(api)
             .header("Accept-API-Version", "protocol=1.0,resource=1.0")
             .json(&serde_json::json!({"type": "ASK_IF_CHANGE", "attributes": names, "history": null})), step)?;
         if !response.status().is_success() {
             return Err(HoseiAuthError::HttpStatus(step, response.status()));
         }
-        send(self.http.get(return_url), AuthStep::Saml)
+        self.send(self.http.get(return_url), AuthStep::Saml)
     }
 
     /// Only bounded same-origin GETs; never replay a SAML POST on a redirect.
@@ -483,7 +509,7 @@ impl<'a> AuthSession<'a> {
             } else {
                 request
             };
-            response = send(request, redirect_step)?;
+            response = self.send(request, redirect_step)?;
             response_step = redirect_step;
         }
         unreachable!("bounded loop returns at the limit")
@@ -492,7 +518,7 @@ impl<'a> AuthSession<'a> {
     fn establish_hoppii_session(&self) -> Result<(), HoseiAuthError> {
         let origin = &self.endpoints.hoppii;
         let login_referer = endpoint(origin, PORTAL_PUBLIC);
-        let response = send(
+        let response = self.send(
             self.http
                 .get(endpoint(origin, PORTAL_LOGIN))
                 .header(REFERER, login_referer.as_str()),
@@ -504,7 +530,7 @@ impl<'a> AuthSession<'a> {
             AuthStep::HoppiiPortalLoginRedirect,
             Some(&login_referer),
         )?;
-        let response = send(
+        let response = self.send(
             self.http
                 .get(endpoint(origin, USER_PAGE))
                 .header(REFERER, endpoint(origin, PORTAL_LOGIN).as_str()),
@@ -523,7 +549,7 @@ impl<'a> AuthSession<'a> {
     }
 
     fn webclass_sso(&self) -> Result<(), HoseiAuthError> {
-        let response = send(
+        let response = self.send(
             self.http
                 .get(endpoint(&self.endpoints.hoppii, PARM))
                 .header(
@@ -545,7 +571,7 @@ impl<'a> AuthSession<'a> {
             &self.endpoints.webclass,
             AuthStep::WebClassSso,
         )?;
-        let response = send(
+        let response = self.send(
             self.http
                 .post(action)
                 .header(REFERER, base.as_str())
@@ -586,7 +612,7 @@ impl<'a> AuthSession<'a> {
             if followed == MAX_REDIRECTS {
                 return Err(HoseiAuthError::RedirectLimit(step));
             }
-            response = send(self.http.get(target).header(REFERER, base.as_str()), step)?;
+            response = self.send(self.http.get(target).header(REFERER, base.as_str()), step)?;
         }
         unreachable!("bounded loop returns at the limit")
     }
@@ -611,6 +637,13 @@ fn resolve_destination(
     origin: &Url,
     step: AuthStep,
 ) -> Result<Url, HoseiAuthError> {
+    if location
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        || location.contains('\\')
+    {
+        return Err(protocol_changed(step, ProtocolReason::InvalidTarget));
+    }
     let target = base
         .join(location)
         .map_err(|_| protocol_changed(step, ProtocolReason::InvalidTarget))?;
@@ -619,6 +652,28 @@ fn resolve_destination(
     }
     if !target.username().is_empty() || target.password().is_some() {
         return Err(protocol_changed(step, ProtocolReason::UserInfo));
+    }
+    // Preserve the original authority check before URL normalization erases an
+    // empty userinfo marker or percent/unicode hostname disguise. Relative paths
+    // inherit the already validated origin and have no authority of their own.
+    let authority = location
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .or_else(|| location.strip_prefix("//"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(""));
+    if let Some(authority) = authority {
+        if authority.contains('@') {
+            return Err(protocol_changed(step, ProtocolReason::UserInfo));
+        }
+        let host = target
+            .host_str()
+            .ok_or_else(|| protocol_changed(step, ProtocolReason::InvalidTarget))?;
+        let port = target
+            .port_or_known_default()
+            .ok_or_else(|| protocol_changed(step, ProtocolReason::InvalidTarget))?;
+        if authority != host && authority != format!("{host}:{port}") {
+            return Err(protocol_changed(step, ProtocolReason::InvalidTarget));
+        }
     }
     Ok(target)
 }
@@ -652,12 +707,8 @@ fn redirect_destination(
     resolve_destination(response.url(), location, origin, step)
 }
 
-fn send(request: RequestBuilder, step: AuthStep) -> Result<Response, HoseiAuthError> {
-    request.send().map_err(|error| transport_error(error, step))
-}
-
-fn transport_error(error: reqwest::Error, step: AuthStep) -> HoseiAuthError {
-    if error.is_timeout() {
+fn transport_error(error: NetworkError, step: AuthStep) -> HoseiAuthError {
+    if error == NetworkError::Timeout {
         HoseiAuthError::Timeout(step)
     } else {
         HoseiAuthError::Request(step)
@@ -679,11 +730,21 @@ fn require_ok(response: &Response, step: AuthStep) -> Result<(), HoseiAuthError>
 
 fn read_ok(response: Response, step: AuthStep) -> Result<String, HoseiAuthError> {
     require_ok(&response, step)?;
-    let bytes = response
-        .bytes()
-        .map_err(|error| transport_error(error, step))?;
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| protocol_changed(step, ProtocolReason::BodyDecode))
+    let kind = if matches!(
+        step,
+        AuthStep::OpenAmInitial | AuthStep::OpenAmCredentials | AuthStep::OpenAmScripted2
+    ) {
+        BodyKind::OpenAmJson
+    } else {
+        BodyKind::AuthHtml
+    };
+    read_text(response, kind).map_err(|error| {
+        if error == NetworkError::Decode {
+            protocol_changed(step, ProtocolReason::BodyDecode)
+        } else {
+            transport_error(error, step)
+        }
+    })
 }
 
 fn required_query_parameter(

@@ -470,9 +470,10 @@ async fn host_origin_methods_bodies_and_absent_routes_are_guarded() {
         serde_json::from_slice::<Value>(&bytes).unwrap(),
         json!({"error":{"code":"invalid_request"}})
     );
-    for path in ["/api/v1/sync"] {
-        assert_eq!(request(&app, path).await.0, StatusCode::NOT_FOUND);
-    }
+    assert_eq!(
+        request(&app, "/api/v1/sync").await.0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
     assert_eq!(
         request(&app, "/api/v1/assignments/id/completion").await.0,
         StatusCode::METHOD_NOT_ALLOWED
@@ -807,6 +808,8 @@ async fn static_allowlist_has_safe_types_and_no_desktop_or_filesystem_access() {
         ("/list_view.js", "text/javascript; charset=utf-8"),
         ("/list_tasks.js", "text/javascript; charset=utf-8"),
         ("/presentation.js", "text/javascript; charset=utf-8"),
+        ("/web_sync.js", "text/javascript; charset=utf-8"),
+        ("/sync.js", "text/javascript; charset=utf-8"),
     ] {
         let response = app
             .clone()
@@ -853,7 +856,7 @@ async fn static_allowlist_has_safe_types_and_no_desktop_or_filesystem_access() {
         "/app.js",
         "/tauri_api.js",
         "/settings_view.js",
-        "/sync.js",
+        "/sync_view.js",
     ] {
         assert_eq!(request(&app, path).await.0, StatusCode::NOT_FOUND, "{path}");
     }

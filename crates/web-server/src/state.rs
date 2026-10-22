@@ -29,6 +29,7 @@ struct Inner {
     auth: crate::auth::AuthService,
     clock: Arc<dyn Clock>,
     accepting: AtomicBool,
+    sync: crate::web_sync::WebSyncCoordinator,
 }
 /// Immutable owner-to-runtime binding. One account, one three-worker runtime.
 struct TenantRuntime {
@@ -69,6 +70,24 @@ impl PocState {
         auth_clock: impl crate::auth::AuthClock,
         provider: Arc<dyn crate::keys::KeyProvider>,
     ) -> Result<Self, WebError> {
+        Self::open_with_backend(
+            database,
+            clock,
+            auth_clock,
+            provider,
+            DisabledNetworkBackend,
+        )
+        .await
+    }
+    pub(crate) async fn open_with_backend<
+        B: assignment_manager_application::SyncBackend + Send + 'static,
+    >(
+        database: &PocDatabase,
+        clock: impl Clock,
+        auth_clock: impl crate::auth::AuthClock,
+        provider: Arc<dyn crate::keys::KeyProvider>,
+        backend: B,
+    ) -> Result<Self, WebError> {
         let (auth, owner) = crate::auth::AuthService::open(database, auth_clock).await?;
         let control = auth.control();
         let vault_owner = owner.clone();
@@ -80,7 +99,7 @@ impl PocState {
                     crate::vault::WebVault::new(control, vault_owner, provider)?,
                 ))
             },
-            DisabledNetworkBackend,
+            backend,
         ) {
             Ok(application) => application,
             Err(error) => {
@@ -88,7 +107,9 @@ impl PocState {
                 return Err(error.into());
             }
         };
+        let sync = crate::web_sync::WebSyncCoordinator::new(owner.clone(), application.clone());
         let state = Self(Arc::new(Inner {
+            sync,
             tenant: TenantRuntime {
                 owner: owner.clone(),
                 application,
@@ -143,19 +164,17 @@ impl PocState {
         secret: assignment_manager_application::credentials::SecretText,
     ) -> Result<(), WebError> {
         self.0
-            .tenant
-            .for_user(user)?
-            .save_moodle_config(secret)
+            .sync
+            .mutate(user, move |app| async move {
+                app.save_moodle_config(secret).await
+            })
             .await
-            .map_err(Into::into)
     }
     pub(crate) async fn remove_moodle(&self, user: &crate::auth::UserId) -> Result<(), WebError> {
         self.0
-            .tenant
-            .for_user(user)?
-            .remove_moodle_config()
+            .sync
+            .mutate(user, |app| async move { app.remove_moodle_config().await })
             .await
-            .map_err(Into::into)
     }
     pub(crate) async fn save_webclass(
         &self,
@@ -163,19 +182,22 @@ impl PocState {
         credentials: assignment_manager_application::credentials::WebClassCredentials,
     ) -> Result<(), WebError> {
         self.0
-            .tenant
-            .for_user(user)?
-            .save_webclass_credentials(credentials)
+            .sync
+            .mutate(user, move |app| async move {
+                app.save_webclass_credentials(credentials).await
+            })
             .await
-            .map_err(Into::into)
     }
     pub(crate) async fn remove_webclass(&self, user: &crate::auth::UserId) -> Result<(), WebError> {
         self.0
-            .tenant
-            .for_user(user)?
-            .remove_webclass_credentials()
+            .sync
+            .mutate(user, |app| async move {
+                app.remove_webclass_credentials().await
+            })
             .await
-            .map_err(Into::into)
+    }
+    pub(crate) fn sync(&self) -> &crate::web_sync::WebSyncCoordinator {
+        &self.0.sync
     }
     pub(crate) fn accepting(&self) -> bool {
         self.0.accepting.load(Ordering::Acquire)
@@ -200,10 +222,12 @@ impl PocState {
     /// Close HTTP admission, while requests already admitted may still finish.
     pub fn begin_shutdown(&self) {
         self.0.accepting.store(false, Ordering::Release);
+        self.0.sync.close();
     }
     /// Called after the HTTP server has drained its accepted requests.
     pub async fn shutdown(&self) {
         self.begin_shutdown();
+        self.0.sync.drain().await;
         self.0.tenant.application.shutdown().await;
         self.0.auth.close().await;
     }

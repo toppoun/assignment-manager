@@ -126,7 +126,27 @@ corrupt recordの修復は将来の明示的なoperator手順であり、現UI�
 ## Deployment boundary
 
 保存時のHTTPS/host/userinfo validationはSSRF対策ではない。保存を受理したURLは通信許可済みではない。
-DisabledNetworkBackend、startup sync OFF、sync endpointなし、大学HTTP client非構築を維持する。
-Web-4では大学別host/path/port allowlist、DNS/接続先制御、HTTP response body size上限、outbound policyが必要。
+DisabledNetworkBackend、startup sync OFF、大学HTTP client非構築を維持する。Web-4Aでは手動job APIを追加するが実大学通信は許可しない。
+実大学通信の前には大学別host/path/port allowlist、DNS/接続先制御、HTTP response body size上限、outbound policyが必要。
 production HTTPS/Secure Cookie、reverse proxy trust、production key provider/ACL、鍵とDBを分離したbackup/restore、
 大学認証の実検証とcredential取扱方針も公開前の必須作業。今回のVault完成は公開許可ではない。
+
+
+## Credential mutation admission (Web-4A)
+
+WebSyncCoordinatorは同じownerのjob受付とsave/delete受付を同じ短いmemory lockで調停する。
+同期中は409 sync_running、mutation中の新規同期は503 busy。GET statusの事前確認だけではない。
+受付済みmutationはserver taskがSettingsWorkerのcommit/replyまでguardを保持し、HTTP切断でも
+早期解放しない。DB/network await中にstd::sync::Mutexを保持しない。
+既存SettingsServiceのpersist成功後のrevision更新と、次sync時のsession破棄を維持する。
+Vault暗号format、key provider、nonce履歴、永続化schemaに変更はない。
+
+
+## University transport preparation (Web-4B1)
+
+[Web-4B1](PHASE-WEB-4B1.md)でcoreに[安全な大学HTTP constructor](WEB-NETWORK-SECURITY.md)を追加した。
+通常Web serverは引き続きDisabledNetworkBackendで、実大学backendへは接続していない。
+Moodleの保存時validationは通信許可ではなく、Web fetchには別のexact host/pathとDNS policyが必要。
+Moodle実host/pathは未設定でfail closed。暗号化Vault、boolean-only status、owner/reauth/CSRF、
+jobとcredential mutationの排他は変更していない。実credentialの使用は今回行っていない。
+Web-4AのWindows検証は未完了・最終BLOCKEDのまま。Web-4B2はまだ実装していない。

@@ -10,7 +10,10 @@ pub mod poc;
 mod requests;
 mod routes;
 mod state;
+#[cfg(feature = "synthetic-sync")]
+pub mod synthetic;
 pub mod vault;
+mod web_sync;
 
 pub use error::WebError;
 pub use routes::router;
@@ -31,6 +34,11 @@ pub struct PocServer {
     address: SocketAddr,
 }
 impl PocServer {
+    /// Dedicated offline test/example entry point, absent from normal builds.
+    #[cfg(feature = "synthetic-sync")]
+    pub async fn from_synthetic_state(state: PocState, port: u16) -> Result<Self, WebError> {
+        Self::bind(state, port).await
+    }
     /// Readiness completes before a socket is bound. No IP/bind option exists.
     pub async fn start(
         database: &PocDatabase,
@@ -92,7 +100,8 @@ impl PocServer {
                 admission.begin_shutdown();
             })
             .await;
-        // axum has drained HTTP requests before worker admission/resources close.
+        // Drain detached jobs/mutations after HTTP, before closing application
+        // workers: an admitted sync still needs the settings worker for secrets.
         state.shutdown().await;
         result.map_err(|_| WebError::Unavailable)
     }

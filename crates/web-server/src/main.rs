@@ -8,7 +8,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Web-3B PoC: {}", error.code());
+            eprintln!("Web-4A PoC: {}", error.code());
             ExitCode::FAILURE
         }
     }
@@ -51,7 +51,7 @@ async fn run() -> Result<(), WebError> {
     }
     let server = PocServer::start(&database, SystemClock, DEFAULT_PORT).await?;
     println!(
-        "Synthetic Web-3B loopback PoC: http://{}/",
+        "Synthetic Web-4A loopback PoC: http://{}/",
         server.local_addr()
     );
     println!(
@@ -60,7 +60,7 @@ async fn run() -> Result<(), WebError> {
     server
         .serve(async {
             if tokio::signal::ctrl_c().await.is_err() {
-                eprintln!("Web-3B PoC: signal unavailable; stopping");
+                eprintln!("Web-4A PoC: signal unavailable; stopping");
             }
         })
         .await

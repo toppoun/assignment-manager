@@ -173,6 +173,9 @@ export function createListView(api, document_ = document) {
     writeControls({ ...DEFAULT_CONTROLS, completion: "all" });
     void load();
   }, { signal: listeners.signal });
+  // A disposed browser view removed the old <option>s. Native selects reject
+  // assigning "all" until that option exists; restore options before reading.
+  updateCourseOptions([], DEFAULT_CONTROLS);
   update(model.snapshot());
   return { load, model, dispose() {
     active = false;
