@@ -1,7 +1,7 @@
 //! Dedicated SQLite state for future apply operations. Dry runs only open it read-only.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read},
     path::Path,
@@ -164,7 +164,7 @@ impl BindingStatus {
 }
 
 pub struct StateSummary {
-    pub blocked_creates: HashSet<SyncKey>,
+    pub(super) bindings: HashMap<SyncKey, Binding>,
     pub pending: usize,
     pub last_fetch: Option<DateTime<Utc>>,
     pub last_apply: Option<DateTime<Utc>>,
@@ -387,15 +387,18 @@ impl StateStore {
             .prepare("SELECT sync_key, page_id, status FROM bindings")
             .map_err(|_| StateError::InvalidDatabase)?;
         let mut rows = stmt.query([]).map_err(|_| StateError::InvalidDatabase)?;
-        let mut blocked_creates = HashSet::new();
+        let mut bindings = HashMap::new();
         let mut pending = 0;
         while let Some(row) = rows.next().map_err(|_| StateError::InvalidDatabase)? {
             let key: String = row.get(0).map_err(|_| StateError::InvalidDatabase)?;
             let page: Option<String> = row.get(1).map_err(|_| StateError::InvalidDatabase)?;
             let status: String = row.get(2).map_err(|_| StateError::InvalidDatabase)?;
             let binding = decode_binding(&status, page)?;
-            blocked_creates.insert(key.parse().map_err(|_| StateError::InvalidDatabase)?);
             pending += usize::from(binding.status != BindingStatus::Linked);
+            bindings.insert(
+                key.parse().map_err(|_| StateError::InvalidDatabase)?,
+                binding,
+            );
         }
         let (fetch, apply): (Option<i64>, Option<i64>) = self
             .0
@@ -437,7 +440,7 @@ impl StateStore {
             })
             .transpose()?;
         Ok(StateSummary {
-            blocked_creates,
+            bindings,
             pending,
             last_fetch: time(fetch)?,
             last_apply: time(apply)?,
@@ -572,7 +575,9 @@ mod tests {
         assert_eq!(store.mark_unknown(&a), Err(StateError::InvalidTransition));
         let summary = StateStore::read(&path, TARGET).unwrap().unwrap();
         assert_eq!(summary.pending, 1);
-        assert_eq!(summary.blocked_creates, HashSet::from([a, b]));
+        assert_eq!(summary.bindings.len(), 2);
+        assert_eq!(summary.bindings[&a].status, BindingStatus::Linked);
+        assert_eq!(summary.bindings[&b].status, BindingStatus::CreateIntent);
     }
 
     #[test]

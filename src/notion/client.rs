@@ -2,11 +2,13 @@ use std::{error::Error, fmt, io::Read, thread, time::Duration};
 
 use reqwest::{
     Method, Url,
-    blocking::{Client, RequestBuilder},
+    blocking::{Client, Request, RequestBuilder},
     header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
 };
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
+
+use super::wire::{property_id, uuid};
 
 pub const NOTION_VERSION: &str = "2026-03-11";
 const BASE: &str = "https://api.notion.com";
@@ -148,21 +150,12 @@ impl NotionClient {
         self.http.request(method, url)
     }
 
-    pub(super) fn permits_query(&self) -> bool {
-        self.base.scheme() == "http"
-            && self.base.host_str().is_some_and(|host| {
-                host.trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-            })
-    }
-
     pub(super) fn read<T: DeserializeOwned>(
         &self,
         request: impl Fn() -> RequestBuilder,
     ) -> Result<T, NotionError> {
         for attempt in 0..ATTEMPTS {
-            match self.send(request()) {
+            match self.send_read(request()) {
                 Ok(result) => return Ok(result),
                 Err(failure) => {
                     if attempt + 1 == ATTEMPTS || !retryable(failure.error) {
@@ -184,21 +177,33 @@ impl NotionClient {
         &self,
         request: &super::wire::PreparedWrite,
     ) -> Result<serde_json::Value, NotionError> {
-        assert!(self.permits_query());
-        self.send(
-            self.request(request.method().clone(), request.path(), &[])
-                .json(request.body()),
-        )
-        .map_err(|failure| failure.error)
+        assert_eq!(
+            self.base.scheme(),
+            "http",
+            "mock writes require a loopback client"
+        );
+        let request = self
+            .request(request.method().clone(), request.path(), &[])
+            .json(request.body())
+            .build()
+            .map_err(|_| NotionError::Configuration)?;
+        self.execute(request).map_err(|failure| failure.error)
     }
 
-    fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Failed> {
+    fn send_read<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Failed> {
         let request = request.build().map_err(|_| NotionError::Configuration)?;
-        if request.url().origin() != self.base.origin()
-            || (request.method() != Method::GET && !self.permits_query())
+        let url = request.url();
+        if url.origin() != self.base.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || !permits_read(request.method(), url.path())
         {
             return Err(NotionError::MethodDisabled.into());
         }
+        self.execute(request)
+    }
+
+    fn execute<T: DeserializeOwned>(&self, request: Request) -> Result<T, Failed> {
         let response = self.http.execute(request).map_err(|error| {
             if error.is_timeout() {
                 NotionError::Timeout
@@ -248,6 +253,21 @@ impl NotionClient {
         }
         serde_json::from_slice(&body).map_err(|_| NotionError::InvalidResponse.into())
     }
+}
+
+fn permits_read(method: &Method, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    let id = match (method, parts.as_slice()) {
+        (&Method::GET, ["", "v1", "data_sources" | "pages", id])
+        | (&Method::POST, ["", "v1", "data_sources", id, "query"]) => id,
+        (&Method::GET, ["", "v1", "pages", id, "properties", property])
+            if property_id(property) =>
+        {
+            id
+        }
+        _ => return false,
+    };
+    uuid(id).as_deref() == Some(*id)
 }
 
 fn retryable(error: NotionError) -> bool {

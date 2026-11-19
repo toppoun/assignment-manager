@@ -499,6 +499,199 @@ fn http_incomplete_query_never_turns_partial_rows_into_creates_or_updates() {
 }
 
 #[test]
+fn inspection_and_dry_run_use_one_complete_snapshot_with_manual_rows_and_duplicate_keys() {
+    let a = key("a");
+    let input = input(vec![
+        candidate("a", "Candidate"),
+        candidate("b", "Manual title"),
+    ]);
+    let mut script = schema_exchanges(inspection_schema());
+    script.push(query(
+        vec![
+            task(MANUAL, None, "Manual title"),
+            task(PAGE_A, Some(&a), "First"),
+        ],
+        Some("next"),
+    ));
+    script.push(query(vec![task(PAGE_B, Some(&a), "Second")], None));
+    let (client, server) = mock(script);
+    let (inspection, report) = client.inspect_dry_run(&input, &target(), &[], &[]);
+    assert_eq!(inspection.error, None);
+    assert_eq!(
+        inspection.snapshot,
+        Some(SnapshotSummary {
+            managed: 2,
+            manual: 1,
+            duplicate_keys: 1
+        })
+    );
+    assert_eq!(report.counts().conflict, 1);
+    assert_eq!(report.counts().create, 1);
+    assert_eq!(report.requests().len(), 1);
+    assert_eq!(report.requests()[0].key(), &key("b"));
+    assert!(!format!("{inspection} {report}").contains("Manual title"));
+    server.join().unwrap();
+}
+
+#[test]
+fn inspection_dry_run_retries_only_the_current_query_page_to_a_limit() {
+    let input = input(vec![candidate("a", "New"), candidate("b", "Another")]);
+    let path = format!("/v1/data_sources/{A}/query");
+    for (last, expected) in [
+        (200, None),
+        (529, Some(NotionError::Overloaded)),
+        (429, Some(NotionError::RateLimited)),
+    ] {
+        let mut script = schema_exchanges(inspection_schema());
+        script.push(query(
+            vec![task(PAGE_A, Some(&key("a")), "Old")],
+            Some("next"),
+        ));
+        for status in [429, 529, last] {
+            let next = if status == 200 {
+                query(vec![], None)
+            } else {
+                Exchange::error("POST", &path, status, "Retry-After: 0\r\n")
+            };
+            script.push(next.check(|_, body| assert_eq!(body["start_cursor"], "next")));
+        }
+        let (client, server) = mock(script);
+        let (inspection, report) = client.inspect_dry_run(&input, &target(), &[], &[]);
+        assert_eq!(report.error(), expected);
+        assert_eq!(inspection.snapshot.is_some(), expected.is_none());
+        if expected.is_none() {
+            assert_eq!((report.counts().create, report.counts().update), (1, 1));
+        } else {
+            assert_eq!(report.counts().deferred, 2);
+            assert!(report.requests().is_empty());
+        }
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn inspection_dry_run_fails_closed_on_unauthorized_malformed_or_repeated_results() {
+    let input = input(vec![candidate("a", "New")]);
+    let path = format!("/v1/data_sources/{A}/query");
+    let manual = task(MANUAL, None, "Manual");
+    let mut moved = task(PAGE_A, Some(&key("a")), "Moved");
+    moved["parent"]["data_source_id"] = json!(C);
+    let mut trashed = task(PAGE_A, Some(&key("a")), "Trashed");
+    trashed["in_trash"] = json!(true);
+    for (next, error) in [
+        (
+            Exchange::error("POST", &path, 401, ""),
+            NotionError::Authentication,
+        ),
+        (
+            Exchange::error("POST", &path, 403, ""),
+            NotionError::Forbidden,
+        ),
+        (
+            Exchange::error("POST", &path, 404, ""),
+            NotionError::NotFound,
+        ),
+        (
+            Exchange::json(
+                "POST",
+                &path,
+                json!({"object":"list","has_more":false,"next_cursor":null}),
+            ),
+            NotionError::InvalidResponse,
+        ),
+        (
+            query(vec![], Some("bad\nnext")),
+            NotionError::IncompleteSnapshot,
+        ),
+        (
+            query(vec![manual.clone()], None),
+            NotionError::IncompleteSnapshot,
+        ),
+        (query(vec![moved], None), NotionError::IncompleteSnapshot),
+        (query(vec![trashed], None), NotionError::IncompleteSnapshot),
+    ] {
+        let mut script = schema_exchanges(inspection_schema());
+        script.push(query(vec![manual.clone()], Some("next")));
+        script.push(next);
+        let (client, server) = mock(script);
+        let (inspection, report) = client.inspect_dry_run(&input, &target(), &[], &[]);
+        assert!(inspection.snapshot.is_none());
+        assert_eq!(report.error(), Some(error));
+        assert_eq!(report.counts().deferred, 1);
+        assert!(report.requests().is_empty());
+        assert!(!format!("{inspection} {report}").contains(TOKEN));
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn http_relation_cannot_be_replaced_from_an_inconsistent_or_duplicate_projection() {
+    let input = input(vec![candidate("a", "New"), candidate("b", "Another")]);
+    let mut row = task(PAGE_A, Some(&key("a")), "Old");
+    row["properties"]["授業"]["relation"] = json!([{"id":COURSE}]);
+    row["properties"]["授業"]["has_more"] = json!(true);
+    let path = format!("/v1/pages/{PAGE_A}/properties/R%3Ael");
+    for ids in [&[][..], &[OLD_COURSE][..], &[COURSE, COURSE][..]] {
+        let mut script = schema_exchanges(inspection_schema());
+        script.push(query(vec![row.clone()], None));
+        script.push(Exchange::json("GET", &path, item_list(ids, None)));
+        let (client, server) = mock(script);
+        let (inspection, report) = client.inspect_dry_run(&input, &target(), &[], &[]);
+        assert!(inspection.snapshot.is_none());
+        assert_eq!(report.error(), Some(NotionError::IncompleteSnapshot));
+        assert_eq!(report.counts().deferred, 2);
+        assert!(report.requests().is_empty());
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn dry_run_defers_missing_known_pages_and_changed_or_unreconciled_bindings() {
+    use super::state::StateStore;
+
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("state.sqlite3");
+    StateStore::initialize(&db, A).unwrap();
+    let state = StateStore::for_apply(&db, A).unwrap();
+    state.confirm(&key("missing"), MANUAL).unwrap();
+    state.confirm(&key("moved"), PAGE_A).unwrap();
+    state.reserve_create(&key("unknown")).unwrap();
+    state.mark_unknown(&key("unknown")).unwrap();
+    drop(state);
+    let original = std::fs::read(&db).unwrap();
+    let input = input(
+        ["missing", "moved", "wrong-key", "unknown", "fresh"]
+            .into_iter()
+            .map(|id| candidate(id, "New"))
+            .collect(),
+    );
+    let mut script = schema_exchanges(inspection_schema());
+    script.push(query(
+        vec![
+            task(PAGE_B, Some(&key("moved")), "Old"),
+            task(PAGE_A, Some(&key("wrong-key")), "Old"),
+            task(OLD_COURSE, Some(&key("unknown")), "New"),
+        ],
+        None,
+    ));
+    let (client, server) = mock(script);
+    let (_, mut report) = client.inspect_dry_run(&input, &target(), &[], &[]);
+    report.defer_unreconciled(&StateStore::read(&db, A).unwrap().unwrap());
+    assert_eq!(
+        report.counts(),
+        DryRunCounts {
+            create: 1,
+            deferred: 4,
+            ..Default::default()
+        }
+    );
+    assert_eq!(report.requests().len(), 1);
+    assert_eq!(report.requests()[0].key(), &key("fresh"));
+    assert_eq!(std::fs::read(&db).unwrap(), original);
+    server.join().unwrap();
+}
+
+#[test]
 fn http_invalid_schema_and_unrecognized_managed_keys_fail_closed() {
     let input = input(vec![candidate("a", "New")]);
     for (property, replacement) in [
@@ -821,7 +1014,7 @@ fn inspection_schema() -> Value {
 }
 
 #[test]
-fn get_only_audit_reports_legacy_schema_and_pages_explicit_relation_items() {
+fn inspection_reports_legacy_schema_and_pages_explicit_relation_items() {
     let mut data = inspection_schema();
     let props = data["properties"].as_object_mut().unwrap();
     props.remove("同期キー");
@@ -872,7 +1065,7 @@ fn get_only_audit_reports_legacy_schema_and_pages_explicit_relation_items() {
     let output = report.to_string();
     assert!(output.contains("property.sync_key=missing expected_type=rich_text"));
     assert!(output.contains("property.source=missing expected_type=select"));
-    assert!(output.contains("snapshot=unavailable_get_only"));
+    assert!(output.contains("snapshot=unavailable"));
     for private in [
         TOKEN,
         PAGE_A,
@@ -886,18 +1079,28 @@ fn get_only_audit_reports_legacy_schema_and_pages_explicit_relation_items() {
 }
 
 #[test]
-fn get_only_audit_distinguishes_configured_schema_missing_ids_and_invalid_options() {
+fn inspection_distinguishes_configured_schema_missing_ids_and_invalid_options() {
     let ready = inspection_schema();
     let mut invalid_options = ready.clone();
     invalid_options["properties"]["取得元"]["select"]["options"] =
         json!([{"id":"option-md","name":"Moodle"}]);
     let mut script = schema_exchanges(ready.clone());
+    script.push(query(vec![], None));
     script.extend(schema_exchanges(ready));
     script.extend(schema_exchanges(invalid_options));
     let (client, server) = mock(script);
 
     let mut target = target();
-    assert_eq!(client.inspect(&target, &[], &[]).error, None);
+    let report = client.inspect(&target, &[], &[]);
+    assert_eq!(report.error, None);
+    assert_eq!(
+        report.snapshot,
+        Some(SnapshotSummary {
+            managed: 0,
+            manual: 0,
+            duplicate_keys: 0
+        })
+    );
     let key_id = std::mem::take(&mut target.properties.sync_key);
     let report = client.inspect(&target, &[], &[]);
     assert_eq!(report.error, Some(NotionError::SchemaMismatch));
@@ -918,7 +1121,7 @@ fn get_only_audit_distinguishes_configured_schema_missing_ids_and_invalid_option
 }
 
 #[test]
-fn get_only_audit_preserves_scope_diagnostics_and_rejects_failed_page_reads() {
+fn inspection_preserves_scope_diagnostics_and_rejects_failed_page_reads() {
     let mut script = vec![
         Exchange::error("GET", format!("/v1/data_sources/{A}"), 401, ""),
         Exchange::json("GET", format!("/v1/data_sources/{A}"), inspection_schema()),
@@ -957,16 +1160,34 @@ fn get_only_audit_preserves_scope_diagnostics_and_rejects_failed_page_reads() {
 }
 
 #[test]
-fn official_transport_rejects_non_get_before_network_and_dry_run_is_incomplete() {
-    let client = NotionClient::new(TOKEN).unwrap();
-    for method in [Method::POST, Method::PATCH, Method::DELETE] {
+fn read_transport_rejects_write_endpoints_and_other_routes_before_network() {
+    let (client, server) = mock(vec![query(vec![], None)]);
+    let query_path = format!("/v1/data_sources/{A}/query");
+    for (method, path) in [
+        (Method::POST, "/v1/pages".to_owned()),
+        (Method::PATCH, format!("/v1/pages/{PAGE_A}")),
+        (Method::DELETE, format!("/v1/pages/{PAGE_A}")),
+        (Method::POST, format!("/v1/data_sources/{A}")),
+        (Method::PATCH, format!("/v1/data_sources/{A}")),
+        (Method::POST, "/v1/data_sources".to_owned()),
+        (Method::POST, "/v1/search".to_owned()),
+        (Method::GET, "/v1/users/me".to_owned()),
+        (Method::GET, query_path.clone()),
+        (Method::POST, format!("{query_path}/")),
+        (Method::POST, format!("/v1/data_sources/{A}/%71uery")),
+        (Method::POST, "/v1/data_sources/not-a-uuid/query".to_owned()),
+    ] {
         let result: Result<Value, NotionError> =
-            client.read(|| client.request(method.clone(), "/v1/pages", &[]));
+            client.read(|| client.request(method.clone(), &path, &[]));
         assert_eq!(result, Err(NotionError::MethodDisabled));
     }
-    let input = input(vec![candidate("a", "Fixture")]);
-    let report = client.dry_run(&input, &target(), &[]);
-    assert_eq!(report.error(), Some(NotionError::MethodDisabled));
-    assert_eq!(report.counts().deferred, 1);
-    assert!(report.requests().is_empty());
+    let result: Value = client
+        .read(|| {
+            client
+                .request(Method::POST, &query_path, &[])
+                .json(&json!({}))
+        })
+        .unwrap();
+    assert_eq!(result["results"], json!([]));
+    server.join().unwrap();
 }

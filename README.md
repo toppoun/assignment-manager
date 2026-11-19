@@ -48,13 +48,16 @@ cargo run --locked --offline --features synthetic-https-fixture -- status --fixt
 終了コードは成功 `0`、実行失敗 `1`、設定・資格情報などの不足 `2`、
 部分成功または確認待ち `3`、多重実行 `4` です。
 
-### Phase 3BのGET限定検査
+### Phase 3B.5の読み取り専用検査とdry-run
 
 対象ワークスペースへの読み取りが許可された環境で、Notion Internal connectionに
 読み取り権限を付与し、課題と授業の元データソースを共有します。
 Notionの「データソースを管理」から両方のデータソースIDを取得し、ローカル設定へ記載します。
 `credentials set notion` を対話端末から実行して登録したトークンを使います。
-次の明示オプションで、公式の `https://api.notion.com` にGETで接続します。
+次の明示オプションで、公式の `https://api.notion.com` に接続します。
+メタデータと個別ページのGET、および一覧を読む
+`POST /v1/data_sources/{data_source_id}/query` を利用します。
+作成・更新・削除・アーカイブやスキーマ変更のリクエストはCLIから送信できません。
 
 ```powershell
 cargo run --locked --offline -- notion-check --allow-notion-read
@@ -67,11 +70,15 @@ cargo run --locked --offline --features synthetic-https-fixture -- sync --dry-ru
 繰り返し、メモは現在の列名と型を診断します。Notion UIの「テキスト」はAPI上の
 `rich_text` です。ページタイトル、トークン、生ID、URLは診断出力に含めません。
 
-Notionの課題データソース全件検索は読み取り操作ですがHTTP POSTを使用します。
-GET限定では指定ページの検査まで行い、一覧を完全取得した証拠としては扱いません。
-スキーマ不足やページ検査の失敗では終了コード `1`、検査が正常でも全件取得が
-許可されないため差分を保留した場合は `3` を返します。GET限定のdry-runでも
-同期状態DBは読み取り専用で、件数・固定分類だけを前回結果に記録します。
+スキーマが適合すると、`notion-check` は全件取得後に同期管理ページ、手動ページ、
+重複キーの件数を表示します。`sync --dry-run --fixture` は合成大学データと照合し、
+Create / Update / Unchanged / Conflict / Deferred の件数を表示します。
+`--allow-notion-read` を省いたfixture実行はループバックのNotionモックを使います。
+スキーマ不足、途中ページの失敗、ページの重複、APIの件数上限などで取得の完全性を
+確認できない場合は差分を確定せず、終了コード `1` を返します。同期キーの重複や
+状態DBとの対応の食い違いで保留した場合は `3` を返します。
+同期状態DBは読み取り専用で開きます。件数と固定分類だけを別の
+`last-dry-run.json` に記録します。
 
 ### 授業の対応表と既存課題の移行案
 
@@ -99,12 +106,12 @@ WebClassの外部IDはグループID、Moodleはフィードスコープ内の�
 1. 承認後に「同期キー」をテキスト（`rich_text`）、「取得元」を単一選択
    （`select`、既存の選択肢 `Moodle`・`WebClass`）として用意し、各IDを設定へ記載します。
    既存プロパティとページ値は維持します。
-2. 全件取得が許可された環境で差分を確認します。手動課題は同期キー空欄のまま共存できます。
+2. 読み取りが許可された環境で差分を確認します。手動課題は同期キー空欄のまま共存できます。
    重複候補を既存課題へ引き継ぐ場合は、対象のページIDと大学課題の完全な外部キーを
    一対一で指定し、期限、授業、取得元を照合します。タイトル一致だけの統合は行いません。
 3. 紐づけ前に変更予定を表示し、同期キーとページIDの重複、移動、ゴミ箱入り、
    未確認のRelationがある組は保留します。完了状態、メモ、優先度、繰り返し、本文は
-   移行の更新対象から外します。Phase 3Bで行うのはこの計画とGET検査までです。
+   移行の更新対象から外します。Phase 3B.5では移行案と読み取り専用の検査・差分計画を提供します。
 
 Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shell、
 Phase 10C2のmacOS native SwiftUI application shell / Settings / Swift Keychain / Syncです。

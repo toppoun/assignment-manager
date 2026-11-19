@@ -16,7 +16,7 @@ mod tests;
 mod wire;
 
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
-pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus};
+pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus, SnapshotSummary};
 pub use plan::{
     AssignmentPatch, ConflictReason, CourseMapping, DeferredReason, NotionAssignment,
     NotionSnapshot, PlanAction, PlannedAssignment, plan_sync,

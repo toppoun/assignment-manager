@@ -87,7 +87,7 @@ fn accepts_only_explicit_notion_read_and_a_legacy_config() {
 
 #[cfg(feature = "synthetic-https-fixture")]
 #[test]
-fn get_only_cli_flow_uses_mock_and_leaves_state_unchanged() {
+fn complete_cli_dry_run_uses_mock_and_leaves_state_unchanged() {
     let mut config = config();
     config.notion = assignment_manager::notion::fixture::target();
     let root = tempfile::tempdir().unwrap();
@@ -97,13 +97,21 @@ fn get_only_cli_flow_uses_mock_and_leaves_state_unchanged() {
     };
     let _lock = TargetLock::acquire(&paths.directory).unwrap();
     StateStore::initialize(&paths.state(), &paths.target).unwrap();
+    let key = "v1:b7e92444ae37a18bb36c597fd2e6bd2ba0999bff4ece1984c465aba44cb977aa"
+        .parse()
+        .unwrap();
+    let state = StateStore::for_apply(&paths.state(), &paths.target).unwrap();
+    assert!(state.reserve_create(&key).unwrap());
+    state.mark_unknown(&key).unwrap();
+    drop(state);
     let original = std::fs::read(paths.state()).unwrap();
     let (mock, _server) = assignment_manager::notion::fixture::start().unwrap();
-    assert_eq!(preview_with_client(&mock, &config, &paths).unwrap(), 1);
+    assert_eq!(preview_with_client(&mock, &config, &paths).unwrap(), 3);
     let report = Receipt::read(&paths.receipt()).unwrap().unwrap();
-    assert_eq!(report.issue.unwrap().code(), "schema_mismatch");
-    assert_eq!(report.counts.deferred, 10);
-    assert_eq!(report.counts.create + report.counts.update, 0);
+    assert_eq!(report.issue.unwrap().code(), "deferred");
+    assert_eq!(report.counts.deferred, 1);
+    assert_eq!(report.counts.create, 9);
+    assert_eq!(report.counts.update, 0);
     assert_eq!(std::fs::read(paths.state()).unwrap(), original);
 }
 

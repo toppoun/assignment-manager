@@ -217,10 +217,6 @@ impl Receipt {
             Some(NotionError::SchemaMismatch) => {
                 (RunOutcome::Failed, Some(DryRunIssue::SchemaMismatch))
             }
-            Some(NotionError::MethodDisabled) => (
-                RunOutcome::Partial,
-                Some(DryRunIssue::GetOnlySnapshotUnavailable),
-            ),
             Some(_) => (RunOutcome::Failed, Some(DryRunIssue::NotionRead)),
             None => match (moodle, webclass) {
                 (Failed, Failed) => (RunOutcome::Failed, Some(DryRunIssue::Acquisition)),
@@ -367,7 +363,7 @@ fn notion_diagnosis(error: NotionError) -> &'static str {
         NotionError::Overloaded => "overloaded",
         NotionError::Transport => "transport_failed",
         NotionError::IncompleteSnapshot => "incomplete_read",
-        NotionError::MethodDisabled => "snapshot_unavailable_get_only",
+        NotionError::MethodDisabled => "request_not_allowed",
         NotionError::Server(_) => "server_error",
         NotionError::Rejected(_) | NotionError::Conflict => "read_rejected",
         NotionError::InvalidResponse
@@ -392,12 +388,19 @@ fn check_notion(config: &Config, paths: &Paths) -> Result<u8, CliError> {
         &config.course_mappings,
     );
     display_inspection(&inspection);
-    if inspection.error.is_some() {
-        println!("result=failed");
-        Ok(1)
-    } else {
-        println!("result=success scope=schema_and_selected_pages");
-        Ok(0)
+    match (inspection.error, inspection.snapshot) {
+        (None, Some(snapshot)) if snapshot.duplicate_keys != 0 => {
+            println!("result=partial issue=conflict");
+            Ok(3)
+        }
+        (None, Some(_)) => {
+            println!("result=success scope=complete_snapshot");
+            Ok(0)
+        }
+        _ => {
+            println!("result=failed");
+            Ok(1)
+        }
     }
 }
 
@@ -414,14 +417,33 @@ fn preview_with_client(
     config: &Config,
     paths: &Paths,
 ) -> Result<u8, CliError> {
-    StateStore::read(&paths.state(), &paths.target)?;
-    let inspection = client.inspect(
+    let state = StateStore::read(&paths.state(), &paths.target)?;
+    let acquired =
+        fixture_run::acquire(assignment_manager::webclass_auth::synthetic::Scenario::BothSuccess)?;
+    let (inspection, mut plan) = client.inspect_dry_run(
+        &acquired.input,
         &config.notion,
         &config.sample_assignment_page_ids,
         &config.course_mappings,
     );
     display_inspection(&inspection);
-    let report = fixture_run::get_only_preview(inspection.error, &config.course_mappings)?;
+    let unconfigured = acquired
+        .input
+        .assignments()
+        .values()
+        .filter_map(|assignment| assignment.course_key.as_ref())
+        .filter(|key| {
+            !config
+                .course_mappings
+                .iter()
+                .any(|mapping| &mapping.course_key == *key)
+        })
+        .count();
+    println!("course_mapping_unconfigured={unconfigured}");
+    if let Some(state) = &state {
+        plan.defer_unreconciled(state);
+    }
+    let report = acquired.receipt(&plan);
     report.write(&paths.receipt())?;
     report.display();
     Ok(match report.outcome {
@@ -446,7 +468,8 @@ fn run_fixture(command: Command, root: PathBuf) -> Result<u8, CliError> {
         Command::Sync(true) => {
             let _lock = TargetLock::acquire(&paths.directory)?;
             let state = StateStore::read(&paths.state(), &paths.target)?;
-            let report = fixture_run::dry_run(state.as_ref())?;
+            let (inspection, report) = fixture_run::dry_run(state.as_ref())?;
+            display_inspection(&inspection);
             report.display();
             report.write(&paths.receipt())?;
             Ok(match report.outcome {

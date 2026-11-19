@@ -1,4 +1,7 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -7,6 +10,7 @@ use serde_json::{Value, json};
 use super::{
     CourseMapping, DeferredReason, NotionAssignment, NotionClient, NotionError, NotionSnapshot,
     NotionTarget, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, plan_sync,
+    state::{BindingStatus, StateSummary},
     wire::{Schema, checked_page_id, relation_id, uuid},
 };
 
@@ -48,17 +52,36 @@ impl DryRunReport {
         self.error
     }
 
-    /// Preserve prior creation intent and known pages that are missing from this
-    /// snapshot. The local state is only consulted and request previews stay
-    /// consistent with the filtered plan.
-    pub fn defer_creates(&mut self, blocked: &HashSet<SyncKey>) {
+    /// Require a prior binding to agree with the complete snapshot before
+    /// proposing a write or marking an assignment unchanged.
+    pub fn defer_unreconciled(&mut self, state: &StateSummary) {
+        let known_pages: HashMap<_, _> = state
+            .bindings
+            .iter()
+            .filter_map(|(key, binding)| Some((binding.page_id.as_deref()?, key)))
+            .collect();
+        let mut blocked = HashSet::new();
         for row in &mut self.plan {
-            if matches!(row.action, PlanAction::Create { .. }) && blocked.contains(&row.key) {
+            let binding = state.bindings.get(&row.key);
+            let needs_reconciliation = match &row.action {
+                PlanAction::Create { .. } => binding.is_some(),
+                PlanAction::Update { page_id, .. } | PlanAction::Unchanged { page_id } => {
+                    binding.is_some_and(|binding| {
+                        binding.status != BindingStatus::Linked
+                            || binding.page_id.as_ref() != Some(page_id)
+                    }) || known_pages
+                        .get(page_id.as_str())
+                        .is_some_and(|key| *key != &row.key)
+                }
+                _ => false,
+            };
+            if needs_reconciliation {
                 row.action = PlanAction::Deferred(DeferredReason::PendingReconciliation);
+                blocked.insert(&row.key);
             }
         }
         self.requests
-            .retain(|request| request.method() != Method::POST || !blocked.contains(request.key()));
+            .retain(|request| !blocked.contains(request.key()));
     }
 
     pub fn counts(&self) -> DryRunCounts {
@@ -113,9 +136,18 @@ impl NotionClient {
         target: &NotionTarget,
         mappings: &[CourseMapping],
     ) -> Result<DryRunReport, NotionError> {
-        if !self.permits_query() {
-            return Err(NotionError::MethodDisabled);
-        }
+        let schema = self.retrieve_schema(target)?;
+        let rows = self.query_assignments(&schema, None)?;
+        self.plan_from_rows(input, &schema, &rows, mappings)
+    }
+
+    pub(super) fn plan_from_rows(
+        &self,
+        input: &SyncInput,
+        schema: &Schema,
+        rows: &[NotionAssignment],
+        mappings: &[CourseMapping],
+    ) -> Result<DryRunReport, NotionError> {
         let mappings: Vec<_> = mappings
             .iter()
             .map(|mapping| {
@@ -125,9 +157,7 @@ impl NotionClient {
                 })
             })
             .collect::<Result<_, NotionError>>()?;
-        let schema = self.retrieve_schema(target)?;
-        let rows = self.query_assignments(&schema, None)?;
-        let plan = plan_sync(input, NotionSnapshot::Complete(&rows), &mappings);
+        let plan = plan_sync(input, NotionSnapshot::Complete(rows), &mappings);
         let mut verified = HashSet::new();
         let mut requests = Vec::new();
         for entry in &plan {
@@ -190,6 +220,7 @@ impl NotionClient {
             &props.source,
             &props.course,
         ]);
+        let mut seen_pages = HashSet::new();
         paginate(
             |cursor| {
                 let mut body = json!({"page_size":100, "result_type":"page"});
@@ -209,19 +240,47 @@ impl NotionClient {
                 {
                     return Err(NotionError::InvalidResponse);
                 }
-                if more_relation {
-                    row.course_page_ids = self.retrieve_relation(&row.page_id, &props.course)?;
+                if !seen_pages.insert(row.page_id.clone()) {
+                    return Err(NotionError::IncompleteSnapshot);
+                }
+                if row.sync_key.is_some() {
+                    row.course_page_ids = self.complete_relation(
+                        &row.page_id,
+                        &props.course,
+                        row.course_page_ids,
+                        more_relation,
+                    )?;
                 }
                 Ok(row)
             },
         )
     }
 
-    pub(super) fn retrieve_relation(
+    pub(super) fn complete_relation(
         &self,
         page: &str,
         property: &str,
+        links: Vec<String>,
+        more: bool,
     ) -> Result<Vec<String>, NotionError> {
+        if links.iter().collect::<HashSet<_>>().len() != links.len() {
+            return Err(NotionError::IncompleteSnapshot);
+        }
+        if !more {
+            return Ok(links);
+        }
+        let full = self.retrieve_relation(page, property)?;
+        let unique: HashSet<_> = full.iter().collect();
+        if unique.len() != full.len()
+            || full.len() <= links.len()
+            || links.iter().any(|link| !unique.contains(link))
+        {
+            return Err(NotionError::IncompleteSnapshot);
+        }
+        Ok(full)
+    }
+
+    fn retrieve_relation(&self, page: &str, property: &str) -> Result<Vec<String>, NotionError> {
         let path = format!("/v1/pages/{page}/properties/{property}");
         paginate(
             |cursor| {
@@ -286,7 +345,10 @@ fn paginate<T>(
         match (page["has_more"].as_bool(), page.get("next_cursor")) {
             (Some(false), Some(Value::Null)) => return Ok(results),
             (Some(true), Some(Value::String(next)))
-                if !next.trim().is_empty() && next.len() <= 4096 && seen.insert(next.clone()) =>
+                if !next.trim().is_empty()
+                    && next.len() <= 4096
+                    && !next.bytes().any(|byte| byte.is_ascii_control())
+                    && seen.insert(next.clone()) =>
             {
                 cursor = Some(next.clone());
             }

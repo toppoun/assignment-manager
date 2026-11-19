@@ -77,7 +77,7 @@ pub(super) fn uuid(value: &str) -> Option<String> {
     ))
 }
 
-fn property_id(id: &str) -> bool {
+pub(super) fn property_id(id: &str) -> bool {
     // The API returns property IDs pre-encoded. Keep escapes in the path and
     // reject any ID that could become a URL dot segment.
     let mut bytes = id.bytes();
@@ -213,11 +213,7 @@ pub(super) fn page_relations(page: &Value, id: &str) -> Result<(Vec<String>, boo
     let has_more = prop["has_more"]
         .as_bool()
         .ok_or(NotionError::InvalidResponse)?;
-    let links = if has_more {
-        Vec::new()
-    } else {
-        relation.iter().map(relation_id).collect::<Result<_, _>>()?
-    };
+    let links = relation.iter().map(relation_id).collect::<Result<_, _>>()?;
     Ok((links, has_more))
 }
 

@@ -1,4 +1,4 @@
-//! GET-only diagnostics. Explicitly selected pages never form a complete snapshot.
+//! Read-only schema diagnostics and complete assignment snapshots.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -8,9 +8,11 @@ use std::{
 use serde_json::{Map, Value};
 
 use super::{
-    CourseMapping, NotionClient, NotionError, NotionTarget,
+    CourseMapping, DryRunReport, NotionAssignment, NotionClient, NotionError, NotionTarget,
+    SyncInput,
     wire::{
-        checked_page_id, data_source_parent, page_relations, relation_targets, source_options, uuid,
+        Schema, checked_page_id, data_source_parent, page_relations, relation_targets,
+        source_options, uuid,
     },
 };
 
@@ -56,7 +58,15 @@ pub struct InspectionReport {
     pub assignment_samples: usize,
     pub sample_relation_entries: usize,
     pub mapped_course_pages: usize,
+    pub snapshot: Option<SnapshotSummary>,
     pub error: Option<NotionError>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    pub managed: usize,
+    pub manual: usize,
+    pub duplicate_keys: usize,
 }
 
 impl fmt::Display for InspectionReport {
@@ -87,15 +97,22 @@ impl fmt::Display for InspectionReport {
         }
         write!(
             f,
-            "assignment_samples={} sample_relation_entries={} mapped_course_pages={} snapshot=unavailable_get_only",
+            "assignment_samples={} sample_relation_entries={} mapped_course_pages={}",
             self.assignment_samples, self.sample_relation_entries, self.mapped_course_pages
-        )
+        )?;
+        match &self.snapshot {
+            Some(snapshot) => write!(
+                f,
+                "\nsnapshot=complete managed={} manual={} duplicate_keys={}",
+                snapshot.managed, snapshot.manual, snapshot.duplicate_keys
+            ),
+            None => write!(f, "\nsnapshot=unavailable"),
+        }
     }
 }
 
 impl NotionClient {
-    /// Validate schema and GET only the explicitly named pages. A page sample
-    /// cannot prove the absence of a sync key in the data source.
+    /// Audit the schema and selected pages, then read the complete assignment list.
     pub fn inspect(
         &self,
         target: &NotionTarget,
@@ -104,18 +121,63 @@ impl NotionClient {
     ) -> InspectionReport {
         let mut report = InspectionReport::default();
         report.error = self
-            .inspect_into(target, assignment_samples, mappings, &mut report)
+            .inspect_snapshot(target, assignment_samples, mappings, &mut report)
             .err();
         report
     }
 
-    fn inspect_into(
+    /// Plan against the same validated snapshot reported by the inspection.
+    pub fn inspect_dry_run(
+        &self,
+        input: &SyncInput,
+        target: &NotionTarget,
+        assignment_samples: &[String],
+        mappings: &[CourseMapping],
+    ) -> (InspectionReport, DryRunReport) {
+        let mut inspection = InspectionReport::default();
+        let result = self
+            .inspect_snapshot(target, assignment_samples, mappings, &mut inspection)
+            .and_then(|(schema, rows)| self.plan_from_rows(input, &schema, &rows, mappings));
+        let plan = result.unwrap_or_else(|error| {
+            inspection.error = Some(error);
+            DryRunReport::incomplete(input, error)
+        });
+        (inspection, plan)
+    }
+
+    fn inspect_snapshot(
         &self,
         target: &NotionTarget,
         assignment_samples: &[String],
         mappings: &[CourseMapping],
         report: &mut InspectionReport,
-    ) -> Result<(), NotionError> {
+    ) -> Result<(Schema, Vec<NotionAssignment>), NotionError> {
+        let schema = self.inspect_schema(target, assignment_samples, mappings, report)?;
+        let rows = self.query_assignments(&schema, None)?;
+        let mut keys = HashSet::new();
+        let mut duplicates = HashSet::new();
+        let mut managed = 0;
+        for key in rows.iter().filter_map(|row| row.sync_key.as_ref()) {
+            managed += 1;
+            if !keys.insert(key) {
+                duplicates.insert(key);
+            }
+        }
+        report.snapshot = Some(SnapshotSummary {
+            managed,
+            manual: rows.len() - managed,
+            duplicate_keys: duplicates.len(),
+        });
+        Ok((schema, rows))
+    }
+
+    fn inspect_schema(
+        &self,
+        target: &NotionTarget,
+        assignment_samples: &[String],
+        mappings: &[CourseMapping],
+        report: &mut InspectionReport,
+    ) -> Result<Schema, NotionError> {
         if assignment_samples.len() > MAX_ASSIGNMENT_SAMPLES || mappings.len() > MAX_COURSE_MAPPINGS
         {
             return Err(NotionError::Configuration);
@@ -149,14 +211,7 @@ impl NotionClient {
                 return Err(NotionError::InvalidResponse);
             }
             let (links, more) = page_relations(&page, &target.properties.course)?;
-            let links = if more {
-                self.retrieve_relation(&id, &target.properties.course)?
-            } else {
-                links
-            };
-            if links.iter().collect::<HashSet<_>>().len() != links.len() {
-                return Err(NotionError::InvalidResponse);
-            }
+            let links = self.complete_relation(&id, &target.properties.course, links, more)?;
             report.assignment_samples += 1;
             report.sample_relation_entries += links.len();
         }
@@ -175,7 +230,7 @@ impl NotionClient {
         {
             return Err(NotionError::SchemaMismatch);
         }
-        Ok(())
+        Schema::validate(target, (assignment_id, course_id), &assignment, &course)
     }
 }
 

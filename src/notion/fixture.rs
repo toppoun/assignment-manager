@@ -143,7 +143,13 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
                     "Sync key":{"id":"sync","type":"rich_text","rich_text":{}},
                     "Source":{"id":"source","type":"select","select":{"options":[
                         {"id":"moodle","name":"Moodle"},{"id":"webclass","name":"WebClass"}
-                    ]}}
+                    ]}},
+                    "状態":{"id":"status","type":"status","status":{}},
+                    "優先度":{"id":"priority","type":"select","select":{}},
+                    "科目":{"id":"subject","type":"select","select":{}},
+                    "種別":{"id":"category","type":"select","select":{}},
+                    "繰り返し":{"id":"recurrence","type":"select","select":{}},
+                    "メモ":{"id":"notes","type":"rich_text","rich_text":{}}
                 }),
             ),
         )
