@@ -1,0 +1,226 @@
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
+};
+
+use crate::{domain::Deadline, import::ExternalRecordKey};
+
+use super::{SyncAssignment, SyncInput, SyncKey, UniversitySource};
+
+/// The read projection needed to compare source-owned properties. A row with
+/// no sync key is manual; unrecognized nonempty keys must be handled by the
+/// snapshot reader before marking the snapshot complete.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NotionAssignment {
+    pub page_id: String,
+    pub sync_key: Option<SyncKey>,
+    pub source: Option<UniversitySource>,
+    pub title: String,
+    pub deadline: Option<Deadline>,
+    /// All page IDs in the source-owned course relation.
+    pub course_page_ids: Vec<String>,
+}
+
+pub enum NotionSnapshot<'a> {
+    /// All managed rows in the query scope and all comparison fields were read.
+    Complete(&'a [NotionAssignment]),
+    /// Read error, incomplete pagination, or an unverified projection.
+    Incomplete,
+}
+
+/// An explicit binding for an exact course key. Names are never matched.
+pub struct CourseMapping {
+    pub course_key: ExternalRecordKey,
+    pub page_id: String,
+}
+
+/// Only properties this phase can change. Omitted fields keep their values.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct AssignmentPatch {
+    pub source: Option<UniversitySource>,
+    pub title: Option<String>,
+    /// None omits the property. Some(None) explicitly clears the deadline.
+    pub deadline: Option<Option<Deadline>>,
+    /// When present, replace the source-owned relation with this single page.
+    pub course_page_id: Option<String>,
+}
+
+impl fmt::Debug for AssignmentPatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssignmentPatch")
+            .field("source_changed", &self.source.is_some())
+            .field("title_changed", &self.title.is_some())
+            .field("deadline_changed", &self.deadline.is_some())
+            .field("course_changed", &self.course_page_id.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictReason {
+    DuplicateSyncKey,
+    InvalidOrRepeatedPage,
+    AmbiguousCourseMapping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredReason {
+    IncompleteSnapshot,
+    /// Only an earlier WebClass attempt produced this candidate.
+    EarlierAttempt,
+    /// The run has no current candidate. Includes failed, skipped, filtered and absent records.
+    NoValidatedCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanAction {
+    Create {
+        assignment: SyncAssignment,
+        course_page_id: Option<String>,
+    },
+    Update {
+        page_id: String,
+        patch: AssignmentPatch,
+    },
+    Unchanged {
+        page_id: String,
+    },
+    Conflict(ConflictReason),
+    Deferred(DeferredReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedAssignment {
+    pub key: SyncKey,
+    pub action: PlanAction,
+}
+
+/// Produce one action per managed synchronization key in lexicographic key
+/// order. Conflicts suppress writes for the affected keys. An incomplete
+/// snapshot suppresses all writes. Manual rows never produce an operation.
+pub fn plan_sync(
+    input: &SyncInput,
+    snapshot: NotionSnapshot<'_>,
+    course_mappings: &[CourseMapping],
+) -> Vec<PlannedAssignment> {
+    let mut keys: BTreeSet<_> = input
+        .assignments
+        .keys()
+        .chain(&input.earlier_attempt)
+        .collect();
+    let NotionSnapshot::Complete(rows) = snapshot else {
+        return keys
+            .into_iter()
+            .map(|key| PlannedAssignment {
+                key: key.clone(),
+                action: PlanAction::Deferred(DeferredReason::IncompleteSnapshot),
+            })
+            .collect();
+    };
+
+    let mut pages_by_key = HashMap::<_, Vec<_>>::new();
+    let mut page_ids = HashSet::new();
+    let mut repeated_page_ids = HashSet::new();
+    for row in rows {
+        if !page_ids.insert(row.page_id.as_str()) {
+            repeated_page_ids.insert(row.page_id.as_str());
+        }
+        if let Some(key) = &row.sync_key {
+            keys.insert(key);
+            pages_by_key.entry(key).or_default().push(row);
+        }
+    }
+
+    let mut pages_by_course = HashMap::<_, BTreeSet<_>>::new();
+    for mapping in course_mappings {
+        pages_by_course
+            .entry(&mapping.course_key)
+            .or_default()
+            .insert(mapping.page_id.as_str());
+    }
+
+    keys.into_iter()
+        .map(|key| {
+            let action = plan_assignment(
+                input.assignments.get(key),
+                input.earlier_attempt.contains(key),
+                pages_by_key.get(key).map_or(&[], Vec::as_slice),
+                &repeated_page_ids,
+                &pages_by_course,
+            );
+            PlannedAssignment {
+                key: key.clone(),
+                action,
+            }
+        })
+        .collect()
+}
+
+fn plan_assignment(
+    assignment: Option<&SyncAssignment>,
+    earlier_attempt: bool,
+    matches: &[&NotionAssignment],
+    repeated_page_ids: &HashSet<&str>,
+    pages_by_course: &HashMap<&ExternalRecordKey, BTreeSet<&str>>,
+) -> PlanAction {
+    let page = match matches {
+        [] => None,
+        [page]
+            if !page.page_id.trim().is_empty()
+                && !repeated_page_ids.contains(page.page_id.as_str()) =>
+        {
+            Some(*page)
+        }
+        [_] => return PlanAction::Conflict(ConflictReason::InvalidOrRepeatedPage),
+        _ => return PlanAction::Conflict(ConflictReason::DuplicateSyncKey),
+    };
+    let Some(assignment) = assignment else {
+        return PlanAction::Deferred(if earlier_attempt {
+            DeferredReason::EarlierAttempt
+        } else {
+            DeferredReason::NoValidatedCandidate
+        });
+    };
+
+    let course_page_id = match assignment
+        .course_key
+        .as_ref()
+        .and_then(|key| pages_by_course.get(key))
+    {
+        None => None,
+        Some(pages) => {
+            let Some(&id) = pages
+                .first()
+                .filter(|id| pages.len() == 1 && !id.trim().is_empty())
+            else {
+                return PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping);
+            };
+            Some(id)
+        }
+    };
+    let Some(page) = page else {
+        return PlanAction::Create {
+            assignment: assignment.clone(),
+            course_page_id: course_page_id.map(str::to_owned),
+        };
+    };
+
+    let patch = AssignmentPatch {
+        source: (page.source != Some(assignment.source)).then_some(assignment.source),
+        title: (page.title != assignment.title).then(|| assignment.title.clone()),
+        deadline: (page.deadline != assignment.deadline).then(|| assignment.deadline.clone()),
+        course_page_id: course_page_id
+            .filter(|id| !matches!(page.course_page_ids.as_slice(), [current] if current == id))
+            .map(str::to_owned),
+    };
+    if patch == AssignmentPatch::default() {
+        PlanAction::Unchanged {
+            page_id: page.page_id.clone(),
+        }
+    } else {
+        PlanAction::Update {
+            page_id: page.page_id.clone(),
+            patch,
+        }
+    }
+}

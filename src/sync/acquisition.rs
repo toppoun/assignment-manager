@@ -47,7 +47,7 @@ pub struct AcquiredAssignments {
 }
 
 impl AcquiredAssignments {
-    fn try_new(
+    pub(crate) fn try_new(
         batch: AssignmentCandidateBatch,
         observation: AssignmentObservation,
     ) -> Result<Self, ObservationValidationError> {
@@ -84,8 +84,8 @@ impl fmt::Debug for AcquiredAssignments {
 /// A Moodle feed result. Course metadata exists only for candidates with a
 /// usable single category from an explicitly CourseRelated export.
 pub struct MoodleAcquisition {
-    pub assignments: AcquiredAssignments,
-    courses: HashMap<ExternalRecordKey, SourceCourse>,
+    pub(crate) assignments: AcquiredAssignments,
+    pub(crate) courses: HashMap<ExternalRecordKey, SourceCourse>,
 }
 
 impl fmt::Debug for MoodleAcquisition {
@@ -98,6 +98,10 @@ impl fmt::Debug for MoodleAcquisition {
 }
 
 impl MoodleAcquisition {
+    pub fn assignments(&self) -> &AcquiredAssignments {
+        &self.assignments
+    }
+
     pub fn course_for(&self, assignment: &ExternalRecordKey) -> Option<&SourceCourse> {
         self.courses.get(assignment)
     }
@@ -182,27 +186,72 @@ pub(super) fn visit_moodle(
 /// the outcome or completeness of any individual contents request.
 #[derive(Debug)]
 pub struct AcquiredWebClassCourses {
-    pub courses: Vec<SourceCourse>,
-    pub observation: WebClassCourseListObservation,
-    pub observed_at: DateTime<Utc>,
+    pub(crate) courses: Vec<SourceCourse>,
+    pub(crate) observation: WebClassCourseListObservation,
+    pub(crate) observed_at: DateTime<Utc>,
+}
+
+impl AcquiredWebClassCourses {
+    pub fn courses(&self) -> &[SourceCourse] {
+        &self.courses
+    }
+
+    pub fn observation(&self) -> &WebClassCourseListObservation {
+        &self.observation
+    }
+
+    pub fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
 }
 
 /// One pass over the course list in response order. On failure, earlier groups
 /// (including valid empty groups) remain available, and traversal stops.
 #[derive(Debug)]
 pub struct WebClassAcquisitionAttempt {
-    pub course_list: Option<AcquiredWebClassCourses>,
+    pub(crate) course_list: Option<AcquiredWebClassCourses>,
+    pub(crate) groups: Vec<AcquiredAssignments>,
+    pub(crate) result: Result<(), WebClassSyncError>,
+}
+
+impl WebClassAcquisitionAttempt {
+    pub fn course_list(&self) -> Option<&AcquiredWebClassCourses> {
+        self.course_list.as_ref()
+    }
+
     /// Each batch's observation identifies its exact WebClass group.
-    pub groups: Vec<AcquiredAssignments>,
-    pub result: Result<(), WebClassSyncError>,
+    pub fn groups(&self) -> &[AcquiredAssignments] {
+        &self.groups
+    }
+
+    pub fn result(&self) -> Result<(), WebClassSyncError> {
+        self.result
+    }
 }
 
 /// Ordered attempts, including any validated groups from before auth expiry.
 /// Across attempts a group or key may be observed again; use its external key.
 #[derive(Debug)]
 pub struct WebClassAcquisition {
-    pub attempts: Vec<WebClassAcquisitionAttempt>,
-    pub result: Result<(), WebClassReauthSyncError>,
+    attempts: Vec<WebClassAcquisitionAttempt>,
+    result: Result<(), WebClassReauthSyncError>,
+}
+
+impl WebClassAcquisition {
+    pub(crate) fn new(
+        attempts: Vec<WebClassAcquisitionAttempt>,
+        result: Result<(), WebClassReauthSyncError>,
+    ) -> Self {
+        Self { attempts, result }
+    }
+
+    pub fn attempts(&self) -> &[WebClassAcquisitionAttempt] {
+        &self.attempts
+    }
+
+    pub fn result(&self) -> Result<(), WebClassReauthSyncError> {
+        self.result
+    }
 }
 
 /// Fetch and validate one exact WebClass contents group with an existing session.
@@ -346,7 +395,7 @@ pub fn acquire_webclass_with_reauth(
         attempts.push(attempt);
         result
     });
-    WebClassAcquisition { attempts, result }
+    WebClassAcquisition::new(attempts, result)
 }
 
 pub(super) fn run_with_webclass_reauth<T>(

@@ -5,6 +5,7 @@ use crate::{
     domain::{CompletionState, Deadline},
     import::{AssignmentCandidate, ExternalRecordKey, OriginKind},
     moodle_http::{MoodleExportKind, MoodleFeed},
+    notion::{self, DeferredReason, NotionSnapshot, PlanAction, SyncInput},
     observation::SyncScope,
     persistence::SqliteStore,
     secured_sync::SecuredSyncClients,
@@ -629,18 +630,18 @@ fn acquisition_retains_both_attempts_and_reauthenticates_only_once() {
             sync::acquire_webclass_with_reauth(&mut session, &authenticator, &mut provider);
         assert_eq!(provider.0, 1);
         assert!(clients.owns_session(&session));
-        assert_eq!(report.attempts.len(), 2);
-        let first = &report.attempts[0];
+        assert_eq!(report.attempts().len(), 2);
+        let first = &report.attempts()[0];
         assert_eq!(first.result, Err(WebClassSyncError::AuthExpired));
         assert_eq!(first.groups.len(), 1);
         assert_eq!(
             first.groups[0].batch().as_slice()[0].external_key,
             key("fixture-course-001")
         );
-        let retry = &report.attempts[1];
+        let retry = &report.attempts()[1];
         if second_expiry {
             assert_eq!(
-                report.result,
+                report.result(),
                 Err(WebClassReauthSyncError::Sync(
                     WebClassSyncError::AuthExpired
                 ))
@@ -649,12 +650,26 @@ fn acquisition_retains_both_attempts_and_reauthenticates_only_once() {
             assert!(retry.course_list.is_none());
             assert!(retry.groups.is_empty());
         } else {
-            assert_eq!(report.result, Ok(()));
+            assert_eq!(report.result(), Ok(()));
             assert_eq!(retry.result, Ok(()));
             assert_eq!(retry.groups.len(), 3);
             assert_eq!(
                 first.groups[0].batch().as_slice(),
                 retry.groups[0].batch().as_slice()
+            );
+        }
+        let input = SyncInput::from_acquisitions(None, Some(&report)).unwrap();
+        let plan = notion::plan_sync(&input, NotionSnapshot::Complete(&[]), &[]);
+        if second_expiry {
+            assert_eq!(plan.len(), 3);
+            assert!(plan.iter().all(|item| item.action == PlanAction::Deferred(
+                DeferredReason::EarlierAttempt
+            )));
+        } else {
+            assert_eq!(plan.len(), 9);
+            assert!(
+                plan.iter()
+                    .all(|item| matches!(item.action, PlanAction::Create { .. }))
             );
         }
         finish_all(servers);

@@ -3,6 +3,7 @@ pub mod domain;
 pub mod import;
 pub mod moodle;
 pub mod moodle_http;
+pub mod notion;
 pub mod observation;
 pub mod persistence;
 pub mod query;
