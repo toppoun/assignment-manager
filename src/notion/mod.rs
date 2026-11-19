@@ -1,13 +1,23 @@
-//! Pure Notion synchronization preparation and planning.
+//! Notion synchronization preparation, planning, and read-only dry runs.
 
+mod client;
+#[cfg(test)]
+mod http_tests;
+#[cfg(test)]
+mod mock_apply;
 mod plan;
+mod reader;
 #[cfg(test)]
 mod tests;
+mod wire;
 
+pub use client::{NOTION_VERSION, NotionClient, NotionError};
 pub use plan::{
     AssignmentPatch, ConflictReason, CourseMapping, DeferredReason, NotionAssignment,
     NotionSnapshot, PlanAction, PlannedAssignment, plan_sync,
 };
+pub use reader::{DryRunCounts, DryRunReport};
+pub use wire::{NotionPropertyIds, NotionTarget, PreparedWrite};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},

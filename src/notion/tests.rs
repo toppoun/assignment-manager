@@ -31,7 +31,7 @@ fn source_candidate(origin: OriginKind, scope: &str, id: &str, title: &str) -> A
     }
 }
 
-fn candidate(id: &str, title: &str) -> AssignmentCandidate {
+pub(super) fn candidate(id: &str, title: &str) -> AssignmentCandidate {
     source_candidate(OriginKind::Moodle, FEED, id, title)
 }
 
@@ -39,7 +39,7 @@ fn key_for(origin: OriginKind, scope: &str, id: &str) -> SyncKey {
     SyncKey::derive(&external(origin, scope, id)).unwrap()
 }
 
-fn key(id: &str) -> SyncKey {
+pub(super) fn key(id: &str) -> SyncKey {
     key_for(OriginKind::Moodle, FEED, id)
 }
 
@@ -56,14 +56,14 @@ fn validated(scope: SyncScope, candidates: Vec<AssignmentCandidate>) -> Acquired
     .unwrap()
 }
 
-fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition {
+pub(super) fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition {
     MoodleAcquisition {
         assignments: validated(SyncScope::MoodleFeed(FEED.into()), candidates),
         courses: HashMap::new(),
     }
 }
 
-fn input(candidates: Vec<AssignmentCandidate>) -> SyncInput {
+pub(super) fn input(candidates: Vec<AssignmentCandidate>) -> SyncInput {
     SyncInput::from_acquisitions(Some(&moodle(candidates)), None).unwrap()
 }
 
