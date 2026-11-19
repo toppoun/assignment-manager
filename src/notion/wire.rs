@@ -25,8 +25,10 @@ pub struct NotionPropertyIds {
     /// URL column verified during schema validation and omitted from writes.
     pub submission_url: String,
     /// Rich text carrying the canonical versioned key, empty for manual tasks.
+    #[serde(default)]
     pub sync_key: String,
     /// Select with existing Moodle and WebClass options, written by option ID.
+    #[serde(default)]
     pub source: String,
 }
 
@@ -99,7 +101,7 @@ fn property_id(id: &str) -> bool {
 }
 
 impl NotionPropertyIds {
-    fn fields(&self) -> [(&str, &str); 6] {
+    pub(super) fn fields(&self) -> [(&str, &'static str); 6] {
         [
             (&self.title, "title"),
             (&self.deadline, "date"),
@@ -124,7 +126,10 @@ impl NotionTarget {
                 .properties
                 .fields()
                 .into_iter()
-                .any(|(id, _)| !property_id(id) || !seen.insert(id))
+                .enumerate()
+                .any(|(index, (id, _))| {
+                    (index < 4 || !id.is_empty()) && (!property_id(id) || !seen.insert(id))
+                })
         {
             return Err(NotionError::Configuration);
         }
@@ -138,11 +143,11 @@ impl NotionTarget {
     }
 }
 
-fn object_id(value: &Value, field: &str) -> Option<String> {
+pub(super) fn object_id(value: &Value, field: &str) -> Option<String> {
     uuid(value[field].as_str()?)
 }
 
-fn data_source_parent(data: &Value, id: &str) -> Result<String, NotionError> {
+pub(super) fn data_source_parent(data: &Value, id: &str) -> Result<String, NotionError> {
     if data["object"] != "data_source"
         || object_id(data, "id").as_deref() != Some(id)
         || data["in_trash"].as_bool() != Some(false)
@@ -161,6 +166,61 @@ fn property<'a>(properties: &'a Map<String, Value>, id: &str, kind: &str) -> Opt
     (matches.next().is_none() && prop["type"].as_str() == Some(kind)).then_some(prop)
 }
 
+pub(super) fn relation_targets(relation: &Value, courses: &str, database: &str) -> bool {
+    object_id(relation, "data_source_id").as_deref() == Some(courses)
+        && object_id(relation, "database_id").as_deref() == Some(database)
+        && matches!(
+            relation["type"].as_str(),
+            Some("single_property" | "dual_property")
+        )
+}
+
+pub(super) fn source_options(select: &Value) -> Result<(String, String), NotionError> {
+    let options = select["options"]
+        .as_array()
+        .ok_or(NotionError::SchemaMismatch)?;
+    let mut option_ids = HashSet::new();
+    let mut moodle = None;
+    let mut webclass = None;
+    for option in options {
+        let id = option["id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(NotionError::SchemaMismatch)?;
+        if !option_ids.insert(id) {
+            return Err(NotionError::SchemaMismatch);
+        }
+        let slot = match option["name"].as_str() {
+            Some("Moodle") => &mut moodle,
+            Some("WebClass") => &mut webclass,
+            _ => continue,
+        };
+        if slot.replace(id.to_owned()).is_some() {
+            return Err(NotionError::SchemaMismatch);
+        }
+    }
+    moodle.zip(webclass).ok_or(NotionError::SchemaMismatch)
+}
+
+pub(super) fn page_relations(page: &Value, id: &str) -> Result<(Vec<String>, bool), NotionError> {
+    let props = page["properties"]
+        .as_object()
+        .ok_or(NotionError::InvalidResponse)?;
+    let prop = property(props, id, "relation").ok_or(NotionError::InvalidResponse)?;
+    let relation = prop["relation"]
+        .as_array()
+        .ok_or(NotionError::InvalidResponse)?;
+    let has_more = prop["has_more"]
+        .as_bool()
+        .ok_or(NotionError::InvalidResponse)?;
+    let links = if has_more {
+        Vec::new()
+    } else {
+        relation.iter().map(relation_id).collect::<Result<_, _>>()?
+    };
+    Ok((links, has_more))
+}
+
 impl Schema {
     pub(super) fn validate(
         target: &NotionTarget,
@@ -175,6 +235,9 @@ impl Schema {
             .as_object()
             .ok_or(NotionError::SchemaMismatch)?;
         for (id, kind) in target.properties.fields() {
+            if id.is_empty() {
+                return Err(NotionError::SchemaMismatch);
+            }
             let prop = property(properties, id, kind).ok_or(NotionError::SchemaMismatch)?;
             if !prop[kind].is_object() {
                 return Err(NotionError::SchemaMismatch);
@@ -182,43 +245,12 @@ impl Schema {
         }
         let relation = &property(properties, &target.properties.course, "relation")
             .ok_or(NotionError::SchemaMismatch)?["relation"];
-        if object_id(relation, "data_source_id").as_deref() != Some(&courses_id)
-            || object_id(relation, "database_id").as_deref() != Some(&courses_database)
-            || !matches!(
-                relation["type"].as_str(),
-                Some("single_property" | "dual_property")
-            )
-        {
+        if !relation_targets(relation, &courses_id, &courses_database) {
             return Err(NotionError::SchemaMismatch);
         }
         let select = &property(properties, &target.properties.source, "select")
             .ok_or(NotionError::SchemaMismatch)?["select"];
-        let options = select["options"]
-            .as_array()
-            .ok_or(NotionError::SchemaMismatch)?;
-        let mut option_ids = HashSet::new();
-        for option in options {
-            let id = option["id"]
-                .as_str()
-                .filter(|id| !id.trim().is_empty())
-                .ok_or(NotionError::SchemaMismatch)?;
-            if !option_ids.insert(id) {
-                return Err(NotionError::SchemaMismatch);
-            }
-        }
-        let option_id = |name| {
-            let mut named = options
-                .iter()
-                .filter(|option| option["name"].as_str() == Some(name));
-            let first = named.next()?;
-            named
-                .next()
-                .is_none()
-                .then(|| first["id"].as_str().map(str::to_owned))
-                .flatten()
-        };
-        let moodle_option = option_id("Moodle").ok_or(NotionError::SchemaMismatch)?;
-        let webclass_option = option_id("WebClass").ok_or(NotionError::SchemaMismatch)?;
+        let (moodle_option, webclass_option) = source_options(select)?;
         Ok(Self {
             assignments_id,
             assignments_database,
@@ -275,23 +307,8 @@ impl Schema {
                 _ => return Err(NotionError::UnsupportedProperty),
             });
         }
-        let p = property(
-            page["properties"]
-                .as_object()
-                .ok_or(NotionError::InvalidResponse)?,
-            &self.properties.course,
-            "relation",
-        )
-        .ok_or(NotionError::InvalidResponse)?;
-        let relation = p["relation"]
-            .as_array()
-            .ok_or(NotionError::InvalidResponse)?;
-        let has_more = p["has_more"]
-            .as_bool()
-            .ok_or(NotionError::InvalidResponse)?;
-        if !has_more {
-            row.course_page_ids = relation.iter().map(relation_id).collect::<Result<_, _>>()?;
-        }
+        let (links, has_more) = page_relations(page, &self.properties.course)?;
+        row.course_page_ids = links;
         Ok((row, has_more))
     }
 

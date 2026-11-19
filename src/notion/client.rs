@@ -6,6 +6,7 @@ use reqwest::{
     header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
 };
 use serde::de::DeserializeOwned;
+use zeroize::Zeroizing;
 
 pub const NOTION_VERSION: &str = "2026-03-11";
 const BASE: &str = "https://api.notion.com";
@@ -31,6 +32,7 @@ pub enum NotionError {
     SchemaMismatch,
     UnsupportedProperty,
     InvalidWrite,
+    MethodDisabled,
 }
 
 impl fmt::Display for NotionError {
@@ -88,8 +90,9 @@ impl NotionClient {
             return Err(NotionError::Configuration);
         }
         let mut headers = HeaderMap::new();
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| NotionError::Configuration)?;
+        let authorization_text = Zeroizing::new(format!("Bearer {token}"));
+        let mut authorization =
+            HeaderValue::from_str(&authorization_text).map_err(|_| NotionError::Configuration)?;
         authorization.set_sensitive(true);
         headers.insert(AUTHORIZATION, authorization);
         headers.insert("notion-version", HeaderValue::from_static(NOTION_VERSION));
@@ -145,12 +148,21 @@ impl NotionClient {
         self.http.request(method, url)
     }
 
+    pub(super) fn permits_query(&self) -> bool {
+        self.base.scheme() == "http"
+            && self.base.host_str().is_some_and(|host| {
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+            })
+    }
+
     pub(super) fn read<T: DeserializeOwned>(
         &self,
         request: impl Fn() -> RequestBuilder,
     ) -> Result<T, NotionError> {
         for attempt in 0..ATTEMPTS {
-            match Self::send(request()) {
+            match self.send(request()) {
                 Ok(result) => return Ok(result),
                 Err(failure) => {
                     if attempt + 1 == ATTEMPTS || !retryable(failure.error) {
@@ -172,20 +184,22 @@ impl NotionClient {
         &self,
         request: &super::wire::PreparedWrite,
     ) -> Result<serde_json::Value, NotionError> {
-        assert!(self.base.host_str().is_some_and(|host| {
-            host.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-        }));
-        Self::send(
+        assert!(self.permits_query());
+        self.send(
             self.request(request.method().clone(), request.path(), &[])
                 .json(request.body()),
         )
         .map_err(|failure| failure.error)
     }
 
-    fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, Failed> {
-        let response = request.send().map_err(|error| {
+    fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Failed> {
+        let request = request.build().map_err(|_| NotionError::Configuration)?;
+        if request.url().origin() != self.base.origin()
+            || (request.method() != Method::GET && !self.permits_query())
+        {
+            return Err(NotionError::MethodDisabled.into());
+        }
+        let response = self.http.execute(request).map_err(|error| {
             if error.is_timeout() {
                 NotionError::Timeout
             } else {

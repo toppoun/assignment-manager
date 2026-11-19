@@ -805,3 +805,168 @@ fn http_mock_write_errors_are_reconciled_before_any_further_creation() {
         server.join().unwrap();
     }
 }
+
+fn inspection_schema() -> Value {
+    let mut data = schema_json();
+    for (name, id, kind) in [
+        ("優先度", "priority", "select"),
+        ("科目", "subject", "select"),
+        ("種別", "category", "select"),
+        ("繰り返し", "recurring", "select"),
+        ("メモ", "note", "rich_text"),
+    ] {
+        data["properties"][name] = json!({"id":id, "type":kind, (kind):{}});
+    }
+    data
+}
+
+#[test]
+fn get_only_audit_reports_legacy_schema_and_pages_explicit_relation_items() {
+    let mut data = inspection_schema();
+    let props = data["properties"].as_object_mut().unwrap();
+    props.remove("同期キー");
+    props.remove("取得元");
+    let mut target = target();
+    target.properties.sync_key.clear();
+    target.properties.source.clear();
+
+    let mut sample = task(PAGE_A, None, TOKEN);
+    sample["properties"]["授業"]["has_more"] = json!(true);
+    let mut script = schema_exchanges(data);
+    script.push(Exchange::json("GET", format!("/v1/pages/{PAGE_A}"), sample));
+    let property = format!("/v1/pages/{PAGE_A}/properties/R%3Ael");
+    script.push(Exchange::json(
+        "GET",
+        &property,
+        item_list(&[COURSE], Some("page-2")),
+    ));
+    script.push(
+        Exchange::json("GET", &property, item_list(&[OLD_COURSE], None))
+            .check(|path, _| assert!(path.contains("start_cursor=page-2"))),
+    );
+    script.push(Exchange::json(
+        "GET",
+        format!("/v1/pages/{COURSE}"),
+        page(COURSE, C, C_DB, json!({})),
+    ));
+    let (client, server) = mock(script);
+    let mapping = CourseMapping {
+        course_key: crate::import::ExternalRecordKey {
+            origin: crate::import::OriginKind::Moodle,
+            scope: "default.course-related".into(),
+            id: "synthetic-private-course-id".into(),
+        },
+        page_id: COURSE.into(),
+    };
+    let report = client.inspect(&target, &[PAGE_A.into()], &[mapping]);
+    assert_eq!(report.error, Some(NotionError::SchemaMismatch));
+    assert!(report.relation_target_verified);
+    assert_eq!(
+        (
+            report.assignment_samples,
+            report.sample_relation_entries,
+            report.mapped_course_pages
+        ),
+        (1, 2, 1)
+    );
+    let output = report.to_string();
+    assert!(output.contains("property.sync_key=missing expected_type=rich_text"));
+    assert!(output.contains("property.source=missing expected_type=select"));
+    assert!(output.contains("snapshot=unavailable_get_only"));
+    for private in [
+        TOKEN,
+        PAGE_A,
+        COURSE,
+        "synthetic-private-course-id",
+        "https://",
+    ] {
+        assert!(!output.contains(private));
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn get_only_audit_distinguishes_configured_schema_missing_ids_and_invalid_options() {
+    let ready = inspection_schema();
+    let mut invalid_options = ready.clone();
+    invalid_options["properties"]["取得元"]["select"]["options"] =
+        json!([{"id":"option-md","name":"Moodle"}]);
+    let mut script = schema_exchanges(ready.clone());
+    script.extend(schema_exchanges(ready));
+    script.extend(schema_exchanges(invalid_options));
+    let (client, server) = mock(script);
+
+    let mut target = target();
+    assert_eq!(client.inspect(&target, &[], &[]).error, None);
+    let key_id = std::mem::take(&mut target.properties.sync_key);
+    let report = client.inspect(&target, &[], &[]);
+    assert_eq!(report.error, Some(NotionError::SchemaMismatch));
+    assert!(
+        report
+            .to_string()
+            .contains("property.sync_key=id_not_configured")
+    );
+    target.properties.sync_key = key_id;
+    let report = client.inspect(&target, &[], &[]);
+    assert_eq!(report.error, Some(NotionError::SchemaMismatch));
+    assert!(
+        report
+            .to_string()
+            .contains("property.source=invalid_options")
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn get_only_audit_preserves_scope_diagnostics_and_rejects_failed_page_reads() {
+    let mut script = vec![
+        Exchange::error("GET", format!("/v1/data_sources/{A}"), 401, ""),
+        Exchange::json("GET", format!("/v1/data_sources/{A}"), inspection_schema()),
+        Exchange::error("GET", format!("/v1/data_sources/{C}"), 403, ""),
+    ];
+    script.extend(schema_exchanges(inspection_schema()));
+    let assignment = task(PAGE_A, None, "First sample");
+    script.push(Exchange::json(
+        "GET",
+        format!("/v1/pages/{PAGE_A}"),
+        assignment,
+    ));
+    script.push(Exchange::error(
+        "GET",
+        format!("/v1/pages/{PAGE_B}"),
+        404,
+        "",
+    ));
+    let (client, server) = mock(script);
+    let target = target();
+    assert_eq!(
+        client.inspect(&target, &[], &[]).error,
+        Some(NotionError::Authentication)
+    );
+    let forbidden = client.inspect(&target, &[], &[]);
+    assert_eq!(forbidden.error, Some(NotionError::Forbidden));
+    assert!(forbidden.assignments_source_verified && !forbidden.courses_source_verified);
+    let incomplete = client.inspect(&target, &[PAGE_A.into(), PAGE_B.into()], &[]);
+    assert_eq!(incomplete.error, Some(NotionError::NotFound));
+    assert_eq!(incomplete.assignment_samples, 1);
+    let input = input(vec![candidate("a", "Fixture")]);
+    let plan = DryRunReport::incomplete(&input, incomplete.error.unwrap());
+    assert_eq!(plan.counts().deferred, 1);
+    assert!(plan.requests().is_empty());
+    server.join().unwrap();
+}
+
+#[test]
+fn official_transport_rejects_non_get_before_network_and_dry_run_is_incomplete() {
+    let client = NotionClient::new(TOKEN).unwrap();
+    for method in [Method::POST, Method::PATCH, Method::DELETE] {
+        let result: Result<Value, NotionError> =
+            client.read(|| client.request(method.clone(), "/v1/pages", &[]));
+        assert_eq!(result, Err(NotionError::MethodDisabled));
+    }
+    let input = input(vec![candidate("a", "Fixture")]);
+    let report = client.dry_run(&input, &target(), &[]);
+    assert_eq!(report.error(), Some(NotionError::MethodDisabled));
+    assert_eq!(report.counts().deferred, 1);
+    assert!(report.requests().is_empty());
+}

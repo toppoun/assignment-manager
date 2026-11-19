@@ -40,9 +40,71 @@ fn parses_only_explicit_dry_run_and_named_credential_commands() {
         &["--config", "some.json", "sync", "--dry-run", "--fixture"],
         &["credentials", "set", "notion", "secret"],
         &["--token", "secret"],
+        &["notion-check"],
+        &["sync", "--dry-run", "--allow-notion-read"],
     ] {
         assert_eq!(parse(words), Err(CliError::Usage));
     }
+}
+
+#[test]
+fn accepts_only_explicit_notion_read_and_a_legacy_config() {
+    assert_eq!(
+        parse(&["notion-check", "--allow-notion-read"])
+            .unwrap()
+            .command,
+        Command::NotionCheck
+    );
+    assert_eq!(
+        parse(&[
+            "--config",
+            "local.json",
+            "sync",
+            "--dry-run",
+            "--fixture",
+            "--allow-notion-read"
+        ])
+        .unwrap()
+        .command,
+        Command::NotionFixturePreview
+    );
+    let mut data = config_json();
+    let config = data.as_object_mut().unwrap();
+    config.remove("moodle");
+    config.remove("webclass");
+    let fields = data["notion"]["properties"].as_object_mut().unwrap();
+    fields.remove("sync_key");
+    fields.remove("source");
+    let config = Config::parse(data.to_string().as_bytes()).unwrap();
+    assert!(config.notion.properties.sync_key.is_empty());
+    assert!(config.notion.properties.source.is_empty());
+    assert_eq!(
+        notion_diagnosis(NotionError::NotFound),
+        "not_found_or_not_shared"
+    );
+    assert_eq!(notion_diagnosis(NotionError::Forbidden), "forbidden");
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+#[test]
+fn get_only_cli_flow_uses_mock_and_leaves_state_unchanged() {
+    let mut config = config();
+    config.notion = assignment_manager::notion::fixture::target();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        target: config.target_id().unwrap(),
+        directory: root.path().into(),
+    };
+    let _lock = TargetLock::acquire(&paths.directory).unwrap();
+    StateStore::initialize(&paths.state(), &paths.target).unwrap();
+    let original = std::fs::read(paths.state()).unwrap();
+    let (mock, _server) = assignment_manager::notion::fixture::start().unwrap();
+    assert_eq!(preview_with_client(&mock, &config, &paths).unwrap(), 1);
+    let report = Receipt::read(&paths.receipt()).unwrap().unwrap();
+    assert_eq!(report.issue.unwrap().code(), "schema_mismatch");
+    assert_eq!(report.counts.deferred, 10);
+    assert_eq!(report.counts.create + report.counts.update, 0);
+    assert_eq!(std::fs::read(paths.state()).unwrap(), original);
 }
 
 #[test]

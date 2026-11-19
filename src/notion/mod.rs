@@ -5,6 +5,7 @@ mod client;
 pub mod fixture;
 #[cfg(test)]
 mod http_tests;
+mod inspection;
 #[cfg(test)]
 mod mock_apply;
 mod plan;
@@ -15,6 +16,7 @@ mod tests;
 mod wire;
 
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
+pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus};
 pub use plan::{
     AssignmentPatch, ConflictReason, CourseMapping, DeferredReason, NotionAssignment,
     NotionSnapshot, PlanAction, PlannedAssignment, plan_sync,

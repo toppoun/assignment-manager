@@ -1,6 +1,6 @@
 # Assignment Manager
 
-## Notion単発CLI（Phase 3A）
+## Notion単発CLI
 
 Windows向けの単発CLIです。合成dry-runでは、固定ループバックの大学HTTPS fixtureから
 MoodleとWebClassを取得し、Notion HTTPモックを読み取って差分の件数を表示します。
@@ -43,10 +43,68 @@ cargo run --locked --offline --features synthetic-https-fixture -- status --fixt
 対話端末の非表示入力で登録します。設定ファイルには秘密情報を入れません。
 `init-state` と `status` が使う状態DBは `targets/<data-source-id>/state.sqlite3` にあり、
 既存アプリのSQLite v3と分離しています。通常の `sync --dry-run` はローカル設定と
-資格情報の検査で止まります。実大学・実Notionへの接続はPhase 3Aでは無効です。
+資格情報の検査で止まります。大学データの取得には合成fixtureを使用します。
 
 終了コードは成功 `0`、実行失敗 `1`、設定・資格情報などの不足 `2`、
 部分成功または確認待ち `3`、多重実行 `4` です。
+
+### Phase 3BのGET限定検査
+
+対象ワークスペースへの読み取りが許可された環境で、Notion Internal connectionに
+読み取り権限を付与し、課題と授業の元データソースを共有します。
+Notionの「データソースを管理」から両方のデータソースIDを取得し、ローカル設定へ記載します。
+`credentials set notion` を対話端末から実行して登録したトークンを使います。
+次の明示オプションで、公式の `https://api.notion.com` にGETで接続します。
+
+```powershell
+cargo run --locked --offline -- notion-check --allow-notion-read
+cargo run --locked --offline --features synthetic-https-fixture -- sync --dry-run --fixture --allow-notion-read
+```
+
+上の設定例から、存在しない `properties.sync_key` と `properties.source` は省略できます。
+`notion-check` は型・権限・Relation先を検査し、任意の `sample_assignment_page_ids`
+に指定した課題ページとRelationの全項目をGETで確認します。状態、優先度、科目、種別、
+繰り返し、メモは現在の列名と型を診断します。Notion UIの「テキスト」はAPI上の
+`rich_text` です。ページタイトル、トークン、生ID、URLは診断出力に含めません。
+
+Notionの課題データソース全件検索は読み取り操作ですがHTTP POSTを使用します。
+GET限定では指定ページの検査まで行い、一覧を完全取得した証拠としては扱いません。
+スキーマ不足やページ検査の失敗では終了コード `1`、検査が正常でも全件取得が
+許可されないため差分を保留した場合は `3` を返します。GET限定のdry-runでも
+同期状態DBは読み取り専用で、件数・固定分類だけを前回結果に記録します。
+
+### 授業の対応表と既存課題の移行案
+
+`course_mappings` は人が確認するローカル設定です。たとえば以下のように
+出所・スコープ・外部IDの完全一致を、確認済みの授業ページIDに対応づけます。
+
+```json
+"course_mappings": [
+  {
+    "course_key": {
+      "origin": "WebClass",
+      "scope": "default",
+      "id": "example-group-2026"
+    },
+    "page_id": "00000000-0000-4000-8000-000000000003"
+  }
+]
+```
+
+WebClassの外部IDはグループID、Moodleはフィードスコープ内の授業ラベルです。
+年度や取得範囲で別の授業になる場合は、対応表を作る前に外部キーの区別を確認します。
+同名・同一キーで一意に判断できない場合は関係付けを保留します。既存の「授業」列を
+ユーザーが管理している場合は、将来の同期所有列として独立したRelationを検討します。
+
+1. 承認後に「同期キー」をテキスト（`rich_text`）、「取得元」を単一選択
+   （`select`、既存の選択肢 `Moodle`・`WebClass`）として用意し、各IDを設定へ記載します。
+   既存プロパティとページ値は維持します。
+2. 全件取得が許可された環境で差分を確認します。手動課題は同期キー空欄のまま共存できます。
+   重複候補を既存課題へ引き継ぐ場合は、対象のページIDと大学課題の完全な外部キーを
+   一対一で指定し、期限、授業、取得元を照合します。タイトル一致だけの統合は行いません。
+3. 紐づけ前に変更予定を表示し、同期キーとページIDの重複、移動、ゴミ箱入り、
+   未確認のRelationがある組は保留します。完了状態、メモ、優先度、繰り返し、本文は
+   移行の更新対象から外します。Phase 3Bで行うのはこの計画とGET検査までです。
 
 Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shell、
 Phase 10C2のmacOS native SwiftUI application shell / Settings / Swift Keychain / Syncです。

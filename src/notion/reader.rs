@@ -30,6 +30,14 @@ pub struct DryRunReport {
 }
 
 impl DryRunReport {
+    pub fn incomplete(input: &SyncInput, error: NotionError) -> Self {
+        Self {
+            plan: plan_sync(input, NotionSnapshot::Incomplete, &[]),
+            requests: Vec::new(),
+            error: Some(error),
+        }
+    }
+
     pub fn plan(&self) -> &[PlannedAssignment] {
         &self.plan
     }
@@ -95,11 +103,7 @@ impl NotionClient {
     ) -> DryRunReport {
         match self.plan_complete(input, target, mappings) {
             Ok(report) => report,
-            Err(error) => DryRunReport {
-                plan: plan_sync(input, NotionSnapshot::Incomplete, &[]),
-                requests: Vec::new(),
-                error: Some(error),
-            },
+            Err(error) => DryRunReport::incomplete(input, error),
         }
     }
 
@@ -109,6 +113,9 @@ impl NotionClient {
         target: &NotionTarget,
         mappings: &[CourseMapping],
     ) -> Result<DryRunReport, NotionError> {
+        if !self.permits_query() {
+            return Err(NotionError::MethodDisabled);
+        }
         let mappings: Vec<_> = mappings
             .iter()
             .map(|mapping| {
@@ -148,11 +155,14 @@ impl NotionClient {
 
     pub(super) fn retrieve_schema(&self, target: &NotionTarget) -> Result<Schema, NotionError> {
         let ids = target.ids()?;
-        let assignments_path = format!("/v1/data_sources/{}", ids.0);
-        let courses_path = format!("/v1/data_sources/{}", ids.1);
-        let assignments = self.read(|| self.request(Method::GET, &assignments_path, &[]))?;
-        let courses = self.read(|| self.request(Method::GET, &courses_path, &[]))?;
+        let assignments = self.get_data_source(&ids.0)?;
+        let courses = self.get_data_source(&ids.1)?;
         Schema::validate(target, ids, &assignments, &courses)
+    }
+
+    pub(super) fn get_data_source(&self, id: &str) -> Result<Value, NotionError> {
+        let path = format!("/v1/data_sources/{id}");
+        self.read(|| self.request(Method::GET, &path, &[]))
     }
 
     pub(super) fn retrieve_page(
@@ -207,7 +217,11 @@ impl NotionClient {
         )
     }
 
-    fn retrieve_relation(&self, page: &str, property: &str) -> Result<Vec<String>, NotionError> {
+    pub(super) fn retrieve_relation(
+        &self,
+        page: &str,
+        property: &str,
+    ) -> Result<Vec<String>, NotionError> {
         let path = format!("/v1/pages/{page}/properties/{property}");
         paginate(
             |cursor| {

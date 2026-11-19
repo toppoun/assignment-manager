@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -21,6 +22,8 @@ pub(super) struct Config {
     pub webclass: bool,
     #[serde(default)]
     pub course_mappings: Vec<CourseMapping>,
+    #[serde(default)]
+    pub sample_assignment_page_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -64,23 +67,30 @@ impl Config {
     pub fn parse(data: &[u8]) -> Result<Self, ConfigError> {
         let config: Self = serde_json::from_slice(data).map_err(|_| ConfigError::Invalid)?;
         config.target_id()?;
-        if config.moodle.is_none() && !config.webclass {
-            return Err(ConfigError::Invalid);
-        }
         if let Some(moodle) = &config.moodle {
             let url = format!("https://{}{}", moodle.host, moodle.path);
             moodle.policy()?;
             MoodleFeed::new(&moodle.scope, MoodleExportKind::CourseRelated, &url)
                 .map_err(|_| ConfigError::Invalid)?;
         }
+        let mut mapped_keys = HashSet::new();
         for mapping in &config.course_mappings {
             let key = &mapping.course_key;
             let scope_matches = match key.origin {
-                OriginKind::Moodle => config.moodle.as_ref().is_some_and(|m| m.scope == key.scope),
-                OriginKind::WebClass => config.webclass && key.scope == DEFAULT_COURSE_SOURCE_SCOPE,
+                OriginKind::Moodle => MoodleFeed::new(
+                    &key.scope,
+                    MoodleExportKind::CourseRelated,
+                    "https://fixture.invalid/calendar",
+                )
+                .is_ok(),
+                OriginKind::WebClass => key.scope == DEFAULT_COURSE_SOURCE_SCOPE,
                 OriginKind::Manual => false,
             };
-            if !scope_matches || key.id.trim().is_empty() || !mapping.has_valid_page_id() {
+            if !scope_matches
+                || key.id.trim().is_empty()
+                || !mapping.has_valid_page_id()
+                || !mapped_keys.insert(key)
+            {
                 return Err(ConfigError::Invalid);
             }
         }

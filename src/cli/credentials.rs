@@ -80,14 +80,21 @@ pub(super) fn register(_: &Config, _: &str, _: Kind) -> Result<(), CredentialSta
     Err(CredentialStatus::Unavailable)
 }
 
+#[cfg(not(windows))]
+pub(super) fn notion_client(
+    _: &str,
+) -> Result<assignment_manager::notion::NotionClient, CredentialStatus> {
+    Err(CredentialStatus::Unavailable)
+}
+
 #[cfg(windows)]
-pub(super) use windows::{lookup, register};
+pub(super) use windows::{lookup, notion_client, register};
 
 #[cfg(windows)]
 mod windows {
     use std::io::{self, IsTerminal};
 
-    use assignment_manager::windows_credentials::local_entry;
+    use assignment_manager::{notion::NotionClient, windows_credentials::local_entry};
     use keyring_core::{Entry, Error};
     use serde::{Deserialize, Deserializer};
     use zeroize::Zeroizing;
@@ -119,6 +126,24 @@ mod windows {
         classify(config, kind, entry.get_secret().map(Zeroizing::new))
     }
 
+    pub(in crate::cli) fn notion_client(target: &str) -> Result<NotionClient, CredentialStatus> {
+        let entry = entry(target, Kind::Notion)?;
+        let bytes = entry.get_secret().map(Zeroizing::new).map_err(read_error)?;
+        client_from_secret(bytes)
+    }
+
+    fn client_from_secret(bytes: Zeroizing<Vec<u8>>) -> Result<NotionClient, CredentialStatus> {
+        let token = std::str::from_utf8(&bytes).map_err(|_| CredentialStatus::Invalid)?;
+        NotionClient::new(token).map_err(|_| CredentialStatus::Invalid)
+    }
+
+    fn read_error(error: Error) -> CredentialStatus {
+        match error {
+            Error::NoEntry => CredentialStatus::Missing,
+            _ => CredentialStatus::Unavailable,
+        }
+    }
+
     fn classify(
         config: &Config,
         kind: Kind,
@@ -127,8 +152,7 @@ mod windows {
         match result {
             Ok(bytes) if valid(config, kind, &bytes) => CredentialStatus::Ready,
             Ok(_) => CredentialStatus::Invalid,
-            Err(Error::NoEntry) => CredentialStatus::Missing,
-            Err(_) => CredentialStatus::Unavailable,
+            Err(error) => read_error(error),
         }
     }
 
@@ -213,6 +237,11 @@ mod windows {
         );
         assert!(valid(&config, Kind::Notion, b"synthetic-token"));
         assert!(!valid(&config, Kind::Notion, b"synthetic-token\r\n"));
+        assert!(client_from_secret(Zeroizing::new(b"synthetic-token".to_vec())).is_ok());
+        assert_eq!(
+            client_from_secret(Zeroizing::new(vec![0xff])).err(),
+            Some(CredentialStatus::Invalid)
+        );
         assert!(valid(
             &config,
             Kind::WebClass,

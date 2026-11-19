@@ -12,10 +12,8 @@ use std::{
     process::ExitCode,
 };
 
-#[cfg(feature = "synthetic-https-fixture")]
-use assignment_manager::notion::NotionError;
 use assignment_manager::notion::{
-    DryRunCounts,
+    DryRunCounts, InspectionReport, NotionError,
     state::{RunOutcome, StateError, StateStore, TargetLock, check_path},
 };
 use chrono::{DateTime, Utc};
@@ -24,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
-const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | sync --dry-run>\nKIND: moodle, webclass, notion\nFixture build: sync --dry-run --fixture, init-state --fixture, status --fixture";
+const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run>\nKIND: moodle, webclass, notion\nFixture build: sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -34,6 +32,8 @@ enum Command {
     Status(bool),
     Register(Kind),
     Sync(bool),
+    NotionCheck,
+    NotionFixturePreview,
 }
 
 impl Command {
@@ -42,6 +42,10 @@ impl Command {
             self,
             Self::InitState(true) | Self::Status(true) | Self::Sync(true)
         )
+    }
+
+    fn needs_fixture_build(&self) -> bool {
+        self.uses_fixture() || matches!(self, Self::NotionFixturePreview)
     }
 }
 
@@ -71,6 +75,10 @@ impl Arguments {
             ["status", "--fixture"] => Command::Status(true),
             ["sync", "--dry-run"] => Command::Sync(false),
             ["sync", "--dry-run", "--fixture"] => Command::Sync(true),
+            ["sync", "--dry-run", "--fixture", "--allow-notion-read"] => {
+                Command::NotionFixturePreview
+            }
+            ["notion-check", "--allow-notion-read"] => Command::NotionCheck,
             ["credentials", "set", kind] => {
                 Command::Register(Kind::parse(kind).ok_or(CliError::Usage)?)
             }
@@ -167,6 +175,7 @@ enum DryRunIssue {
     Acquisition,
     SchemaMismatch,
     NotionRead,
+    GetOnlySnapshotUnavailable,
     Conflict,
     Deferred,
 }
@@ -177,6 +186,7 @@ impl DryRunIssue {
             Self::Acquisition => "acquisition",
             Self::SchemaMismatch => "schema_mismatch",
             Self::NotionRead => "notion_read",
+            Self::GetOnlySnapshotUnavailable => "snapshot_unavailable_get_only",
             Self::Conflict => "conflict",
             Self::Deferred => "deferred",
         }
@@ -207,6 +217,10 @@ impl Receipt {
             Some(NotionError::SchemaMismatch) => {
                 (RunOutcome::Failed, Some(DryRunIssue::SchemaMismatch))
             }
+            Some(NotionError::MethodDisabled) => (
+                RunOutcome::Partial,
+                Some(DryRunIssue::GetOnlySnapshotUnavailable),
+            ),
             Some(_) => (RunOutcome::Failed, Some(DryRunIssue::NotionRead)),
             None => match (moodle, webclass) {
                 (Failed, Failed) => (RunOutcome::Failed, Some(DryRunIssue::Acquisition)),
@@ -341,6 +355,82 @@ fn check_credentials(config: &Config, target: &str) -> Result<(), CliError> {
         .map_or(Ok(()), |failed| Err(CliError::Credential(failed)))
 }
 
+fn notion_diagnosis(error: NotionError) -> &'static str {
+    match error {
+        NotionError::Configuration => "configuration_invalid",
+        NotionError::Authentication => "authentication_failed",
+        NotionError::Forbidden => "forbidden",
+        NotionError::NotFound => "not_found_or_not_shared",
+        NotionError::SchemaMismatch => "schema_mismatch",
+        NotionError::Timeout => "timeout",
+        NotionError::RateLimited => "rate_limited",
+        NotionError::Overloaded => "overloaded",
+        NotionError::Transport => "transport_failed",
+        NotionError::IncompleteSnapshot => "incomplete_read",
+        NotionError::MethodDisabled => "snapshot_unavailable_get_only",
+        NotionError::Server(_) => "server_error",
+        NotionError::Rejected(_) | NotionError::Conflict => "read_rejected",
+        NotionError::InvalidResponse
+        | NotionError::UnsupportedProperty
+        | NotionError::InvalidWrite => "invalid_response",
+    }
+}
+
+fn display_inspection(inspection: &InspectionReport) {
+    println!("{inspection}");
+    if let Some(error) = inspection.error {
+        println!("notion_error={}", notion_diagnosis(error));
+    }
+}
+
+fn check_notion(config: &Config, paths: &Paths) -> Result<u8, CliError> {
+    let _lock = TargetLock::acquire(&paths.directory)?;
+    let client = credentials::notion_client(&paths.target).map_err(CliError::Credential)?;
+    let inspection = client.inspect(
+        &config.notion,
+        &config.sample_assignment_page_ids,
+        &config.course_mappings,
+    );
+    display_inspection(&inspection);
+    if inspection.error.is_some() {
+        println!("result=failed");
+        Ok(1)
+    } else {
+        println!("result=success scope=schema_and_selected_pages");
+        Ok(0)
+    }
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+fn preview_notion(config: &Config, paths: &Paths) -> Result<u8, CliError> {
+    let _lock = TargetLock::acquire(&paths.directory)?;
+    let client = credentials::notion_client(&paths.target).map_err(CliError::Credential)?;
+    preview_with_client(&client, config, paths)
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+fn preview_with_client(
+    client: &assignment_manager::notion::NotionClient,
+    config: &Config,
+    paths: &Paths,
+) -> Result<u8, CliError> {
+    StateStore::read(&paths.state(), &paths.target)?;
+    let inspection = client.inspect(
+        &config.notion,
+        &config.sample_assignment_page_ids,
+        &config.course_mappings,
+    );
+    display_inspection(&inspection);
+    let report = fixture_run::get_only_preview(inspection.error, &config.course_mappings)?;
+    report.write(&paths.receipt())?;
+    report.display();
+    Ok(match report.outcome {
+        RunOutcome::Success => 0,
+        RunOutcome::Partial => 3,
+        RunOutcome::Failed => 1,
+    })
+}
+
 #[cfg(feature = "synthetic-https-fixture")]
 fn run_fixture(command: Command, root: PathBuf) -> Result<u8, CliError> {
     let target = assignment_manager::notion::fixture::target()
@@ -380,7 +470,7 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         return Ok(0);
     }
     // Fail before accessing local state when this is an ordinary binary.
-    if args.command.uses_fixture() && !cfg!(feature = "synthetic-https-fixture") {
+    if args.command.needs_fixture_build() && !cfg!(feature = "synthetic-https-fixture") {
         return Err(CliError::FixtureUnavailable);
     }
     let root = config::root()?;
@@ -409,6 +499,9 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         }
         Command::InitState(false) => initialize(&paths),
         Command::Status(false) => status(&paths),
+        Command::NotionCheck => check_notion(&config, &paths),
+        #[cfg(feature = "synthetic-https-fixture")]
+        Command::NotionFixturePreview => preview_notion(&config, &paths),
         Command::Register(kind) => {
             if !kind.enabled(&config) {
                 return Err(CliError::Credential(CredentialStatus::Disabled));
