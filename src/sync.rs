@@ -3,22 +3,26 @@
 //! Fetching, parsing, mapping and validation finish before the store starts its
 //! import transaction. Candidate absence has no deletion or presence semantics.
 
-use std::collections::{HashMap, HashSet};
+mod acquisition;
+
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use chrono::Utc;
-
-use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
-use crate::moodle::{map_events, parse_calendar, single_course_category};
-use crate::moodle_http::{MoodleClient, MoodleFeed};
-use crate::observation::{AssignmentObservation, SyncScope, WebClassCourseListObservation};
-use crate::persistence::{
-    AssignmentImportSummary, DEFAULT_COURSE_SOURCE_SCOPE, MoodleCourseResolution, SqliteStore,
+pub use acquisition::{
+    AcquiredAssignments, AcquiredWebClassCourses, MoodleAcquisition, SourceCourse,
+    WebClassAcquisition, WebClassAcquisitionAttempt, acquire_moodle, acquire_webclass_group,
+    acquire_webclass_once, acquire_webclass_with_reauth,
 };
-use crate::webclass::{WebClassMapError, map_contents_for_group, parse_contents, parse_courses};
+use acquisition::{
+    WebClassEvent, acquire_webclass_courses, run_with_webclass_reauth, visit_moodle,
+    visit_webclass_groups,
+};
+
+use crate::moodle_http::{MoodleClient, MoodleFeed};
+use crate::persistence::{AssignmentImportSummary, MoodleCourseResolution, SqliteStore};
 use crate::webclass_auth::{HoseiAuthenticator, HoseiCredentials};
-use crate::webclass_http::{WebClassClient, WebClassHttpError};
+use crate::webclass_http::WebClassClient;
 
 /// Fixed stage classifications only; source payloads and underlying errors are discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,82 +64,33 @@ pub fn sync_moodle_once(
     feed: &MoodleFeed,
     store: &mut SqliteStore,
 ) -> Result<AssignmentImportSummary, MoodleSyncError> {
-    let raw = client
-        .fetch_calendar(feed)
-        .map_err(|_| MoodleSyncError::Fetch)?;
-    let events = parse_calendar(&raw).map_err(|_| MoodleSyncError::Parse)?;
-    client
-        .check_sync_records(events.len())
-        .map_err(|_| MoodleSyncError::Validation)?;
-    let observation = AssignmentObservation::try_new(
-        SyncScope::MoodleFeed(feed.scope().to_owned()),
-        events
-            .iter()
-            .map(|event| ExternalRecordKey {
-                origin: OriginKind::Moodle,
-                scope: feed.scope().to_owned(),
-                id: event.uid.clone(),
-            })
-            .collect(),
-    )
-    .map_err(|_| MoodleSyncError::Validation)?;
-    let candidates = map_events(&events, feed.scope());
-    let batch =
-        AssignmentCandidateBatch::try_new(candidates).map_err(|_| MoodleSyncError::Validation)?;
-    observation
-        .validate_candidates(&batch)
-        .map_err(|_| MoodleSyncError::Validation)?;
-    let observed_at = Utc::now();
-    let candidate_keys: HashSet<_> = batch
-        .as_slice()
-        .iter()
-        .map(|candidate| &candidate.external_key)
-        .collect();
     let mut resolutions = HashMap::new();
-    for event in &events {
-        client
-            .check_sync_records(0)
-            .map_err(|_| MoodleSyncError::Fetch)?;
-        let key = ExternalRecordKey {
-            origin: OriginKind::Moodle,
-            scope: feed.scope().to_owned(),
-            id: event.uid.clone(),
-        };
-        if !candidate_keys.contains(&key) {
-            continue;
-        }
-        let Some(category) = single_course_category(event, feed) else {
-            continue;
-        };
+    let assignments = visit_moodle(client, feed, |assignment_key, course| {
+        let key = course.external_key;
         let course_id = match store
-            .find_moodle_course_id(feed.scope(), category)
+            .find_moodle_course_id(&key.scope, &key.id)
             .map_err(|_| MoodleSyncError::Persistence)?
         {
             Some(id) => id,
             None => {
                 store
-                    .create_course_with_source(
-                        category,
-                        vec![],
-                        OriginKind::Moodle,
-                        feed.scope(),
-                        category,
-                    )
+                    .create_course_with_source(course.name, vec![], key.origin, &key.scope, &key.id)
                     .map_err(|_| MoodleSyncError::Persistence)?
                     .id
             }
         };
-        resolutions.insert(key, MoodleCourseResolution::new(course_id, category));
-    }
-    client
-        .check_sync_records(batch.as_slice().len())
-        .map_err(|_| MoodleSyncError::Validation)?;
+        resolutions.insert(
+            assignment_key,
+            MoodleCourseResolution::new(course_id, key.id),
+        );
+        Ok(())
+    })?;
     store
         .import_assignment_batch_with_observation_and_courses(
-            &batch,
-            &observation,
+            assignments.batch(),
+            assignments.observation(),
             &resolutions,
-            observed_at,
+            assignments.observed_at(),
         )
         .map_err(|_| MoodleSyncError::Persistence)
 }
@@ -190,46 +145,20 @@ pub fn sync_webclass_group_once(
     group_id: &str,
     store: &mut SqliteStore,
 ) -> Result<AssignmentImportSummary, WebClassSyncError> {
-    client
-        .check_sync_group()
-        .map_err(|_| WebClassSyncError::Fetch)?;
-    let raw = client
-        .fetch_contents_json(group_id)
-        .map_err(|error| match error {
-            WebClassHttpError::AuthExpired => WebClassSyncError::AuthExpired,
-            _ => WebClassSyncError::Fetch,
-        })?;
-    let contents = parse_contents(&raw).map_err(|_| WebClassSyncError::Parse)?;
-    client
-        .check_sync_records(contents.len())
-        .map_err(|_| WebClassSyncError::Validation)?;
-    let observation = AssignmentObservation::try_new(
-        SyncScope::WebClassContents(group_id.to_owned()),
-        contents
-            .iter()
-            .map(|content| ExternalRecordKey {
-                origin: OriginKind::WebClass,
-                // Keep the response group so observation validation checks every
-                // record, including those later excluded from assignment mapping.
-                scope: content.group_id.clone(),
-                id: content.contents_id.clone(),
-            })
-            .collect(),
-    )
-    .map_err(|_| WebClassSyncError::Validation)?;
-    let batch = map_contents_for_group(&contents, group_id).map_err(|error| match error {
-        WebClassMapError::InvalidEndDate => WebClassSyncError::Map,
-        WebClassMapError::Validation(_) => WebClassSyncError::Validation,
-    })?;
-    observation
-        .validate_candidates(&batch)
-        .map_err(|_| WebClassSyncError::Validation)?;
-    let observed_at = Utc::now();
-    client
-        .check_sync_records(batch.as_slice().len())
-        .map_err(|_| WebClassSyncError::Validation)?;
+    let assignments = acquire_webclass_group(client, group_id)?;
+    import_webclass_assignments(store, &assignments)
+}
+
+fn import_webclass_assignments(
+    store: &mut SqliteStore,
+    assignments: &AcquiredAssignments,
+) -> Result<AssignmentImportSummary, WebClassSyncError> {
     store
-        .import_assignment_batch_with_observation(&batch, &observation, observed_at)
+        .import_assignment_batch_with_observation(
+            assignments.batch(),
+            assignments.observation(),
+            assignments.observed_at(),
+        )
         .map_err(|_| WebClassSyncError::Persistence)
 }
 
@@ -273,55 +202,45 @@ pub fn sync_webclass_all_once(
     client: &WebClassClient,
     store: &mut SqliteStore,
 ) -> Result<WebClassSyncSummary, WebClassSyncError> {
-    let raw = client.fetch_courses_json().map_err(|error| match error {
-        WebClassHttpError::AuthExpired => WebClassSyncError::AuthExpired,
-        _ => WebClassSyncError::Fetch,
-    })?;
-    let courses = parse_courses(&raw).map_err(|_| WebClassSyncError::Parse)?;
-    client
-        .check_sync_courses(courses.len())
-        .map_err(|_| WebClassSyncError::CourseValidation)?;
-    let observation = WebClassCourseListObservation::try_new(
-        courses
-            .iter()
-            .map(|course| course.group_id.clone())
-            .collect(),
-    )
-    .map_err(|_| WebClassSyncError::CourseValidation)?;
-    let observed_at = Utc::now();
+    let course_list = acquire_webclass_courses(client)?;
     store
-        .record_webclass_course_list_observation(&observation, observed_at)
+        .record_webclass_course_list_observation(&course_list.observation, course_list.observed_at)
         .map_err(|_| WebClassSyncError::CoursePersistence)?;
     let mut summary = WebClassSyncSummary {
-        courses_discovered: courses.len(),
+        courses_discovered: course_list.courses.len(),
         ..Default::default()
     };
-    for course in courses {
-        client
-            .check_sync_courses(0)
-            .map_err(|_| WebClassSyncError::Fetch)?;
-        if store
-            .find_webclass_course_id(&course.group_id)
-            .map_err(|_| WebClassSyncError::CoursePersistence)?
-            .is_none()
-        {
-            store
-                .create_course_with_source(
-                    course.group_name,
-                    vec![],
-                    OriginKind::WebClass,
-                    DEFAULT_COURSE_SOURCE_SCOPE,
-                    &course.group_id,
-                )
-                .map_err(|_| WebClassSyncError::CoursePersistence)?;
-            summary.courses_created += 1;
+    visit_webclass_groups(client, &course_list.courses, |event| {
+        match event {
+            WebClassEvent::Course(course) => {
+                let key = &course.external_key;
+                if store
+                    .find_webclass_course_id(&key.id)
+                    .map_err(|_| WebClassSyncError::CoursePersistence)?
+                    .is_none()
+                {
+                    store
+                        .create_course_with_source(
+                            &course.name,
+                            vec![],
+                            key.origin,
+                            &key.scope,
+                            &key.id,
+                        )
+                        .map_err(|_| WebClassSyncError::CoursePersistence)?;
+                    summary.courses_created += 1;
+                }
+            }
+            WebClassEvent::Assignments(assignments) => {
+                let imported = import_webclass_assignments(store, &assignments)?;
+                summary.groups_synced += 1;
+                summary.assignments_created += imported.created;
+                summary.assignments_updated += imported.updated;
+                summary.assignments_unchanged += imported.unchanged;
+            }
         }
-        let imported = sync_webclass_group_once(client, &course.group_id, store)?;
-        summary.groups_synced += 1;
-        summary.assignments_created += imported.created;
-        summary.assignments_updated += imported.updated;
-        summary.assignments_unchanged += imported.unchanged;
-    }
+        Ok(())
+    })?;
     Ok(summary)
 }
 
@@ -391,17 +310,9 @@ pub fn sync_webclass_all_with_reauth(
     credential_provider: &mut impl WebClassCredentialProvider,
     store: &mut SqliteStore,
 ) -> Result<WebClassSyncSummary, WebClassReauthSyncError> {
-    match sync_webclass_all_once(client, store) {
-        Ok(summary) => return Ok(summary),
-        Err(WebClassSyncError::AuthExpired) => {}
-        Err(category) => return Err(WebClassReauthSyncError::Sync(category)),
-    }
-    let new_client = credential_provider
-        .with_credentials(|credentials| authenticator.login(credentials))
-        .ok_or(WebClassReauthSyncError::CredentialsUnavailable)?
-        .map_err(|_| WebClassReauthSyncError::AuthenticationFailed)?;
-    *client = new_client;
-    sync_webclass_all_once(client, store).map_err(WebClassReauthSyncError::Sync)
+    run_with_webclass_reauth(client, authenticator, credential_provider, |client| {
+        sync_webclass_all_once(client, store)
+    })
 }
 
 #[cfg(test)]

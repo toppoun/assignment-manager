@@ -16,6 +16,9 @@ use crate::domain::{
     Assignment, AssignmentId, CompletionState, CourseId, Deadline, SubmissionTarget,
 };
 
+/// WebClass course identities use the existing single-profile namespace.
+pub const DEFAULT_COURSE_SOURCE_SCOPE: &str = "default";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OriginKind {
     Moodle,

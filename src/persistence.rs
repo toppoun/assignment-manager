@@ -17,13 +17,12 @@ use crate::domain::{
     Assignment, AssignmentId, ClassSlot, CompletionState, Course, CourseId, DayOfWeek, Deadline,
     ScheduleEntry, SubmissionTarget,
 };
+pub use crate::import::DEFAULT_COURSE_SOURCE_SCOPE;
 use crate::import::{AssignmentCandidateBatch, ExternalRecordKey, OriginKind};
 use crate::observation::{AssignmentObservation, SyncScope, WebClassCourseListObservation};
 use crate::query::{AssignmentListItem, CourseListInfo};
 
 const SCHEMA_VERSION: i64 = 3;
-/// WebClass course identities use the existing single-profile namespace.
-pub const DEFAULT_COURSE_SOURCE_SCOPE: &str = "default";
 /// Unscoped historical Moodle/Manual bindings are preserved outside feed namespaces.
 pub const LEGACY_COURSE_SOURCE_SCOPE: &str = "legacy";
 const ID_INSERT_ATTEMPTS: usize = 4;

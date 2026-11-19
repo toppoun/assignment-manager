@@ -2,13 +2,16 @@
 //! Nested in the existing protocol fixture module so no CA/DNS seam is exported.
 use super::*;
 use crate::{
-    domain::CompletionState,
-    import::{ExternalRecordKey, OriginKind},
+    domain::{CompletionState, Deadline},
+    import::{AssignmentCandidate, ExternalRecordKey, OriginKind},
     moodle_http::{MoodleExportKind, MoodleFeed},
     observation::SyncScope,
     persistence::SqliteStore,
     secured_sync::SecuredSyncClients,
-    sync::{self, WebClassCredentialProvider, WebClassReauthSyncError, WebClassSyncError},
+    sync::{
+        self, MoodleSyncError, SourceCourse, WebClassCredentialProvider, WebClassReauthSyncError,
+        WebClassSyncError,
+    },
     university_network::NetworkError,
 };
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -20,6 +23,7 @@ use std::{
     },
 };
 const ICS: &str = include_str!("../fixtures/moodle/calendar_basic.ics");
+const COURSE_ICS: &str = include_str!("../fixtures/moodle/calendar_course_related.ics");
 const COURSE_DATA: &str = include_str!("../fixtures/webclass/courses_basic.json");
 const CONTENT_DATA: &str = include_str!("../fixtures/webclass/contents_basic.json");
 const MOODLE: &str =
@@ -128,18 +132,17 @@ fn full_sync() -> Vec<Exchange> {
     let mut result = vec![course_response()];
     for n in 1..=3 {
         let group = format!("fixture-course-{n:03}");
-        result.push(
-            Exchange::new(
-                "GET",
-                &format!("{CONTENTS}?group_id={group}"),
-                200,
-                &CONTENT_DATA.replace("fixture-course-002", &group),
-            )
-            .json_response()
-            .cookie("wc_test", "synthetic-cookie"),
-        );
+        result.push(contents_response(
+            &group,
+            &CONTENT_DATA.replace("fixture-course-002", &group),
+        ));
     }
     result
+}
+fn contents_response(group: &str, body: &str) -> Exchange {
+    Exchange::new("GET", &format!("{CONTENTS}?group_id={group}"), 200, body)
+        .json_response()
+        .cookie("wc_test", "synthetic-cookie")
 }
 fn start(
     flow: FullFlow,
@@ -215,6 +218,220 @@ fn key(group: &str) -> ExternalRecordKey {
         scope: group.into(),
         id: "fixture-content-001".into(),
     }
+}
+
+fn assert_import_matches(
+    store: &SqliteStore,
+    candidate: &AssignmentCandidate,
+    course: &SourceCourse,
+) {
+    let assignment = store
+        .find_assignment_by_external_key(&candidate.external_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assignment.title, candidate.title);
+    assert_eq!(assignment.deadline, candidate.deadline);
+    assert_eq!(assignment.submission, candidate.submission);
+    assert_eq!(assignment.submission_url, None);
+    assert_eq!(candidate.submission_url, None);
+    let key = &course.external_key;
+    let stored_course = store
+        .find_course_by_source(key.origin, &key.scope, &key.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assignment.course_id.as_ref(), Some(&stored_course.id));
+    assert_eq!(stored_course.name, course.name);
+}
+
+#[test]
+fn acquisition_without_a_store_matches_both_legacy_imports() {
+    let mut f = flow();
+    f.exchanges[2].extend(full_sync());
+    f.exchanges[2].extend(full_sync());
+    let calendar_responses = (0..2)
+        .map(|_| {
+            let mut response = moodle_response(200);
+            response.body = COURSE_ICS.into();
+            response
+        })
+        .collect();
+    let (mut clients, servers, _) = start(f, calendar_responses);
+    clients.begin_run();
+    let feed = feed();
+    let moodle_client = clients.moodle().unwrap();
+    let moodle = sync::acquire_moodle(&moodle_client, &feed).unwrap();
+    let session = clients
+        .authenticator()
+        .login(HoseiCredentials::new(STUDENT, PASSWORD))
+        .unwrap();
+    let webclass = sync::acquire_webclass_once(&session);
+    assert_eq!(webclass.result, Ok(()));
+
+    let moodle_candidates = moodle.assignments.batch().as_slice();
+    assert_eq!(moodle_candidates.len(), 2);
+    assert_eq!(moodle.assignments.observation().keys().len(), 3);
+    let first = &moodle_candidates[0];
+    assert_eq!(first.external_key.origin, OriginKind::Moodle);
+    assert_eq!(first.external_key.scope, feed.scope());
+    assert_eq!(first.external_key.id, "synthetic-db-end@example.invalid");
+    assert_eq!(first.title, "Synthetic database quiz");
+    assert_eq!(
+        first.deadline,
+        Some(Deadline::DateTime("2026-10-05T00:00:00Z".parse().unwrap()))
+    );
+    let course = moodle.course_for(&first.external_key).unwrap();
+    assert_eq!(course.external_key.origin, OriginKind::Moodle);
+    assert_eq!(course.external_key.scope, feed.scope());
+    assert_eq!(course.external_key.id, "2026-DB");
+
+    let courses = &webclass.course_list.as_ref().unwrap().courses;
+    assert_eq!(courses.len(), 3);
+    assert_eq!(webclass.groups.len(), courses.len());
+    assert_eq!(courses[0].external_key.scope, "default");
+    assert_eq!(courses[0].external_key.id, "fixture-course-001");
+    let first = &webclass.groups[0].batch().as_slice()[0];
+    assert_eq!(first.external_key, key("fixture-course-001"));
+    assert_eq!(first.title, "演習課題A");
+    assert_eq!(
+        first.deadline,
+        Some(Deadline::DateTime("2026-10-31T14:59:59Z".parse().unwrap()))
+    );
+    let keys: std::collections::HashSet<_> = webclass
+        .groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .batch()
+                .as_slice()
+                .iter()
+                .map(|item| &item.external_key)
+        })
+        .collect();
+    assert_eq!(keys.len(), 9); // The same three contents IDs occur in each group.
+
+    let output = format!("{moodle:?} {webclass:?}");
+    for marker in SECRETS.iter().copied().chain([
+        "synthetic-secret",
+        "synthetic-cookie",
+        "fixture-author-001",
+        "synthetic-db-end@example.invalid",
+        "fixture-course-001",
+        "Synthetic database quiz",
+        "演習課題A",
+    ]) {
+        assert!(!output.contains(marker));
+    }
+
+    // The independent fetches above complete before SQLite is opened.
+    let mut store = SqliteStore::open(":memory:").unwrap();
+    let moodle_summary = sync::sync_moodle_once(&moodle_client, &feed, &mut store).unwrap();
+    assert_eq!(moodle_summary.created, moodle_candidates.len());
+    for candidate in moodle_candidates {
+        assert_import_matches(
+            &store,
+            candidate,
+            moodle.course_for(&candidate.external_key).unwrap(),
+        );
+    }
+    let webclass_summary = sync::sync_webclass_all_once(&session, &mut store).unwrap();
+    assert_eq!(webclass_summary.assignments_created, keys.len());
+    for (course, group) in courses.iter().zip(webclass.groups) {
+        assert_eq!(
+            group.observation().scope(),
+            &SyncScope::WebClassContents(course.external_key.id.clone())
+        );
+        for candidate in group.batch().as_slice() {
+            assert_import_matches(&store, candidate, course);
+        }
+    }
+    finish_all(servers);
+}
+
+#[test]
+fn acquisition_validates_filtered_records_and_accepts_empty_batches() {
+    let mut empty_calendar = moodle_response(200);
+    empty_calendar.body = include_str!("../fixtures/moodle/calendar_empty.ics").into();
+    let mut duplicate_calendar = moodle_response(200);
+    duplicate_calendar.body = COURSE_ICS.replace(
+        "UID:synthetic-ai-start@example.invalid",
+        "UID:synthetic-db-end@example.invalid",
+    );
+
+    const GROUP: &str = "fixture-course-001";
+    let mut records: Vec<serde_json::Value> = serde_json::from_str(CONTENT_DATA).unwrap();
+    let mut hidden = records.remove(0);
+    hidden["hidden_content"] = true.into();
+    hidden["group_id"] = GROUP.into();
+    let hidden_only = serde_json::json!([hidden]).to_string();
+    let duplicate = serde_json::json!([hidden, hidden]).to_string();
+    let mut wrong_group = hidden.clone();
+    wrong_group["group_id"] = "fixture-course-002".into();
+    hidden["end_date"] = "malformed-private-date".into();
+    let mut f = flow();
+    f.exchanges[2].extend([
+        contents_response(GROUP, &hidden_only),
+        contents_response(GROUP, &duplicate),
+        contents_response(GROUP, &serde_json::json!([wrong_group]).to_string()),
+        contents_response(GROUP, &serde_json::json!([hidden]).to_string()),
+    ]);
+    let (mut clients, servers, _) = start(f, vec![empty_calendar, duplicate_calendar]);
+    clients.begin_run();
+
+    let moodle_client = clients.moodle().unwrap();
+    let empty = sync::acquire_moodle(&moodle_client, &feed()).unwrap();
+    assert!(empty.assignments.batch().as_slice().is_empty());
+    assert!(empty.assignments.observation().keys().is_empty());
+    assert_eq!(
+        sync::acquire_moodle(&moodle_client, &feed()).unwrap_err(),
+        MoodleSyncError::Validation
+    );
+
+    let session = clients
+        .authenticator()
+        .login(HoseiCredentials::new(STUDENT, PASSWORD))
+        .unwrap();
+    let empty = sync::acquire_webclass_group(&session, GROUP).unwrap();
+    assert!(empty.batch().as_slice().is_empty());
+    assert_eq!(empty.observation().keys(), &[key(GROUP)]);
+    for expected in [
+        WebClassSyncError::Validation,
+        WebClassSyncError::Validation,
+        WebClassSyncError::Map,
+    ] {
+        let error = sync::acquire_webclass_group(&session, GROUP).unwrap_err();
+        assert_eq!(error, expected);
+        assert!(error.source().is_none());
+        assert!(!format!("{error:?} {error}").contains("malformed-private-date"));
+    }
+    finish_all(servers);
+}
+
+#[test]
+fn acquisition_reports_a_partial_failure_with_validated_groups() {
+    let mut f = flow();
+    let mut exchanges = full_sync();
+    exchanges.truncate(3);
+    exchanges[2].status = 503;
+    exchanges[2].body = "synthetic-private-body".into();
+    f.exchanges[2].extend(exchanges);
+    let (mut clients, servers, _) = start(f, vec![]);
+    clients.begin_run();
+    let session = clients
+        .authenticator()
+        .login(HoseiCredentials::new(STUDENT, PASSWORD))
+        .unwrap();
+
+    let report = sync::acquire_webclass_once(&session);
+    assert_eq!(report.result, Err(WebClassSyncError::Fetch));
+    let output = format!("{report:?}");
+    assert!(!output.contains("synthetic-private-body"));
+    assert_eq!(report.course_list.unwrap().courses.len(), 3);
+    assert_eq!(report.groups.len(), 1);
+    assert_eq!(
+        report.groups[0].batch().as_slice()[0].external_key,
+        key("fixture-course-001")
+    );
+    finish_all(servers);
 }
 
 #[test]
@@ -376,28 +593,78 @@ fn secured_session_reuse_budget_reset_duplicates_completion_and_positive_observa
     finish_all(servers);
 }
 
+fn flow_with_expiry_and_retry(second_expiry: bool) -> FullFlow {
+    let mut f = flow();
+    let mut first = full_sync();
+    first.truncate(3);
+    first[2] = Exchange::redirect(
+        "GET",
+        &format!("{CONTENTS}?group_id=fixture-course-002"),
+        "/webclass/login.php",
+    );
+    f.exchanges[2].extend(first);
+    let retry_login = flow();
+    for (target, more) in f.exchanges.iter_mut().zip(retry_login.exchanges) {
+        target.extend(more);
+    }
+    if second_expiry {
+        f.exchanges[2].push(Exchange::redirect("GET", COURSES, "/webclass/login.php"));
+    } else {
+        f.exchanges[2].extend(full_sync());
+    }
+    f
+}
+
+#[test]
+fn acquisition_retains_both_attempts_and_reauthenticates_only_once() {
+    for second_expiry in [false, true] {
+        let (mut clients, servers, _) = start(flow_with_expiry_and_retry(second_expiry), vec![]);
+        clients.begin_run();
+        let authenticator = clients.authenticator();
+        let mut session = authenticator
+            .login(HoseiCredentials::new(STUDENT, PASSWORD))
+            .unwrap();
+        let mut provider = Provider(0);
+        let report =
+            sync::acquire_webclass_with_reauth(&mut session, &authenticator, &mut provider);
+        assert_eq!(provider.0, 1);
+        assert!(clients.owns_session(&session));
+        assert_eq!(report.attempts.len(), 2);
+        let first = &report.attempts[0];
+        assert_eq!(first.result, Err(WebClassSyncError::AuthExpired));
+        assert_eq!(first.groups.len(), 1);
+        assert_eq!(
+            first.groups[0].batch().as_slice()[0].external_key,
+            key("fixture-course-001")
+        );
+        let retry = &report.attempts[1];
+        if second_expiry {
+            assert_eq!(
+                report.result,
+                Err(WebClassReauthSyncError::Sync(
+                    WebClassSyncError::AuthExpired
+                ))
+            );
+            assert_eq!(retry.result, Err(WebClassSyncError::AuthExpired));
+            assert!(retry.course_list.is_none());
+            assert!(retry.groups.is_empty());
+        } else {
+            assert_eq!(report.result, Ok(()));
+            assert_eq!(retry.result, Ok(()));
+            assert_eq!(retry.groups.len(), 3);
+            assert_eq!(
+                first.groups[0].batch().as_slice(),
+                retry.groups[0].batch().as_slice()
+            );
+        }
+        finish_all(servers);
+    }
+}
+
 #[test]
 fn secured_partial_commit_and_auth_expired_retry_once_keeps_policy_and_cookie_partition() {
     for second_expiry in [false, true] {
-        let mut f = flow();
-        let mut first = full_sync();
-        first.truncate(3);
-        first[2] = Exchange::redirect(
-            "GET",
-            &format!("{CONTENTS}?group_id=fixture-course-002"),
-            "/webclass/login.php",
-        );
-        f.exchanges[2].extend(first);
-        let retry_login = flow();
-        for (target, more) in f.exchanges.iter_mut().zip(retry_login.exchanges) {
-            target.extend(more);
-        }
-        if second_expiry {
-            f.exchanges[2].push(Exchange::redirect("GET", COURSES, "/webclass/login.php"));
-        } else {
-            f.exchanges[2].extend(full_sync());
-        }
-        let (mut clients, servers, _) = start(f, vec![]);
+        let (mut clients, servers, _) = start(flow_with_expiry_and_retry(second_expiry), vec![]);
         clients.begin_run();
         let mut store = SqliteStore::open(":memory:").unwrap();
         let mut session = clients
