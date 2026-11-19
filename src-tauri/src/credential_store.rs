@@ -1,10 +1,13 @@
 //! The only OS credential boundary. No network clients, SQL, or public secret DTOs.
+#[cfg(test)]
 use std::collections::HashMap;
 
 use assignment_manager_application::credentials::{
     CredentialStore, SecretText, WebClassCredentials, validate_moodle,
 };
-use keyring_core::{Entry, Error as BackendError, api::CredentialStoreApi};
+#[cfg(target_os = "macos")]
+use keyring_core::api::CredentialStoreApi;
+use keyring_core::{Entry, Error as BackendError};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use zeroize::Zeroizing;
 
@@ -133,24 +136,21 @@ impl OsCredentialStore {
     /// Called on the dedicated settings worker, with a fixed app-owned service.
     pub fn new(service: &str) -> Result<Self, ApplicationError> {
         #[cfg(windows)]
-        let store = windows_native_keyring_store::Store::new();
-        #[cfg(target_os = "macos")]
-        let store = apple_native_keyring_store::keychain::Store::new();
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let store: keyring_core::Result<std::sync::Arc<keyring_core::CredentialStore>> =
-            Err(BackendError::NoDefaultStore);
-        let store = store.map_err(|_| ApplicationError::CredentialUnavailable)?;
-        // Windows Local persistence survives restart without credential roaming.
-        let modifiers = if cfg!(windows) {
-            HashMap::from([("persistence", "Local")])
-        } else {
-            HashMap::new()
-        };
         let build = |account| {
-            store
-                .build(service, account, Some(&modifiers))
+            assignment_manager::windows_credentials::local_entry(service, account)
                 .map_err(|_| ApplicationError::CredentialUnavailable)
         };
+        #[cfg(target_os = "macos")]
+        let store = apple_native_keyring_store::keychain::Store::new()
+            .map_err(|_| ApplicationError::CredentialUnavailable)?;
+        #[cfg(target_os = "macos")]
+        let build = |account| {
+            store
+                .build(service, account, None)
+                .map_err(|_| ApplicationError::CredentialUnavailable)
+        };
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let build = |_| Err(ApplicationError::CredentialUnavailable);
         Ok(Self {
             backend: NativeBackend {
                 moodle: build("moodle-feed-v1")?,

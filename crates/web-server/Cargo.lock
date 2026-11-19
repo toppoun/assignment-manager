@@ -68,13 +68,18 @@ dependencies = [
  "aws-lc-rs",
  "chrono",
  "ical",
+ "keyring-core",
  "reqwest",
+ "rpassword",
  "rusqlite",
  "rustls",
  "scraper",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "windows-native-keyring-store",
+ "zeroize",
 ]
 
 [[package]]

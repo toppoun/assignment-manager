@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{domain::Deadline, import::ExternalRecordKey};
+use serde::Deserialize;
 
 use super::{SyncAssignment, SyncInput, SyncKey, UniversitySource};
 
@@ -29,9 +30,17 @@ pub enum NotionSnapshot<'a> {
 }
 
 /// An explicit binding for an exact course key. Names are never matched.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CourseMapping {
     pub course_key: ExternalRecordKey,
     pub page_id: String,
+}
+
+impl CourseMapping {
+    pub fn has_valid_page_id(&self) -> bool {
+        super::wire::uuid(&self.page_id).is_some()
+    }
 }
 
 /// Only properties this phase can change. Omitted fields keep their values.
@@ -66,6 +75,7 @@ pub enum ConflictReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredReason {
     IncompleteSnapshot,
+    PendingReconciliation,
     /// Only an earlier WebClass attempt produced this candidate.
     EarlierAttempt,
     /// The run has no current candidate. Includes failed, skipped, filtered and absent records.

@@ -2,6 +2,7 @@
 name = "assignment-manager"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 
 [features]
 # Fixed loopback-only university fixture for explicit offline tests/examples.
@@ -16,9 +17,16 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 scraper = { version = "0.27", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["net", "time"] }
 
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring-core = "1"
+rpassword = "7.5.4"
+windows-native-keyring-store = { version = "1", default-features = false }
+zeroize = "1"
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

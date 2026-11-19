@@ -24,9 +24,6 @@ tempfile = "3"
 zeroize = "1"
 tauri = { version = "2", features = [] }
 
-[target.'cfg(windows)'.dependencies]
-windows-native-keyring-store = { version = "1", default-features = false }
-
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 

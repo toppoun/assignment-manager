@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat};
 use reqwest::Method;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::domain::Deadline;
@@ -10,7 +11,8 @@ use super::{
     NotionAssignment, NotionError, PlanAction, PlannedAssignment, SyncKey, UniversitySource,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// Property IDs returned by the API for the preconfigured assignment schema.
 /// Renaming a column does not change these IDs.
 pub struct NotionPropertyIds {
@@ -28,6 +30,8 @@ pub struct NotionPropertyIds {
     pub source: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotionTarget {
     pub assignments_data_source_id: String,
     pub courses_data_source_id: String,
@@ -108,6 +112,11 @@ impl NotionPropertyIds {
 }
 
 impl NotionTarget {
+    /// Canonical assignment data source ID after checking local configuration.
+    pub fn validated_id(&self) -> Result<String, NotionError> {
+        self.ids().map(|(assignments, _)| assignments)
+    }
+
     pub(super) fn ids(&self) -> Result<(String, String), NotionError> {
         let mut seen = HashSet::new();
         if self.properties.title != "title"

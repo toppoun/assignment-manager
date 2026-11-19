@@ -136,7 +136,7 @@ fn mock(script: Vec<Exchange>) -> (NotionClient, JoinHandle<()>) {
 fn mock_with_timeout(script: Vec<Exchange>, timeout: Duration) -> (NotionClient, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let client = NotionClient::for_mock(listener.local_addr().unwrap(), TOKEN, timeout);
+    let client = NotionClient::for_mock(listener.local_addr().unwrap(), TOKEN, timeout).unwrap();
     let server = thread::spawn(move || {
         for exchange in script {
             let start = Instant::now();

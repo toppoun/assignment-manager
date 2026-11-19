@@ -1,18 +1,20 @@
 use std::{collections::HashSet, fmt};
 
 use reqwest::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    CourseMapping, NotionAssignment, NotionClient, NotionError, NotionSnapshot, NotionTarget,
-    PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, plan_sync,
+    CourseMapping, DeferredReason, NotionAssignment, NotionClient, NotionError, NotionSnapshot,
+    NotionTarget, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, plan_sync,
     wire::{Schema, checked_page_id, relation_id, uuid},
 };
 
 const MAX_LIST_PAGES: usize = 200;
 const MAX_LIST_ITEMS: usize = 10_000;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DryRunCounts {
     pub create: usize,
     pub update: usize,
@@ -36,6 +38,19 @@ impl DryRunReport {
     }
     pub fn error(&self) -> Option<NotionError> {
         self.error
+    }
+
+    /// Preserve prior creation intent and known pages that are missing from this
+    /// snapshot. The local state is only consulted and request previews stay
+    /// consistent with the filtered plan.
+    pub fn defer_creates(&mut self, blocked: &HashSet<SyncKey>) {
+        for row in &mut self.plan {
+            if matches!(row.action, PlanAction::Create { .. }) && blocked.contains(&row.key) {
+                row.action = PlanAction::Deferred(DeferredReason::PendingReconciliation);
+            }
+        }
+        self.requests
+            .retain(|request| request.method() != Method::POST || !blocked.contains(request.key()));
     }
 
     pub fn counts(&self) -> DryRunCounts {

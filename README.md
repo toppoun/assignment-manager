@@ -1,5 +1,53 @@
 # Assignment Manager
 
+## Notion単発CLI（Phase 3A）
+
+Windows向けの単発CLIです。合成dry-runでは、固定ループバックの大学HTTPS fixtureから
+MoodleとWebClassを取得し、Notion HTTPモックを読み取って差分の件数を表示します。
+
+```powershell
+cargo run --locked --offline --features synthetic-https-fixture -- sync --dry-run --fixture
+cargo run --locked --offline --features synthetic-https-fixture -- status --fixture
+```
+
+`init-state --fixture` で合成用の状態DBを明示的に初期化できます。dry-runはDBを
+読み取り専用で使い、未初期化なら作りません。前回結果として、時刻・取得元別の結果・
+差分件数・固定エラー分類だけを `last-dry-run.json` に記録します。
+同時実行はOSファイルロックで拒否します。強制終了後は同じロックファイルを再利用できます。
+
+ローカル設定は `%LOCALAPPDATA%\AssignmentManagerNotion\config.json` に置くか、
+コマンドの前に `--config PATH` を指定します。次は架空のIDを使った設定例です。
+プロパティには表示名と区別してAPIのIDを指定します。
+
+```json
+{
+  "notion": {
+    "assignments_data_source_id": "00000000-0000-4000-8000-000000000001",
+    "courses_data_source_id": "00000000-0000-4000-8000-000000000002",
+    "properties": {
+      "title": "title", "deadline": "due", "course": "course",
+      "submission_url": "url", "sync_key": "sync", "source": "source"
+    }
+  },
+  "moodle": {
+    "host": "moodle.example.invalid",
+    "path": "/calendar/export",
+    "scope": "default.course-related"
+  },
+  "webclass": true
+}
+```
+
+`doctor` は設定、Windows Credential Managerの登録状態、専用DBをローカルで診断します。
+`credentials set moodle`、`credentials set webclass`、`credentials set notion` は
+対話端末の非表示入力で登録します。設定ファイルには秘密情報を入れません。
+`init-state` と `status` が使う状態DBは `targets/<data-source-id>/state.sqlite3` にあり、
+既存アプリのSQLite v3と分離しています。通常の `sync --dry-run` はローカル設定と
+資格情報の検査で止まります。実大学・実Notionへの接続はPhase 3Aでは無効です。
+
+終了コードは成功 `0`、実行失敗 `1`、設定・資格情報などの不足 `2`、
+部分成功または確認待ち `3`、多重実行 `4` です。
+
 Rust core、Phase 9のshared application layer、Windows向けTauri 2 desktop shell、
 Phase 10C2のmacOS native SwiftUI application shell / Settings / Swift Keychain / Syncです。
 

@@ -12,5 +12,7 @@ pub mod university_network;
 pub mod webclass;
 pub mod webclass_auth;
 pub mod webclass_http;
+#[cfg(windows)]
+pub mod windows_credentials;
 
 pub mod secured_sync;

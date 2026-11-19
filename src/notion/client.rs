@@ -112,9 +112,15 @@ impl NotionClient {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn for_mock(address: std::net::SocketAddr, token: &str, timeout: Duration) -> Self {
-        assert!(address.ip().is_loopback());
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    pub(super) fn for_mock(
+        address: std::net::SocketAddr,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<Self, NotionError> {
+        if !address.ip().is_loopback() {
+            return Err(NotionError::Configuration);
+        }
         Self::build(
             &format!("http://{address}"),
             token,
@@ -122,7 +128,6 @@ impl NotionClient {
             timeout,
             Duration::ZERO,
         )
-        .unwrap()
     }
 
     pub(super) fn request(

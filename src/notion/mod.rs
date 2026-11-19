@@ -1,12 +1,15 @@
 //! Notion synchronization preparation, planning, and read-only dry runs.
 
 mod client;
+#[cfg(feature = "synthetic-https-fixture")]
+pub mod fixture;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
 mod mock_apply;
 mod plan;
 mod reader;
+pub mod state;
 #[cfg(test)]
 mod tests;
 mod wire;
