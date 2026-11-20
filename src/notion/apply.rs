@@ -6,6 +6,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+#[cfg(test)]
+use super::http_tests::trial_tests::recovery_tests::pause_create_at;
 use super::{
     AssignmentPatch, CourseMapping, DryRunCounts, DryRunReport, NotionAssignment, NotionClient,
     NotionError, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, TrialAssignment,
@@ -349,6 +351,8 @@ impl NotionClient {
         if !store.reserve_create(key)? {
             return Ok(WriteOutcome::Deferred(None));
         }
+        #[cfg(test)]
+        pause_create_at("intent_saved");
         match self.send_write(request, access) {
             Ok(page) => {
                 let id =
@@ -357,6 +361,8 @@ impl NotionClient {
                         .filter(|_| schema.page_key(&page).ok().flatten().as_ref() == Some(key));
                 if let Some(id) = id {
                     if !store.is_owned_by_another_key(&id, key)? {
+                        #[cfg(test)]
+                        pause_create_at("response_received");
                         store.confirm(key, &id)?;
                         return Ok(WriteOutcome::Applied);
                     }

@@ -4,6 +4,8 @@ use crate::notion::{
     trial::PRODUCTION_DATA_SOURCES,
 };
 
+pub(in crate::notion) mod recovery_tests;
+
 const READ_BOT: &str = "00000000-0000-4000-8000-000000000011";
 const WRITE_BOT: &str = "00000000-0000-4000-8000-000000000012";
 
@@ -144,6 +146,36 @@ fn a_trial_with_a_changed_snapshot_after_approval_holds_the_write() {
         Err(ApplyError::PlanChanged)
     );
     assert_eq!(std::fs::read(path).unwrap(), before);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_trial_with_an_incomplete_snapshot_after_approval_holds_the_write() {
+    let target = trial();
+    let assignment = assignment();
+    let (input, _) = assignment.input().unwrap();
+    let key = input.assignments().first_key_value().unwrap().0;
+    let dir = directory();
+    let path = dir.path().join("state.sqlite3");
+    let before = std::fs::read(&path).unwrap();
+    let old = task(PAGE_A, Some(key), "Old title");
+    let mut script = vec![bot(WRITE_BOT)];
+    script.extend(snapshot(vec![old.clone()]));
+    script.extend(schema_exchanges(trial_schema()));
+    script.push(query(vec![old], Some("next")));
+    script.push(
+        Exchange::error("POST", format!("/v1/data_sources/{A}/query"), 403, "")
+            .check(|_, body| assert_eq!(body["start_cursor"], "next")),
+    );
+    let (client, server) = mock(script);
+    assert_eq!(
+        client.apply_trial(&target, &assignment, dir.path(), |preview| {
+            assert_eq!(preview.summary().counts.update, 1);
+            true
+        }),
+        Err(ApplyError::Notion(NotionError::Forbidden))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
     server.join().unwrap();
 }
 

@@ -1,15 +1,11 @@
-use std::{
-    path::Path,
-    process::{Command, Stdio},
-    sync::mpsc,
-};
+use std::path::Path;
 
 use rusqlite::Connection;
 
 use super::*;
 use crate::notion::{
     apply::{ApplyError, ApplyReport},
-    state::{BindingStatus, StateError, StateStore, TargetLock},
+    state::{StateError, StateStore, TargetLock},
 };
 
 fn exact(expected: SyncKey, rows: Vec<Value>) -> Exchange {
@@ -255,159 +251,8 @@ fn http_apply_reports_manual_candidates_and_rechecks_the_key_before_post() {
 }
 
 #[test]
-fn http_apply_recovers_lost_create_response_without_resending() {
-    let key = key("a");
-    let dir = apply_state();
-    let input = input(vec![candidate("a", "Task")]);
-    let db = dir.path().join("state.sqlite3");
-    let reserved = key.clone();
-    let mut script = apply_exchanges(vec![]);
-    script.push(exact(key.clone(), vec![]));
-    script.push(
-        Exchange::drop_response("POST", "/v1/pages").check(move |_, _| {
-            let state = StateStore::read(&db, A).unwrap().unwrap();
-            assert_eq!(
-                state.bindings[&reserved].status,
-                BindingStatus::CreateIntent
-            );
-        }),
-    );
-    script.extend(apply_exchanges(vec![]));
-    script.extend(apply_exchanges(vec![
-        task(PAGE_A, Some(&key), "Task"),
-        task(PAGE_B, Some(&key), "Duplicate"),
-    ]));
-    script.extend(apply_exchanges(vec![task(PAGE_A, Some(&key), "Task")]));
-    let (client, server) = mock(script);
-    let report = apply(&client, &input, &[], &dir);
-    assert_eq!(report.pending, 1);
-    assert_eq!(report.counts.deferred, 1);
-    assert_eq!(report.error, Some(NotionError::Transport));
-    assert_eq!(apply(&client, &input, &[], &dir).counts.deferred, 1);
-    let conflict = apply(&client, &input, &[], &dir);
-    assert_eq!(conflict.counts.conflict, 1);
-    assert_eq!(conflict.pending, 1);
-    let recovered = apply(&client, &input, &[], &dir);
-    assert_eq!(recovered.recovered, 1);
-    assert_eq!(recovered.pending, 0);
-    assert_eq!(recovered.counts.unchanged, 1);
-    server.join().unwrap();
-}
-
-#[test]
-fn http_apply_recovers_after_post_succeeds_but_sqlite_cannot_confirm() {
-    let key = key("a");
-    let dir = apply_state();
-    let conn = Connection::open(dir.path().join("state.sqlite3")).unwrap();
-    conn.execute_batch(
-        "CREATE TRIGGER test_confirm_failure BEFORE UPDATE ON bindings WHEN NEW.status='linked'
-         BEGIN SELECT RAISE(FAIL, 'synthetic database failure'); END;",
-    )
-    .unwrap();
-    let input = input(vec![candidate("a", "Task")]);
-    let existing = task(PAGE_A, Some(&key), "Task");
-    let mut script = apply_exchanges(vec![]);
-    script.push(exact(key.clone(), vec![]));
-    script.push(Exchange::json("POST", "/v1/pages", existing.clone()));
-    script.extend(apply_exchanges(vec![existing]));
-    let (client, server) = mock(script);
-    assert_eq!(
-        client.apply(&input, &target(), &[], dir.path()),
-        Err(ApplyError::State(StateError::Database))
-    );
-    assert_eq!(
-        open_state(dir.path())
-            .binding(&key)
-            .unwrap()
-            .unwrap()
-            .status,
-        BindingStatus::CreateIntent
-    );
-    conn.execute_batch("DROP TRIGGER test_confirm_failure")
-        .unwrap();
-    let recovered = apply(&client, &input, &[], &dir);
-    assert_eq!(recovered.recovered, 1);
-    assert_eq!(recovered.counts.unchanged, 1);
-    server.join().unwrap();
-}
-
-#[test]
-fn http_apply_child_when_requested() {
-    let Some(dir) = std::env::var_os("AM_TEST_NOTION_APPLY_DIR") else {
-        return;
-    };
-    let address = std::env::var("AM_TEST_NOTION_APPLY_ADDRESS")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let client = NotionClient::for_mock(address, TOKEN, Duration::from_secs(15)).unwrap();
-    client
-        .apply(
-            &input(vec![candidate("a", "Task")]),
-            &target(),
-            &[],
-            Path::new(&dir),
-        )
-        .unwrap();
-}
-
-#[test]
-fn http_apply_recovers_from_process_killed_after_post_was_received() {
-    let key = key("a");
-    let dir = apply_state();
-    let (received, arrived) = mpsc::channel();
-    let (finish, hold) = mpsc::channel();
-    let mut script = apply_exchanges(vec![]);
-    script.push(exact(key.clone(), vec![]));
-    script.push(
-        Exchange::drop_response("POST", "/v1/pages").check(move |_, _| {
-            received.send(()).unwrap();
-            hold.recv_timeout(Duration::from_secs(5)).unwrap();
-        }),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (client, server) = serve(listener, script, Duration::from_secs(2));
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "notion::http_tests::apply_tests::http_apply_child_when_requested",
-        ])
-        .env("AM_TEST_NOTION_APPLY_DIR", dir.path())
-        .env("AM_TEST_NOTION_APPLY_ADDRESS", address.to_string())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let arrival = arrived.recv_timeout(Duration::from_secs(5));
-    if arrival.is_ok() {
-        assert_eq!(
-            client.apply(&SyncInput::default(), &target(), &[], dir.path()),
-            Err(ApplyError::State(StateError::Busy))
-        );
-    }
-    let _ = child.kill();
-    let status = child.wait().unwrap();
-    arrival.unwrap();
-    assert!(!status.success());
-    finish.send(()).unwrap();
-    server.join().unwrap();
-    assert_eq!(
-        open_state(dir.path())
-            .binding(&key)
-            .unwrap()
-            .unwrap()
-            .status,
-        BindingStatus::CreateIntent
-    );
-    let (client, server) = mock(apply_exchanges(vec![task(PAGE_A, Some(&key), "Task")]));
-    let recovered = apply(&client, &input(vec![candidate("a", "Task")]), &[], &dir);
-    assert_eq!(recovered.recovered, 1);
-    assert_eq!(recovered.counts.unchanged, 1);
-    server.join().unwrap();
-}
-
-#[test]
 fn http_apply_defers_deleted_moved_trashed_rekeyed_and_manually_edited_pages() {
+    let changed_key = key("changed-key");
     let key = key("a");
     let dir = apply_state();
     let input = input(vec![candidate("a", "New")]);
@@ -424,6 +269,8 @@ fn http_apply_defers_deleted_moved_trashed_rekeyed_and_manually_edited_pages() {
     formatted["properties"]["タイトル（改名済）"]["title"][0]["annotations"]["bold"] = json!(true);
     let mut relinked = prior.clone();
     relinked["properties"]["授業"]["relation"] = json!([{"id":OLD_COURSE}]);
+    let mut rescheduled = prior.clone();
+    rescheduled["properties"]["期限"]["date"] = json!({"start":"2026-12-20"});
     let mut script = Vec::new();
     let cases = [
         Exchange::error("GET", format!("/v1/pages/{PAGE_A}"), 404, ""),
@@ -433,7 +280,9 @@ fn http_apply_defers_deleted_moved_trashed_rekeyed_and_manually_edited_pages() {
         get_task(revised),
         get_task(formatted),
         get_task(relinked),
+        get_task(rescheduled),
         get_task(task(PAGE_A, None, "Old")),
+        get_task(task(PAGE_A, Some(&changed_key), "Old")),
         get_task(task(PAGE_A, Some(&key), "Manual edit")),
     ];
     let count = cases.len();
@@ -456,30 +305,58 @@ fn http_apply_defers_deleted_moved_trashed_rekeyed_and_manually_edited_pages() {
 fn http_apply_checks_ambiguous_patch_by_reading_intended_changes_once() {
     let sync_key = key("a");
     let dir = apply_state();
-    let input = input(vec![candidate("a", "New")]);
-    let old = task(PAGE_A, Some(&sync_key), "Old");
-    let new = task(PAGE_A, Some(&sync_key), "New");
+    let mut changed = candidate("a", "New");
+    changed.deadline = Some(Deadline::DateOnly("2026-12-20".parse().unwrap()));
+    let (input, course_key) = input_with_course(vec![changed]);
+    let mappings = [CourseMapping {
+        course_key,
+        page_id: COURSE.into(),
+    }];
+    let mut old = task(PAGE_A, Some(&sync_key), "Old");
+    old["properties"]["授業"]["relation"] = json!([{"id":OLD_COURSE}]);
+    old["children"] = json!([{"type":"paragraph","content":"private body"}]);
+    let mut only_title = old.clone();
+    only_title["properties"]["タイトル（改名済）"]["title"] = json!([text("New")]);
+    let mut new = only_title.clone();
+    new["properties"]["期限"]["date"] = json!({"start":"2026-12-20"});
+    let rows = || vec![old.clone(), task(MANUAL, None, "Manual task")];
     let path = format!("/v1/pages/{PAGE_A}");
-    let mut script = apply_exchanges(vec![old.clone()]);
-    script.push(get_task(old.clone()));
-    script.push(Exchange::drop_response("PATCH", &path));
-    script.push(get_task(new));
-    script.extend(apply_exchanges(vec![old.clone()]));
-    script.push(get_task(old.clone()));
-    script.push(Exchange::error("PATCH", &path, 503, ""));
-    script.push(get_task(task(PAGE_A, Some(&sync_key), "Manual")));
-    for status in [401, 403, 404, 409, 429] {
-        script.extend(apply_exchanges(vec![old.clone()]));
+    let check_patch = |_: &str, body: &Value| {
+        assert_eq!(
+            body,
+            &json!({
+                "properties":{
+                    "title":{"title":[text("New")]},
+                    "due":{"date":{"start":"2026-12-20"}}
+                }
+            })
+        );
+    };
+    let mut script = Vec::new();
+    for (patch, actual) in [
+        (Exchange::drop_response("PATCH", &path), new.clone()),
+        (Exchange::error("PATCH", &path, 503, ""), new),
+        (Exchange::error("PATCH", &path, 503, ""), only_title),
+    ] {
+        script.extend(apply_exchanges(rows()));
         script.push(get_task(old.clone()));
-        script.push(Exchange::error(
-            "PATCH",
-            &path,
-            status,
-            "Retry-After: 0\r\n",
-        ));
+        script.push(patch.check(check_patch));
+        script.push(get_task(actual));
+    }
+    for status in [401, 403, 404, 409, 429] {
+        script.extend(apply_exchanges(rows()));
+        script.push(get_task(old.clone()));
+        script
+            .push(Exchange::error("PATCH", &path, status, "Retry-After: 0\r\n").check(check_patch));
     }
     let (client, server) = mock(script);
-    assert_eq!(apply(&client, &input, &[], &dir).counts.update, 1);
+    for _ in 0..2 {
+        let report = apply(&client, &input, &mappings, &dir);
+        assert_eq!(report.counts.update, 1);
+        assert_eq!(report.counts.course_relation_mismatch, 1);
+        assert_eq!(report.counts.deferred, 0);
+        assert_eq!(report.error, None);
+    }
     for expected in [
         NotionError::Server(503),
         NotionError::Authentication,
@@ -488,11 +365,19 @@ fn http_apply_checks_ambiguous_patch_by_reading_intended_changes_once() {
         NotionError::Conflict,
         NotionError::RateLimited,
     ] {
-        let report = apply(&client, &input, &[], &dir);
+        let report = apply(&client, &input, &mappings, &dir);
         assert_eq!(report.counts.deferred, 1);
+        assert_eq!(report.counts.update, 0);
+        assert_eq!(report.counts.course_relation_mismatch, 1);
         assert_eq!(report.error, Some(expected));
         assert_eq!(report.pending, 0);
+        assert!(!format!("{report:?}").contains(TOKEN));
     }
+    let state = StateStore::read(&dir.path().join("state.sqlite3"), A)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.bindings.len(), 1);
+    assert_eq!(state.bindings[&sync_key].page_id.as_deref(), Some(PAGE_A));
     server.join().unwrap();
 }
 
@@ -538,27 +423,158 @@ fn http_apply_does_not_write_after_incomplete_pagination_or_schema_mismatch() {
     let key = key("a");
     let dir = apply_state();
     open_state(dir.path()).reserve_create(&key).unwrap();
+    let db = dir.path().join("state.sqlite3");
+    let before = std::fs::read(&db).unwrap();
+    let existing = task(PAGE_A, Some(&key), "Task");
+    let first = || query(vec![existing.clone()], Some("next"));
+    let path = format!("/v1/data_sources/{A}/query");
     let mut script = schema_exchanges(schema_json());
-    script.push(query(vec![task(PAGE_A, Some(&key), "Task")], Some("next")));
+    script.push(first());
     for _ in 0..3 {
-        script.push(
-            Exchange::error("POST", format!("/v1/data_sources/{A}/query"), 502, "").check(
-                |_, body| {
-                    assert_eq!(body["start_cursor"], "next");
-                },
-            ),
-        );
+        script.push(Exchange::error("POST", &path, 502, "").check(|_, body| {
+            assert_eq!(body["start_cursor"], "next");
+        }));
+    }
+    let mut capped = list(vec![existing.clone()], None);
+    capped["request_status"] =
+        json!({"type":"incomplete","incomplete_reason":"query_result_limit_reached"});
+    script.extend(schema_exchanges(schema_json()));
+    script.push(Exchange::json("POST", &path, capped));
+    for next in [
+        query(vec![], Some("next")),
+        query(vec![existing.clone()], None),
+        Exchange::error("POST", &path, 401, ""),
+        Exchange::error("POST", &path, 403, ""),
+    ] {
+        script.extend(schema_exchanges(schema_json()));
+        script.push(first());
+        script.push(next.check(|_, body| assert_eq!(body["start_cursor"], "next")));
     }
     script.extend(schema_exchanges(json!({})));
     let (client, server) = mock(script);
-    let input = input(vec![candidate("a", "Task"), candidate("b", "New")]);
-    for expected in [NotionError::Server(502), NotionError::SchemaMismatch] {
+    let input = input(vec![candidate("a", "Needs update"), candidate("b", "New")]);
+    for expected in [
+        NotionError::Server(502),
+        NotionError::IncompleteSnapshot,
+        NotionError::IncompleteSnapshot,
+        NotionError::IncompleteSnapshot,
+        NotionError::Authentication,
+        NotionError::Forbidden,
+        NotionError::SchemaMismatch,
+    ] {
         let report = apply(&client, &input, &[], &dir);
         assert_eq!(report.error, Some(expected));
         assert_eq!(report.pending, 1);
-        assert_eq!(report.counts.deferred, 2);
+        assert_eq!(
+            report.counts,
+            DryRunCounts {
+                deferred: 2,
+                ..DryRunCounts::default()
+            }
+        );
+        assert!(!format!("{report:?}").contains(TOKEN));
+        assert_eq!(std::fs::read(&db).unwrap(), before);
     }
     server.join().unwrap();
+}
+
+#[test]
+fn http_apply_does_not_write_when_the_relation_read_fails() {
+    let sync_key = key("a");
+    let dir = apply_state();
+    let db = dir.path().join("state.sqlite3");
+    let before = std::fs::read(&db).unwrap();
+    let row = task(PAGE_A, Some(&sync_key), "Old");
+    let mut overflow = row.clone();
+    overflow["properties"]["授業"]["has_more"] = json!(true);
+    let mut script = apply_exchanges(vec![overflow]);
+    script.push(Exchange::error(
+        "GET",
+        format!("/v1/pages/{PAGE_A}/properties/R%3Ael"),
+        403,
+        "",
+    ));
+    script.extend(apply_exchanges(vec![row]));
+    script.push(Exchange::error(
+        "GET",
+        format!("/v1/pages/{COURSE}"),
+        404,
+        "",
+    ));
+    let (client, server) = mock(script);
+    let (source, course_key) =
+        input_with_course(vec![candidate("a", "New"), candidate("b", "New")]);
+    let mappings = [CourseMapping {
+        course_key,
+        page_id: COURSE.into(),
+    }];
+    for error in [NotionError::Forbidden, NotionError::NotFound] {
+        let report = apply(&client, &source, &mappings, &dir);
+        assert_eq!(report.error, Some(error));
+        assert_eq!(
+            report.counts,
+            DryRunCounts {
+                deferred: 2,
+                ..DryRunCounts::default()
+            }
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn http_apply_retries_only_the_incomplete_query_page_within_retry_after_limits() {
+    let dir = apply_state();
+    let db = dir.path().join("state.sqlite3");
+    let before = std::fs::read(&db).unwrap();
+    let source = input(vec![candidate("a", "New"), candidate("b", "New")]);
+    let path = format!("/v1/data_sources/{A}/query");
+    for (status, error) in [
+        (429, NotionError::RateLimited),
+        (529, NotionError::Overloaded),
+    ] {
+        for (delays, waited) in [
+            (
+                &[
+                    "Retry-After: 1\r\n",
+                    "Retry-After: 0\r\n",
+                    "Retry-After: 0\r\n",
+                ][..],
+                true,
+            ),
+            (&["Retry-After: 3600\r\n"][..], false),
+        ] {
+            let mut script = schema_exchanges(schema_json());
+            script.push(query(
+                vec![task(PAGE_A, Some(&key("a")), "Old")],
+                Some("next"),
+            ));
+            for &delay in delays {
+                script.push(
+                    Exchange::error("POST", &path, status, delay).check(|_, body| {
+                        assert_eq!(body["start_cursor"], "next");
+                    }),
+                );
+            }
+            let (client, server) = mock(script);
+            let started = Instant::now();
+            let report = apply(&client, &source, &[], &dir);
+            if waited {
+                assert!(started.elapsed() >= Duration::from_secs(1));
+            }
+            assert_eq!(report.error, Some(error));
+            assert_eq!(
+                report.counts,
+                DryRunCounts {
+                    deferred: 2,
+                    ..DryRunCounts::default()
+                }
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), before);
+            server.join().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -592,6 +608,27 @@ fn http_apply_checks_destination_lock_and_database_before_network() {
         Err(ApplyError::State(StateError::InvalidDatabase))
     );
     assert_eq!(std::fs::read(&path).unwrap(), original);
+    let db = Connection::open(&path).unwrap();
+    let page_size: i64 = db
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .unwrap();
+    let bindings_page: i64 = db
+        .query_row(
+            "SELECT rootpage FROM sqlite_schema WHERE name='bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+    // Damage a table B-tree page, leaving the database and application headers intact.
+    let mut corrupt = original;
+    corrupt[usize::try_from((bindings_page - 1) * page_size).unwrap()] = 0;
+    std::fs::write(&path, &corrupt).unwrap();
+    assert_eq!(
+        client.apply(&initial, &target(), &[], dir.path()),
+        Err(ApplyError::State(StateError::InvalidDatabase))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
     std::fs::write(&path, b"broken SQLite").unwrap();
     assert_eq!(
         client.apply(&initial, &target(), &[], dir.path()),

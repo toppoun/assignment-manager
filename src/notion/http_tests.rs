@@ -1,9 +1,10 @@
 mod apply_tests;
-mod trial_tests;
+pub(super) mod trial_tests;
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -131,11 +132,23 @@ impl Exchange {
     }
 }
 
-fn mock(script: Vec<Exchange>) -> (NotionClient, JoinHandle<()>) {
+struct MockServer {
+    finished: mpsc::Sender<()>,
+    thread: JoinHandle<()>,
+}
+
+impl MockServer {
+    fn join(self) -> thread::Result<()> {
+        let _ = self.finished.send(());
+        self.thread.join()
+    }
+}
+
+fn mock(script: Vec<Exchange>) -> (NotionClient, MockServer) {
     mock_with_timeout(script, Duration::from_secs(2))
 }
 
-fn mock_with_timeout(script: Vec<Exchange>, timeout: Duration) -> (NotionClient, JoinHandle<()>) {
+fn mock_with_timeout(script: Vec<Exchange>, timeout: Duration) -> (NotionClient, MockServer) {
     serve(TcpListener::bind("127.0.0.1:0").unwrap(), script, timeout)
 }
 
@@ -143,10 +156,11 @@ fn serve(
     listener: TcpListener,
     script: Vec<Exchange>,
     timeout: Duration,
-) -> (NotionClient, JoinHandle<()>) {
+) -> (NotionClient, MockServer) {
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
+    let (finished, test) = mpsc::channel();
+    let thread = thread::spawn(move || {
         for exchange in script {
             let start = Instant::now();
             loop {
@@ -165,12 +179,25 @@ fn serve(
                 }
             }
         }
-        // A hidden extra send may be queued by the time the last handler exits.
-        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        // Keep accepting connections until the test has finished its client calls.
+        // Closing the listener earlier would hide an unexpected write attempt.
+        loop {
+            let finished = !matches!(
+                test.recv_timeout(Duration::from_millis(2)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "unexpected extra mock request",
+            );
+            if finished {
+                break;
+            }
+        }
     });
     (
         NotionClient::for_mock(address, TOKEN, timeout).unwrap(),
-        server,
+        MockServer { finished, thread },
     )
 }
 
