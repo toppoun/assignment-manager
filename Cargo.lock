@@ -36,6 +36,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "scraper",
+ "security-framework",
  "serde",
  "serde_json",
  "tempfile",

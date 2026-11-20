@@ -117,6 +117,7 @@ impl CliError {
             Self::Credential(CredentialStatus::Disabled) => "source_disabled",
             Self::Credential(CredentialStatus::Missing) => "credential_missing",
             Self::Credential(CredentialStatus::Invalid) => "credential_invalid",
+            Self::Credential(CredentialStatus::Cancelled) => "credential_cancelled",
             Self::Credential(_) => "credential_unavailable",
             Self::FixtureUnavailable => "fixture_feature_required",
             Self::NetworkDisabled => "network_disabled",
@@ -346,6 +347,10 @@ fn check_credentials(config: &Config, target: &str) -> Result<(), CliError> {
     for (kind, status) in Kind::ALL.into_iter().zip(values) {
         println!("{}={}", kind.code(), status.code());
     }
+    #[cfg(target_os = "macos")]
+    if values.contains(&CredentialStatus::Unavailable) {
+        return Err(CliError::Credential(CredentialStatus::Unavailable));
+    }
     values
         .into_iter()
         .find(|status| !status.ok())
@@ -517,6 +522,10 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
                 Err(_) => println!("state=invalid"),
             }
             println!("network=disabled");
+            #[cfg(target_os = "macos")]
+            if let Err(error @ CliError::Credential(CredentialStatus::Unavailable)) = credential {
+                return Err(error);
+            }
             database?;
             credential?;
             Ok(0)

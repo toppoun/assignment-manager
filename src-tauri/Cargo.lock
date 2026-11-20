@@ -71,6 +71,7 @@ dependencies = [
  "rpassword",
  "rusqlite",
  "scraper",
+ "security-framework",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,5 +1,8 @@
 use super::config::Config;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     Moodle,
@@ -39,6 +42,7 @@ pub(super) enum CredentialStatus {
     Missing,
     Invalid,
     Unavailable,
+    Cancelled,
 }
 
 impl CredentialStatus {
@@ -49,6 +53,7 @@ impl CredentialStatus {
             Self::Missing => "missing",
             Self::Invalid => "invalid",
             Self::Unavailable => "unavailable",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -125,24 +130,27 @@ mod native {
         result.map_err(|_| CredentialStatus::Unavailable)
     }
 
-    fn target_entry(target: &str, kind: Kind) -> Result<Entry, CredentialStatus> {
-        entry(
-            &format!("io.assignment-manager.notion-cli.v1.{target}"),
-            kind,
-        )
+    fn service_name(target: &str) -> String {
+        format!("io.assignment-manager.notion-cli.v1.{target}")
+    }
+
+    fn read_secret(service: &str, kind: Kind) -> Result<Zeroizing<Vec<u8>>, CredentialStatus> {
+        #[cfg(target_os = "macos")]
+        let _no_ui = super::macos::suppress_interaction_if(
+            !io::stdin().is_terminal() || !io::stderr().is_terminal(),
+        )?;
+        entry(service, kind)?
+            .get_secret()
+            .map(Zeroizing::new)
+            .map_err(read_error)
     }
 
     pub(in crate::cli) fn lookup(config: &Config, target: &str, kind: Kind) -> CredentialStatus {
-        let Ok(entry) = target_entry(target, kind) else {
-            return CredentialStatus::Unavailable;
-        };
-        classify(config, kind, entry.get_secret().map(Zeroizing::new))
+        classify(config, kind, read_secret(&service_name(target), kind))
     }
 
     pub(in crate::cli) fn notion_client(target: &str) -> Result<NotionClient, CredentialStatus> {
-        let entry = target_entry(target, Kind::Notion)?;
-        let bytes = entry.get_secret().map(Zeroizing::new).map_err(read_error)?;
-        client_from_secret(bytes)
+        client_from_secret(read_secret(&service_name(target), Kind::Notion)?)
     }
 
     fn client_from_secret(bytes: Zeroizing<Vec<u8>>) -> Result<NotionClient, CredentialStatus> {
@@ -160,12 +168,12 @@ mod native {
     fn classify(
         config: &Config,
         kind: Kind,
-        result: keyring_core::Result<Zeroizing<Vec<u8>>>,
+        result: Result<Zeroizing<Vec<u8>>, CredentialStatus>,
     ) -> CredentialStatus {
         match result {
             Ok(bytes) if valid(config, kind, &bytes) => CredentialStatus::Ready,
             Ok(_) => CredentialStatus::Invalid,
-            Err(error) => read_error(error),
+            Err(status) => status,
         }
     }
 
@@ -192,12 +200,31 @@ mod native {
         if !io::stdin().is_terminal() {
             return Err(CredentialStatus::Unavailable);
         }
-        let entry = target_entry(target, kind)?;
+        let service = service_name(target);
+        #[cfg(target_os = "macos")]
+        let registration = super::macos::Registration::open(&service, kind.code())?;
+        #[cfg(target_os = "macos")]
+        let exists = registration.exists();
+        #[cfg(windows)]
+        let entry = entry(&service, kind)?;
+        #[cfg(windows)]
+        let exists = match entry.get_attributes() {
+            Ok(_) => true,
+            Err(Error::NoEntry) => false,
+            Err(_) => return Err(CredentialStatus::Unavailable),
+        };
         let prompt = |label| {
             rpassword::prompt_password(label)
                 .map(Zeroizing::new)
                 .map_err(|_| CredentialStatus::Unavailable)
         };
+        if exists
+            && !prompt("Replace existing credential? [y/N]: ")?
+                .trim()
+                .eq_ignore_ascii_case("y")
+        {
+            return Err(CredentialStatus::Cancelled);
+        }
         let bytes = match kind {
             Kind::Moodle => Zeroizing::new(
                 prompt("Moodle calendar URL (hidden): ")?
@@ -226,10 +253,18 @@ mod native {
         if !valid(config, kind, &bytes) {
             return Err(CredentialStatus::Invalid);
         }
-        // Replace the logical record atomically in the OS credential store.
-        entry
-            .set_secret(&bytes)
-            .map_err(|_| CredentialStatus::Unavailable)
+        #[cfg(target_os = "macos")]
+        {
+            registration
+                .save(&bytes)
+                .map_err(|_| CredentialStatus::Unavailable)
+        }
+        #[cfg(windows)]
+        {
+            entry
+                .set_secret(&bytes)
+                .map_err(|_| CredentialStatus::Unavailable)
+        }
     }
 
     #[cfg(test)]
@@ -237,11 +272,15 @@ mod native {
     fn classifies_missing_or_malformed_credentials_without_accessing_the_os_store() {
         let config = super::super::tests::config();
         assert_eq!(
-            classify(&config, Kind::Notion, Err(Error::NoEntry)),
+            classify(&config, Kind::Notion, Err(read_error(Error::NoEntry))),
             CredentialStatus::Missing
         );
         assert_eq!(
-            classify(&config, Kind::Notion, Err(Error::NoDefaultStore)),
+            classify(
+                &config,
+                Kind::Notion,
+                Err(read_error(Error::NoDefaultStore))
+            ),
             CredentialStatus::Unavailable
         );
         assert_eq!(
@@ -270,6 +309,9 @@ mod native {
     #[test]
     #[ignore = "requires the user's unlocked macOS login Keychain"]
     fn macos_keychain_round_trip() {
+        use security_framework::os::macos::keychain::SecKeychain;
+        use std::process::{Command, Stdio};
+
         // This namespace cannot be selected by any CLI config.
         let nonce = tempfile::tempdir().unwrap();
         let name = nonce.path().file_name().unwrap().to_str().unwrap();
@@ -278,7 +320,7 @@ mod native {
         let kind = Kind::Notion;
         let record = entry(&service, kind).unwrap();
         assert_eq!(
-            classify(&config, kind, record.get_secret().map(Zeroizing::new)),
+            classify(&config, kind, read_secret(&service, kind)),
             CredentialStatus::Missing
         );
 
@@ -290,25 +332,87 @@ mod native {
         }
         let _cleanup = RemoveTestRecord(&record);
 
+        let stale = super::macos::Registration::open(&service, kind.code()).unwrap();
+        assert!(!stale.exists());
         for (value, expected) in [
             (b"synthetic-token".as_slice(), CredentialStatus::Ready),
             (b"replacement-token", CredentialStatus::Ready),
             (b"malformed token", CredentialStatus::Invalid),
         ] {
-            assert!(
-                record.set_secret(value).is_ok(),
-                "test Keychain save failed"
-            );
-            let reader = entry(&service, kind).unwrap();
-            let loaded = reader.get_secret().map(Zeroizing::new);
+            let registration = super::macos::Registration::open(&service, kind.code()).unwrap();
+            assert_eq!(registration.exists(), value != b"synthetic-token");
+            registration.save(value).unwrap_or_else(|error| {
+                panic!("saving test item {service} ({expected:?}): {error}")
+            });
+            let loaded = read_secret(&service, kind);
             assert!(loaded.as_ref().is_ok_and(|bytes| bytes.as_slice() == value));
             assert_eq!(classify(&config, kind, loaded), expected);
         }
-
-        assert!(
-            record.delete_credential().is_ok(),
-            "test Keychain cleanup failed"
+        assert!(stale.save(b"unconfirmed-token").is_err());
+        assert_eq!(
+            classify(&config, kind, read_secret(&service, kind)),
+            CredentialStatus::Invalid
         );
-        assert!(matches!(record.get_secret(), Err(Error::NoEntry)));
+        record.delete_credential().unwrap();
+        assert_eq!(
+            classify(&config, kind, read_secret(&service, kind)),
+            CredentialStatus::Missing
+        );
+
+        // Only the security tool is trusted for this dedicated fixture item.
+        let security = "/usr/bin/security";
+        struct RemoveProtectedRecord<'a>(&'a str, &'a str);
+        impl RemoveProtectedRecord<'_> {
+            fn remove(&self) -> bool {
+                Command::new("/usr/bin/security")
+                    .args(["delete-generic-password", "-s", self.0, "-a", self.1])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            }
+        }
+        impl Drop for RemoveProtectedRecord<'_> {
+            fn drop(&mut self) {
+                self.remove();
+            }
+        }
+        let cleanup_protected = RemoveProtectedRecord(&service, kind.code());
+        let status = Command::new(security)
+            .args([
+                "add-generic-password",
+                "-s",
+                &service,
+                "-a",
+                kind.code(),
+                "-w",
+                "malformed fixture token",
+                "-T",
+                security,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "test Keychain ACL setup failed");
+        let interaction_allowed = SecKeychain::user_interaction_allowed().unwrap();
+        {
+            let _no_ui = super::macos::suppress_interaction_if(true).unwrap();
+            assert!(!SecKeychain::user_interaction_allowed().unwrap());
+            assert_eq!(
+                classify(&config, kind, read_secret(&service, kind)),
+                CredentialStatus::Unavailable
+            );
+            assert!(!SecKeychain::user_interaction_allowed().unwrap());
+        }
+        assert_eq!(
+            SecKeychain::user_interaction_allowed().unwrap(),
+            interaction_allowed
+        );
+        assert!(
+            cleanup_protected.remove(),
+            "cannot delete test item {service}"
+        );
+        assert_eq!(
+            classify(&config, kind, read_secret(&service, kind)),
+            CredentialStatus::Missing
+        );
     }
 }

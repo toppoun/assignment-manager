@@ -41,7 +41,9 @@ Windowsでは `%LOCALAPPDATA%\AssignmentManagerNotion\config.json` に置きま�
 
 `doctor` は設定、OSの資格情報ストアの登録状態、専用DBをローカルで診断します。
 `credentials set moodle`、`credentials set webclass`、`credentials set notion` は
-対話端末の非表示入力で登録します。設定ファイルには秘密情報を入れません。
+対話端末の非表示入力で登録します。既存項目の上書きは `y` で承認します。
+キャンセル時は既存項目を保持し、`credential_cancelled` と終了コード `2` を返します。
+設定ファイルには秘密情報を入れません。
 `init-state` と `status` が使う状態DBは `targets/<data-source-id>/state.sqlite3` にあり、
 既存アプリのSQLite v3と分離しています。通常の `sync --dry-run` はローカル設定と
 資格情報の検査で止まります。大学データの取得には合成fixtureを使用します。
@@ -76,10 +78,13 @@ target/debug/assignment-manager doctor
 ログインキーチェーンに保存します。CLIのアクセスをmacOSから確認されたら、実行中のCLIに
 対するアクセス要求であることを確認して許可します。未登録は `notion=missing`、不正な値は
 `notion=invalid`、キーチェーンにアクセスできない場合は `notion=unavailable` と表示します。
+`doctor`、`notion-check`、`sync --dry-run` は、標準入力か標準エラーが端末に接続されていない場合、
+キーチェーンの認証UIを表示しません。承認が必要な場合は `credential_unavailable`、
+未登録の場合は `credential_missing` を返します。いずれも終了コードは `2` です。
 状態DBが未初期化のときの `state=missing pending=0` は正常です。
 
 実トークンを使わずにログインキーチェーンを検証するには、次のテストを実行します。
-テスト専用サービス名で登録・更新・取得・削除を検査します。
+テスト専用サービス名で登録、更新、非対話の取得、アクセス拒否と未登録の区別を検査します。
 
 ```sh
 cargo test --locked --offline --bin assignment-manager macos_keychain_round_trip -- --ignored
