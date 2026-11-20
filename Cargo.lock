@@ -29,6 +29,7 @@ dependencies = [
  "apple-native-keyring-store",
  "aws-lc-rs",
  "chrono",
+ "hyper",
  "ical",
  "keyring-core",
  "reqwest",

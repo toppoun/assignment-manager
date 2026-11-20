@@ -12,7 +12,7 @@ use crate::{
         AssignmentCandidateBatch, DEFAULT_COURSE_SOURCE_SCOPE, ExternalRecordKey, OriginKind,
     },
     moodle::{map_events, parse_calendar, single_course_category},
-    moodle_http::{MoodleClient, MoodleFeed},
+    moodle_http::{MoodleClient, MoodleDiagnostic, MoodleFeed},
     observation::{
         AssignmentObservation, ObservationValidationError, SyncScope, WebClassCourseListObservation,
     },
@@ -107,12 +107,42 @@ impl MoodleAcquisition {
     }
 }
 
+/// The existing failure category plus a fixed diagnostic for the read-only check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoodleAcquisitionError {
+    pub kind: MoodleSyncError,
+    pub diagnostic: MoodleDiagnostic,
+}
+
+impl fmt::Display for MoodleAcquisitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl std::error::Error for MoodleAcquisitionError {}
+
+fn acquired_response_error(kind: MoodleSyncError, code: &'static str) -> MoodleAcquisitionError {
+    MoodleAcquisitionError {
+        kind,
+        diagnostic: MoodleDiagnostic::new(code, Some(reqwest::StatusCode::OK)),
+    }
+}
+
 /// Fetch one Moodle feed and return its normalized data without a store.
 /// The result contains the feed scope, never the calendar URL.
 pub fn acquire_moodle(
     client: &MoodleClient,
     feed: &MoodleFeed,
 ) -> Result<MoodleAcquisition, MoodleSyncError> {
+    acquire_moodle_with_diagnostic(client, feed).map_err(|error| error.kind)
+}
+
+/// Fetch once using the same acquisition path, retaining only fixed diagnostic values.
+pub fn acquire_moodle_with_diagnostic(
+    client: &MoodleClient,
+    feed: &MoodleFeed,
+) -> Result<MoodleAcquisition, MoodleAcquisitionError> {
     let mut courses = HashMap::new();
     let assignments = visit_moodle(client, feed, |key, course| {
         courses.insert(key, course);
@@ -130,14 +160,18 @@ pub(super) fn visit_moodle(
     client: &MoodleClient,
     feed: &MoodleFeed,
     mut visit_course: impl FnMut(ExternalRecordKey, SourceCourse) -> Result<(), MoodleSyncError>,
-) -> Result<AcquiredAssignments, MoodleSyncError> {
+) -> Result<AcquiredAssignments, MoodleAcquisitionError> {
     let raw = client
-        .fetch_calendar(feed)
-        .map_err(|_| MoodleSyncError::Fetch)?;
-    let events = parse_calendar(&raw).map_err(|_| MoodleSyncError::Parse)?;
-    client
-        .check_sync_records(events.len())
-        .map_err(|_| MoodleSyncError::Validation)?;
+        .fetch_calendar_with_diagnostic(feed)
+        .map_err(|(_, diagnostic)| MoodleAcquisitionError {
+            kind: MoodleSyncError::Fetch,
+            diagnostic,
+        })?;
+    let events = parse_calendar(&raw)
+        .map_err(|_| acquired_response_error(MoodleSyncError::Parse, "ics_parse"))?;
+    let limit = acquired_response_error(MoodleSyncError::Validation, "candidate_limit");
+    let validation = acquired_response_error(MoodleSyncError::Validation, "candidate_validation");
+    client.check_sync_records(events.len()).map_err(|_| limit)?;
     let key_for = |id: &str| ExternalRecordKey {
         origin: OriginKind::Moodle,
         scope: feed.scope().to_owned(),
@@ -147,11 +181,10 @@ pub(super) fn visit_moodle(
         SyncScope::MoodleFeed(feed.scope().to_owned()),
         events.iter().map(|event| key_for(&event.uid)).collect(),
     )
-    .map_err(|_| MoodleSyncError::Validation)?;
+    .map_err(|_| validation)?;
     let batch = AssignmentCandidateBatch::try_new(map_events(&events, feed.scope()))
-        .map_err(|_| MoodleSyncError::Validation)?;
-    let assignments = AcquiredAssignments::try_new(batch, observation)
-        .map_err(|_| MoodleSyncError::Validation)?;
+        .map_err(|_| validation)?;
+    let assignments = AcquiredAssignments::try_new(batch, observation).map_err(|_| validation)?;
     let candidate_keys: HashSet<_> = assignments
         .batch()
         .as_slice()
@@ -159,9 +192,9 @@ pub(super) fn visit_moodle(
         .map(|candidate| &candidate.external_key)
         .collect();
     for event in &events {
-        client
-            .check_sync_records(0)
-            .map_err(|_| MoodleSyncError::Fetch)?;
+        client.check_sync_records(0).map_err(|_| {
+            acquired_response_error(MoodleSyncError::Fetch, "course_processing_limit")
+        })?;
         let key = key_for(&event.uid);
         if !candidate_keys.contains(&key) {
             continue;
@@ -173,12 +206,13 @@ pub(super) fn visit_moodle(
                     external_key: key_for(category),
                     name: category.to_owned(),
                 },
-            )?;
+            )
+            .map_err(|kind| acquired_response_error(kind, "course_processing"))?;
         }
     }
     client
         .check_sync_records(assignments.batch().as_slice().len())
-        .map_err(|_| MoodleSyncError::Validation)?;
+        .map_err(|_| limit)?;
     Ok(assignments)
 }
 

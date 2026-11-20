@@ -312,6 +312,139 @@ impl fmt::Display for NetworkError {
 }
 impl Error for NetworkError {}
 
+// Only typed evidence is used. The raw error and its causes are discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestFailure {
+    RequestBuild,
+    Policy,
+    ResourceLimit,
+    DnsLookup,
+    DnsTimeout,
+    DnsPolicy,
+    TcpConnect,
+    TlsHandshake,
+    TlsProtocol,
+    TlsCertificateChain,
+    TlsHostname,
+    TlsCertificateTime,
+    TlsRevoked,
+    TlsRevocation,
+    TlsCertificateOther,
+    HttpExchange,
+    RequestTimeout,
+    ConnectionUnknown,
+    RequestUnknown,
+}
+
+impl RequestFailure {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::RequestBuild => "request_build",
+            Self::Policy => "request_policy",
+            Self::ResourceLimit => "request_limit",
+            Self::DnsLookup => "dns_lookup",
+            Self::DnsTimeout => "dns_timeout",
+            Self::DnsPolicy => "dns_policy",
+            Self::TcpConnect => "tcp_connect",
+            Self::TlsHandshake => "tls_handshake",
+            Self::TlsProtocol => "tls_protocol",
+            Self::TlsCertificateChain => "tls_certificate_chain",
+            Self::TlsHostname => "tls_hostname",
+            Self::TlsCertificateTime => "tls_certificate_time",
+            Self::TlsRevoked => "tls_certificate_revoked",
+            Self::TlsRevocation => "tls_revocation_unconfirmed",
+            Self::TlsCertificateOther => "tls_certificate_other",
+            Self::HttpExchange => "http_exchange",
+            Self::RequestTimeout => "request_timeout_stage_unknown",
+            Self::ConnectionUnknown => "connection_stage_unknown",
+            Self::RequestUnknown => "request_stage_unknown",
+        }
+    }
+}
+
+impl fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl Error for RequestFailure {}
+
+fn tls_failure(error: &rustls::Error, connecting: bool) -> RequestFailure {
+    use RequestFailure as Failure;
+    use rustls::CertificateError as Cert;
+
+    match error {
+        rustls::Error::InvalidCertificate(error) => match error {
+            Cert::UnknownIssuer | Cert::BadSignature => Failure::TlsCertificateChain,
+            Cert::NotValidForName | Cert::NotValidForNameContext { .. } => Failure::TlsHostname,
+            Cert::Expired
+            | Cert::ExpiredContext { .. }
+            | Cert::NotValidYet
+            | Cert::NotValidYetContext { .. } => Failure::TlsCertificateTime,
+            Cert::Revoked => Failure::TlsRevoked,
+            Cert::UnknownRevocationStatus
+            | Cert::ExpiredRevocationList
+            | Cert::ExpiredRevocationListContext { .. }
+            | Cert::InvalidOcspResponse => Failure::TlsRevocation,
+            _ => Failure::TlsCertificateOther,
+        },
+        rustls::Error::InvalidCertRevocationList(_) => Failure::TlsRevocation,
+        rustls::Error::NoCertificatesPresented => Failure::TlsCertificateOther,
+        _ if connecting => Failure::TlsHandshake,
+        _ => Failure::TlsProtocol,
+    }
+}
+
+fn request_failure(error: &reqwest::Error) -> RequestFailure {
+    use RequestFailure as Failure;
+    use std::io::ErrorKind;
+
+    let connecting = error.is_connect();
+    let mut tcp_failure = false;
+    let mut http_exchange = false;
+    let mut cause = error.source();
+    while let Some(current) = cause {
+        if let Some(detail) = current.downcast_ref::<RequestFailure>() {
+            return *detail;
+        }
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return tls_failure(tls, connecting);
+        }
+        if let Some(http) = current.downcast_ref::<hyper::Error>() {
+            http_exchange |= http.is_parse() || http.is_incomplete_message();
+        }
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            tcp_failure |= connecting
+                && matches!(
+                    io.kind(),
+                    ErrorKind::ConnectionRefused
+                        | ErrorKind::NetworkUnreachable
+                        | ErrorKind::HostUnreachable
+                        | ErrorKind::AddrNotAvailable
+                );
+            // io::Error::source can skip the wrapped error itself.
+            cause = io
+                .get_ref()
+                .map(|inner| inner as &dyn Error)
+                .or_else(|| current.source());
+        } else {
+            cause = current.source();
+        }
+    }
+    if tcp_failure {
+        Failure::TcpConnect
+    } else if http_exchange {
+        Failure::HttpExchange
+    } else if error.is_timeout() {
+        Failure::RequestTimeout
+    } else if connecting {
+        Failure::ConnectionUnknown
+    } else {
+        Failure::RequestUnknown
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Source {
     Moodle,
@@ -344,7 +477,7 @@ struct GuardedResolver {
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         if !self.hosts.iter().any(|h| h == name.as_str()) {
-            return Box::pin(async { Err(NetworkError::Policy.into()) });
+            return Box::pin(async { Err(RequestFailure::DnsPolicy.into()) });
         }
         let lookup = self.lookup.resolve(name);
         #[cfg(feature = "synthetic-https-fixture")]
@@ -356,8 +489,8 @@ impl Resolve for GuardedResolver {
         Box::pin(async move {
             let answers = tokio::time::timeout(CONNECT_TIMEOUT, lookup)
                 .await
-                .map_err(|_| NetworkError::Timeout)?
-                .map_err(|_| NetworkError::Policy)?;
+                .map_err(|_| RequestFailure::DnsTimeout)?
+                .map_err(|_| RequestFailure::DnsLookup)?;
             let mut checked = Vec::new();
             for mut addr in answers.take(MAX_DNS_ANSWERS + 1) {
                 #[cfg(test)]
@@ -367,7 +500,7 @@ impl Resolve for GuardedResolver {
                 #[cfg(feature = "synthetic-https-fixture")]
                 let test_peer = test_peer || fixture_peers.contains(&addr);
                 if checked.len() == MAX_DNS_ANSWERS || (!test_peer && !public_ip(addr.ip())) {
-                    return Err(NetworkError::Policy.into());
+                    return Err(RequestFailure::DnsPolicy.into());
                 }
                 // DNS supplies addresses, never a service/port override.
                 if !test_peer {
@@ -376,7 +509,7 @@ impl Resolve for GuardedResolver {
                 checked.push(addr);
             }
             if checked.is_empty() {
-                return Err(NetworkError::Policy.into());
+                return Err(RequestFailure::DnsPolicy.into());
             }
             Ok(Box::new(checked.into_iter()) as Addrs)
         })
@@ -543,19 +676,32 @@ impl Transport {
         Ok(())
     }
     pub(crate) fn send(&self, request: RequestBuilder) -> Result<Response, NetworkError> {
-        let mut request = request.build().map_err(|_| NetworkError::Request)?;
+        self.send_with_detail(request).map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn send_with_detail(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<Response, (NetworkError, RequestFailure)> {
+        let rejected = (NetworkError::Policy, RequestFailure::Policy);
+        let limit = (NetworkError::ResourceLimit, RequestFailure::ResourceLimit);
+        let mut request = request
+            .build()
+            .map_err(|_| (NetworkError::Request, RequestFailure::RequestBuild))?;
         if let Some((policy, source)) = &self.policy {
-            policy.validate(request.url(), *source)?;
+            policy
+                .validate(request.url(), *source)
+                .map_err(|_| rejected)?;
             // Only the known fixed, query-free protocol Referers may be supplied.
             if let Some(value) = request.headers().get(REFERER) {
-                let url = Url::parse(value.to_str().map_err(|_| NetworkError::Policy)?)
-                    .map_err(|_| NetworkError::Policy)?;
+                let url =
+                    Url::parse(value.to_str().map_err(|_| rejected)?).map_err(|_| rejected)?;
                 let mut clean = url.clone();
                 clean.set_query(None);
                 clean.set_fragment(None);
                 request.headers_mut().insert(
                     REFERER,
-                    HeaderValue::from_str(clean.as_str()).map_err(|_| NetworkError::Policy)?,
+                    HeaderValue::from_str(clean.as_str()).map_err(|_| rejected)?,
                 );
             }
         }
@@ -563,22 +709,29 @@ impl Transport {
             .headers_mut()
             .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
         if self.cookies.as_ref().is_some_and(|c| c.exhausted()) {
-            return Err(NetworkError::ResourceLimit);
+            return Err(limit);
         }
-        let lease = self.run.as_ref().map(|run| run.acquire()).transpose()?;
+        let lease = self
+            .run
+            .as_ref()
+            .map(|run| run.acquire())
+            .transpose()
+            .map_err(|_| limit)?;
         if let Some(lease) = &lease {
-            let state = lease.0.0.lock().map_err(|_| NetworkError::ResourceLimit)?;
-            *request.timeout_mut() = Some(REQUEST_TIMEOUT.min(RunBudget::remaining(&state)?));
+            let state = lease.0.0.lock().map_err(|_| limit)?;
+            *request.timeout_mut() =
+                Some(REQUEST_TIMEOUT.min(RunBudget::remaining(&state).map_err(|_| limit)?));
         }
         let inner = self.client.execute(request).map_err(|e| {
-            if e.is_timeout() {
+            let error = if e.is_timeout() {
                 NetworkError::Timeout
             } else {
                 NetworkError::Request
-            }
+            };
+            (error, request_failure(&e))
         })?;
         if self.cookies.as_ref().is_some_and(|c| c.exhausted()) {
-            return Err(NetworkError::ResourceLimit);
+            return Err(limit);
         }
         Ok(Response { inner, lease })
     }

@@ -1,7 +1,7 @@
 use assignment_manager::{
     moodle_http::{MoodleExportKind, MoodleFeed},
     secured_sync::SecuredSyncClients,
-    sync::{MoodleSyncError, acquire_moodle},
+    sync::{MoodleSyncError, acquire_moodle_with_diagnostic},
 };
 
 use super::{CliError, Config, CredentialStatus, credentials};
@@ -30,26 +30,33 @@ pub(super) fn moodle(config: &Config) -> Result<u8, CliError> {
 }
 
 fn check_moodle(clients: &SecuredSyncClients, feed: &MoodleFeed) -> bool {
-    let result = clients
-        .moodle()
-        .map_err(|_| MoodleSyncError::Fetch)
-        .and_then(|client| acquire_moodle(&client, feed));
-    match result {
+    let Ok(client) = clients.moodle() else {
+        print_source("moodle", 0, Some("fetch"));
+        println!("moodle diagnostic=client_initialization");
+        return false;
+    };
+    match acquire_moodle_with_diagnostic(&client, feed) {
         Ok(acquired) => print_source(
             "moodle",
             acquired.assignments().batch().as_slice().len(),
             None,
         ),
-        Err(error) => print_source(
-            "moodle",
-            0,
-            Some(match error {
+        Err(error) => {
+            let stage = match error.kind {
                 MoodleSyncError::Fetch => "fetch",
                 MoodleSyncError::Parse => "parse",
                 MoodleSyncError::Validation => "validation",
                 MoodleSyncError::Persistence => "persistence",
-            }),
-        ),
+            };
+            print_source("moodle", 0, Some(stage));
+            let code = error.diagnostic.code();
+            if let Some(status) = error.diagnostic.http_status() {
+                println!("moodle diagnostic={code} http_status={status}");
+            } else {
+                println!("moodle diagnostic={code}");
+            }
+            false
+        }
     }
 }
 

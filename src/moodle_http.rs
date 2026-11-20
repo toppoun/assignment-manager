@@ -5,7 +5,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::university_network::{
-    BodyKind, NetworkError, NetworkPolicy, Source, Transport, read_text, strict_url,
+    BodyKind, NetworkError, NetworkPolicy, RequestFailure, Source, Transport, read_text, strict_url,
 };
 use reqwest::blocking::Client;
 use reqwest::{StatusCode, Url};
@@ -165,6 +165,27 @@ impl fmt::Display for MoodleHttpError {
 
 impl Error for MoodleHttpError {}
 
+/// Fixed diagnostic and, only after an HTTP response is received, its numeric status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoodleDiagnostic {
+    code: &'static str,
+    status: Option<StatusCode>,
+}
+
+impl MoodleDiagnostic {
+    pub(crate) fn new(code: &'static str, status: Option<StatusCode>) -> Self {
+        Self { code, status }
+    }
+
+    pub fn code(self) -> &'static str {
+        self.code
+    }
+
+    pub fn http_status(self) -> Option<u16> {
+        self.status.map(|status| status.as_u16())
+    }
+}
+
 /// Never follows redirects, including same-origin redirects, or sends an automatic Referer.
 pub struct MoodleClient {
     http: Transport,
@@ -219,22 +240,42 @@ impl MoodleClient {
     /// Return the response text without interpreting iCalendar or creating candidates.
     /// Redirects return `HttpStatus` without reading or requesting their Location.
     pub fn fetch_calendar(&self, feed: &MoodleFeed) -> Result<String, MoodleHttpError> {
+        self.fetch_calendar_with_diagnostic(feed)
+            .map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn fetch_calendar_with_diagnostic(
+        &self,
+        feed: &MoodleFeed,
+    ) -> Result<String, (MoodleHttpError, MoodleDiagnostic)> {
         if self.http.is_secured() && !feed.web_syntax_valid {
-            return Err(MoodleHttpError::Request);
+            return Err((
+                MoodleHttpError::Request,
+                MoodleDiagnostic::new(RequestFailure::Policy.code(), None),
+            ));
         }
         let response = self
             .http
-            .send(self.http.get(feed.url.clone()))
-            .map_err(|error| {
-                if error == NetworkError::Timeout {
+            .send_with_detail(self.http.get(feed.url.clone()))
+            .map_err(|(error, detail)| {
+                let error = if error == NetworkError::Timeout {
                     MoodleHttpError::Timeout
                 } else {
                     MoodleHttpError::Request
-                }
+                };
+                (error, MoodleDiagnostic::new(detail.code(), None))
             })?;
         let status = response.status();
         if status != StatusCode::OK {
-            return Err(MoodleHttpError::HttpStatus(status));
+            let detail = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "http_authentication",
+                status if status.is_server_error() => "http_server",
+                _ => "http_unexpected_status",
+            };
+            return Err((
+                MoodleHttpError::HttpStatus(status),
+                MoodleDiagnostic::new(detail, Some(status)),
+            ));
         }
         // This endpoint is consumed as one complete export. Reject range and
         // link metadata until there is a verified continuation contract.
@@ -243,12 +284,20 @@ impl MoodleClient {
             .contains_key(reqwest::header::CONTENT_RANGE)
             || response.headers().contains_key(reqwest::header::LINK)
         {
-            return Err(MoodleHttpError::UnexpectedResponse);
+            return Err((
+                MoodleHttpError::UnexpectedResponse,
+                MoodleDiagnostic::new("http_unexpected_metadata", Some(status)),
+            ));
         }
-        read_text(response, BodyKind::MoodleIcs).map_err(|error| match error {
-            NetworkError::Timeout => MoodleHttpError::Timeout,
-            NetworkError::Decode => MoodleHttpError::BodyDecode,
-            _ => MoodleHttpError::BodyRead,
+        read_text(response, BodyKind::MoodleIcs).map_err(|error| {
+            let (error, detail) = match error {
+                NetworkError::Timeout => (MoodleHttpError::Timeout, "body_timeout"),
+                NetworkError::Decode => (MoodleHttpError::BodyDecode, "body_utf8"),
+                NetworkError::Encoding => (MoodleHttpError::BodyRead, "body_encoding"),
+                NetworkError::BodyTooLarge => (MoodleHttpError::BodyRead, "body_size_limit"),
+                _ => (MoodleHttpError::BodyRead, "body_read"),
+            };
+            (error, MoodleDiagnostic::new(detail, Some(status)))
         })
     }
 }

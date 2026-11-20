@@ -10,9 +10,10 @@ use std::error::Error;
 use std::fmt;
 
 pub use acquisition::{
-    AcquiredAssignments, AcquiredWebClassCourses, MoodleAcquisition, SourceCourse,
-    WebClassAcquisition, WebClassAcquisitionAttempt, acquire_moodle, acquire_webclass_group,
-    acquire_webclass_once, acquire_webclass_with_reauth,
+    AcquiredAssignments, AcquiredWebClassCourses, MoodleAcquisition, MoodleAcquisitionError,
+    SourceCourse, WebClassAcquisition, WebClassAcquisitionAttempt, acquire_moodle,
+    acquire_moodle_with_diagnostic, acquire_webclass_group, acquire_webclass_once,
+    acquire_webclass_with_reauth,
 };
 use acquisition::{
     WebClassEvent, acquire_webclass_courses, run_with_webclass_reauth, visit_moodle,
@@ -84,7 +85,8 @@ pub fn sync_moodle_once(
             MoodleCourseResolution::new(course_id, key.id),
         );
         Ok(())
-    })?;
+    })
+    .map_err(|error| error.kind)?;
     store
         .import_assignment_batch_with_observation_and_courses(
             assignments.batch(),

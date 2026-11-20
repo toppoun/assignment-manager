@@ -1,6 +1,7 @@
 //! No public DNS queries or university requests. All connections use loopback.
 use super::*;
 use crate::moodle_http::{MoodleClient, MoodleExportKind, MoodleFeed, MoodleHttpError};
+use crate::sync::{MoodleSyncError, acquire_moodle_with_diagnostic};
 use std::{
     collections::VecDeque,
     io::{self, Write},
@@ -36,6 +37,9 @@ fn secret_safe(error: &dyn Error) {
         "synthetic-password",
         "SAMLResponse",
         "Set-Cookie",
+        "SYNTHETIC_BODY_PRIVATE",
+        "SYNTHETIC_COOKIE_PRIVATE",
+        "SYNTHETIC_EVENT_PRIVATE",
         "?token=",
         "https://",
     ] {
@@ -148,7 +152,7 @@ impl Resolve for FakeLookup {
         Box::pin(async move {
             result
                 .map(|a| Box::new(a.into_iter()) as Addrs)
-                .ok_or_else(|| NetworkError::Policy.into())
+                .ok_or_else(|| io::Error::other(URL).into())
         })
     }
 }
@@ -409,13 +413,221 @@ fn tls_untrusted_certificate_and_wrong_hostname_are_rejected() {
             policy.test.root = None;
             URL.into()
         };
-        let error = MoodleClient::for_web(policy)
-            .unwrap()
-            .fetch_calendar(&feed(&target))
-            .unwrap_err();
-        assert_eq!(error, MoodleHttpError::Request);
-        secret_safe(&error);
+        let client = MoodleClient::for_web(policy).unwrap();
+        assert_moodle_diagnostic(
+            &client,
+            &target,
+            MoodleSyncError::Fetch,
+            if trust {
+                "tls_hostname"
+            } else {
+                "tls_certificate_chain"
+            },
+            None,
+        );
         assert!(server.join().unwrap().0.is_none());
+    }
+}
+
+fn assert_moodle_diagnostic(
+    client: &MoodleClient,
+    target: &str,
+    kind: MoodleSyncError,
+    code: &str,
+    status: Option<u16>,
+) {
+    let error = acquire_moodle_with_diagnostic(client, &feed(target)).unwrap_err();
+    assert_eq!(error.kind, kind);
+    assert_eq!(error.diagnostic.code(), code);
+    assert_eq!(error.diagnostic.http_status(), status);
+    secret_safe(&error);
+}
+
+#[test]
+fn moodle_diagnostics_identify_dns_failures_and_tcp_refusal_before_http() {
+    for (answers, code) in [
+        (vec![], "dns_lookup"),
+        (vec![vec![]], "dns_policy"),
+        (vec![vec![addr("127.0.0.2")]], "dns_policy"),
+    ] {
+        let mut policy = policy();
+        let lookup = Arc::new(FakeLookup::new(answers));
+        policy.test.lookup = Some(lookup.clone());
+        let client = MoodleClient::for_web(policy).unwrap();
+        assert_moodle_diagnostic(&client, URL, MoodleSyncError::Fetch, code, None);
+        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Hold the port without listening so a different process cannot claim it.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let peer = socket.local_addr().unwrap();
+    let lookup = Arc::new(FakeLookup::new(vec![vec![peer]]));
+    let client = MoodleClient::for_web(tls_policy(peer, lookup.clone())).unwrap();
+    assert_moodle_diagnostic(&client, URL, MoodleSyncError::Fetch, "tcp_connect", None);
+    assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn moodle_diagnostics_identify_tls_protocol_failure_before_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = listener.local_addr().unwrap();
+    let (release, waiting) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        let mut prefix = [0; 5];
+        stream.read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix[0], 0x16); // TLS ClientHello
+        let mut record = vec![0; usize::from(u16::from_be_bytes([prefix[3], prefix[4]]))];
+        stream.read_exact(&mut record).unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        let _ = waiting.recv_timeout(Duration::from_secs(12));
+    });
+    let client = MoodleClient::for_web(tls_policy(
+        peer,
+        Arc::new(FakeLookup::new(vec![vec![peer]])),
+    ))
+    .unwrap();
+    assert_moodle_diagnostic(&client, URL, MoodleSyncError::Fetch, "tls_handshake", None);
+    release.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn moodle_diagnostics_use_only_fixed_codes_for_typed_certificate_errors() {
+    use rustls::CertificateError;
+
+    for (certificate_error, code) in [
+        (CertificateError::Expired, "tls_certificate_time"),
+        (CertificateError::Revoked, "tls_certificate_revoked"),
+        (
+            CertificateError::UnknownRevocationStatus,
+            "tls_revocation_unconfirmed",
+        ),
+        (
+            CertificateError::InvalidOcspResponse,
+            "tls_revocation_unconfirmed",
+        ),
+        (
+            CertificateError::ApplicationVerificationFailure,
+            "tls_certificate_other",
+        ),
+        (
+            CertificateError::Other(rustls::OtherError(Arc::new(io::Error::other(URL)))),
+            "tls_certificate_other",
+        ),
+    ] {
+        let failure = tls_failure(&rustls::Error::InvalidCertificate(certificate_error), true);
+        assert_eq!(failure.code(), code);
+        secret_safe(&failure);
+    }
+}
+
+#[test]
+fn moodle_diagnostics_distinguish_http_status_body_and_ics_failures() {
+    use MoodleSyncError::{Fetch, Parse, Validation};
+
+    let private_headers =
+        "X-Fake-Person: SYNTHETIC_EVENT_PRIVATE\r\nSet-Cookie: opaque=SYNTHETIC_COOKIE_PRIVATE\r\n";
+    let private_body = b"SYNTHETIC_EVENT_PRIVATE";
+    let event = "BEGIN:VEVENT\r\nUID:SYNTHETIC_EVENT_PRIVATE\r\nSUMMARY:Mock\r\nDTSTART:20271120T120000Z\r\nEND:VEVENT\r\n";
+    let duplicate_events = format!("BEGIN:VCALENDAR\r\n{event}{event}END:VCALENDAR\r\n");
+    let cases = [
+        (
+            format!("HTTP/1.1 401 Unauthorized\r\n{private_headers}Content-Length: 0\r\n\r\n")
+                .into_bytes(),
+            Fetch,
+            "http_authentication",
+            Some(401),
+        ),
+        (
+            format!("HTTP/1.1 403 Forbidden\r\n{private_headers}Content-Length: 0\r\n\r\n")
+                .into_bytes(),
+            Fetch,
+            "http_authentication",
+            Some(403),
+        ),
+        (
+            format!("HTTP/1.1 503 Unavailable\r\n{private_headers}Content-Length: 0\r\n\r\n")
+                .into_bytes(),
+            Fetch,
+            "http_server",
+            Some(503),
+        ),
+        (
+            format!("HTTP/1.1 302 Found\r\nLocation: {URL}\r\nContent-Length: 0\r\n\r\n")
+                .into_bytes(),
+            Fetch,
+            "http_unexpected_status",
+            Some(302),
+        ),
+        (
+            response(b"", &format!("Link: <{URL}>\r\n")),
+            Fetch,
+            "http_unexpected_metadata",
+            Some(200),
+        ),
+        (
+            b"invalid HTTP status SYNTHETIC_BODY_PRIVATE\r\n\r\n".to_vec(),
+            Fetch,
+            "http_exchange",
+            None,
+        ),
+        (
+            response(b"SYNTHETIC_BODY_PRIVATE", "Content-Length: 256\r\n"),
+            Fetch,
+            "body_read",
+            Some(200),
+        ),
+        (
+            response(b"", "Content-Encoding: gzip\r\n"),
+            Fetch,
+            "body_encoding",
+            Some(200),
+        ),
+        (
+            response(b"", "Content-Length: 999999999\r\n"),
+            Fetch,
+            "body_size_limit",
+            Some(200),
+        ),
+        (
+            response(b"\xff", "Content-Length: 1\r\n"),
+            Fetch,
+            "body_utf8",
+            Some(200),
+        ),
+        (
+            response(
+                private_body,
+                &format!(
+                    "{private_headers}Content-Length: {}\r\n",
+                    private_body.len()
+                ),
+            ),
+            Parse,
+            "ics_parse",
+            Some(200),
+        ),
+        (
+            response(
+                duplicate_events.as_bytes(),
+                &format!("Content-Length: {}\r\n", duplicate_events.len()),
+            ),
+            Validation,
+            "candidate_validation",
+            Some(200),
+        ),
+    ];
+    for (raw, kind, code, status) in cases {
+        let (peer, server) = tls_server(raw);
+        let lookup = Arc::new(FakeLookup::new(vec![vec![peer]]));
+        let client = MoodleClient::for_web(tls_policy(peer, lookup.clone())).unwrap();
+        assert_moodle_diagnostic(&client, URL, kind, code, status);
+        let (request, listener) = server.join().unwrap();
+        assert!(request.unwrap().starts_with("GET "));
+        assert_no_connection(&listener);
+        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -698,10 +910,22 @@ fn dns_deadline_fails_closed() {
         }
     }
     let started = Instant::now();
-    assert_eq!(
-        resolve(Arc::new(PendingLookup), HOST),
-        Err(NetworkError::Policy)
-    );
+    let resolver = GuardedResolver {
+        hosts: vec![HOST.into()],
+        lookup: Arc::new(PendingLookup),
+        #[cfg(feature = "synthetic-https-fixture")]
+        fixture_peers: Vec::new(),
+        peer: None,
+        loopback_origins: false,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(matches!(
+        rt.block_on(resolver.resolve(HOST.parse().unwrap())),
+        Err(error) if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::DnsTimeout)
+    ));
     assert!(started.elapsed() < Duration::from_secs(12));
 }
 
@@ -723,10 +947,14 @@ fn secured_connect_tls_deadline_expires_without_sending_http_credentials() {
     ))
     .unwrap();
     let started = Instant::now();
-    let error = client.fetch_calendar(&feed(URL)).unwrap_err();
+    let (error, diagnostic) = client
+        .fetch_calendar_with_diagnostic(&feed(URL))
+        .unwrap_err();
     release.send(()).unwrap();
     server.join().unwrap();
     assert_eq!(error, MoodleHttpError::Timeout);
+    assert_eq!(diagnostic.code(), "request_timeout_stage_unknown");
+    assert_eq!(diagnostic.http_status(), None);
     secret_safe(&error);
     assert!(started.elapsed() < Duration::from_secs(12));
 }
