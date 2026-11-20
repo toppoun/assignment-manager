@@ -106,9 +106,12 @@ fn complete_cli_dry_run_uses_mock_and_leaves_state_unchanged() {
     let mut config = config();
     config.notion = assignment_manager::notion::fixture::target();
     let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_path_buf();
+    #[cfg(target_os = "macos")]
+    let directory = directory.canonicalize().unwrap();
     let paths = Paths {
         target: config.target_id().unwrap(),
-        directory: root.path().into(),
+        directory,
     };
     let _lock = TargetLock::acquire(&paths.directory).unwrap();
     StateStore::initialize(&paths.state(), &paths.target).unwrap();

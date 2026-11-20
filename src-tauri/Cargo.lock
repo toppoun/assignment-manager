@@ -62,6 +62,7 @@ dependencies = [
 name = "assignment-manager"
 version = "0.1.0"
 dependencies = [
+ "apple-native-keyring-store",
  "aws-lc-rs",
  "chrono",
  "ical",

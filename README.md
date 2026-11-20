@@ -2,7 +2,7 @@
 
 ## Notion単発CLI
 
-Windows向けの単発CLIです。合成dry-runでは、固定ループバックの大学HTTPS fixtureから
+macOSとWindowsで使える単発CLIです。合成dry-runでは、固定ループバックの大学HTTPS fixtureから
 MoodleとWebClassを取得し、Notion HTTPモックを読み取って差分の件数を表示します。
 
 ```powershell
@@ -15,8 +15,9 @@ cargo run --locked --offline --features synthetic-https-fixture -- status --fixt
 差分件数・固定エラー分類だけを `last-dry-run.json` に記録します。
 同時実行はOSファイルロックで拒否します。強制終了後は同じロックファイルを再利用できます。
 
-ローカル設定は `%LOCALAPPDATA%\AssignmentManagerNotion\config.json` に置くか、
-コマンドの前に `--config PATH` を指定します。次は架空のIDを使った設定例です。
+ローカル設定はmacOSでは `~/Library/Application Support/AssignmentManagerNotion/config.json`、
+Windowsでは `%LOCALAPPDATA%\AssignmentManagerNotion\config.json` に置きます。
+コマンドの前に `--config PATH` を指定することもできます。次は架空のIDを使った設定例です。
 プロパティには表示名と区別してAPIのIDを指定します。
 
 ```json
@@ -38,7 +39,7 @@ cargo run --locked --offline --features synthetic-https-fixture -- status --fixt
 }
 ```
 
-`doctor` は設定、Windows Credential Managerの登録状態、専用DBをローカルで診断します。
+`doctor` は設定、OSの資格情報ストアの登録状態、専用DBをローカルで診断します。
 `credentials set moodle`、`credentials set webclass`、`credentials set notion` は
 対話端末の非表示入力で登録します。設定ファイルには秘密情報を入れません。
 `init-state` と `status` が使う状態DBは `targets/<data-source-id>/state.sqlite3` にあり、
@@ -48,10 +49,46 @@ cargo run --locked --offline --features synthetic-https-fixture -- status --fixt
 終了コードは成功 `0`、実行失敗 `1`、設定・資格情報などの不足 `2`、
 部分成功または確認待ち `3`、多重実行 `4` です。
 
-### Phase 3B.5の読み取り専用検査とdry-run
+### macOSでのビルドとローカル検証
 
-対象ワークスペースへの読み取りが許可された環境で、Notion Internal connectionに
-読み取り権限を付与し、課題と授業の元データソースを共有します。
+Xcode Command Line ToolsとRustを入れ、初回は `cargo fetch --locked --target "$(rustc --print host-tuple)"` で依存関係を取得します。
+
+```sh
+cargo build --locked --offline --features synthetic-https-fixture
+target/debug/assignment-manager sync --dry-run --fixture
+target/debug/assignment-manager status --fixture
+```
+
+実Notionの読み取り検証に向けて、上記の `notion` 設定に課題と授業のデータソースIDを
+指定します。`properties.title` は `title` です。期限、授業Relation、提出URL、
+「同期キー」（`rich_text`）、「取得元」（`select`、`Moodle` / `WebClass`）には
+Notion APIが返すプロパティIDを指定します。大学の合成fixtureを使う場合は、設定から
+`moodle` と `webclass` を省略できます。
+
+```sh
+target/debug/assignment-manager doctor
+target/debug/assignment-manager credentials set notion
+target/debug/assignment-manager doctor
+```
+
+トークンは対話端末の非表示プロンプトで入力します。CLI専用のサービス名
+`io.assignment-manager.notion-cli.v1.<正規化した課題データソースID>`、アカウント名 `notion` で
+ログインキーチェーンに保存します。CLIのアクセスをmacOSから確認されたら、実行中のCLIに
+対するアクセス要求であることを確認して許可します。未登録は `notion=missing`、不正な値は
+`notion=invalid`、キーチェーンにアクセスできない場合は `notion=unavailable` と表示します。
+状態DBが未初期化のときの `state=missing pending=0` は正常です。
+
+実トークンを使わずにログインキーチェーンを検証するには、次のテストを実行します。
+テスト専用サービス名で登録・更新・取得・削除を検査します。
+
+```sh
+cargo test --locked --offline --bin assignment-manager macos_keychain_round_trip -- --ignored
+```
+
+### Notionの読み取り専用検査とdry-run
+
+対象ワークスペースのユーザーから読み取りの明示的な許可を得た後に実施します。
+Notion Internal connectionに読み取り権限を付与し、課題と授業の元データソースを共有します。
 Notionの「データソースを管理」から両方のデータソースIDを取得し、ローカル設定へ記載します。
 `credentials set notion` を対話端末から実行して登録したトークンを使います。
 次の明示オプションで、公式の `https://api.notion.com` に接続します。
@@ -59,7 +96,7 @@ Notionの「データソースを管理」から両方のデータソースIDを
 `POST /v1/data_sources/{data_source_id}/query` を利用します。
 作成・更新・削除・アーカイブやスキーマ変更のリクエストはCLIから送信できません。
 
-```powershell
+```sh
 cargo run --locked --offline -- notion-check --allow-notion-read
 cargo run --locked --offline --features synthetic-https-fixture -- sync --dry-run --fixture --allow-notion-read
 ```

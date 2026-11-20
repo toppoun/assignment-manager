@@ -23,10 +23,15 @@ zeroize = "1"
 
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 keyring-core = "1"
 rpassword = "7.5.4"
+
+[target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { version = "1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

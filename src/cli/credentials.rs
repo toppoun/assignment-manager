@@ -32,7 +32,7 @@ impl Kind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(super) enum CredentialStatus {
     Ready,
     Disabled,
@@ -70,31 +70,33 @@ pub(super) fn diagnose(
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn lookup(_: &Config, _: &str, _: Kind) -> CredentialStatus {
     CredentialStatus::Unavailable
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn register(_: &Config, _: &str, _: Kind) -> Result<(), CredentialStatus> {
     Err(CredentialStatus::Unavailable)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn notion_client(
     _: &str,
 ) -> Result<assignment_manager::notion::NotionClient, CredentialStatus> {
     Err(CredentialStatus::Unavailable)
 }
 
-#[cfg(windows)]
-pub(super) use windows::{lookup, notion_client, register};
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) use native::{lookup, notion_client, register};
 
-#[cfg(windows)]
-mod windows {
+#[cfg(any(windows, target_os = "macos"))]
+mod native {
     use std::io::{self, IsTerminal};
 
-    use assignment_manager::{notion::NotionClient, windows_credentials::local_entry};
+    use assignment_manager::notion::NotionClient;
+    #[cfg(target_os = "macos")]
+    use keyring_core::api::CredentialStoreApi;
     use keyring_core::{Entry, Error};
     use serde::{Deserialize, Deserializer};
     use zeroize::Zeroizing;
@@ -114,20 +116,31 @@ mod windows {
         String::deserialize(de).map(Zeroizing::new)
     }
 
-    fn entry(target: &str, kind: Kind) -> Result<Entry, CredentialStatus> {
-        let service = format!("io.assignment-manager.notion-cli.v1.{target}");
-        local_entry(&service, kind.code()).map_err(|_| CredentialStatus::Unavailable)
+    fn entry(service: &str, kind: Kind) -> Result<Entry, CredentialStatus> {
+        #[cfg(windows)]
+        let result = assignment_manager::windows_credentials::local_entry(service, kind.code());
+        #[cfg(target_os = "macos")]
+        let result = apple_native_keyring_store::keychain::Store::new()
+            .and_then(|store| store.build(service, kind.code(), None));
+        result.map_err(|_| CredentialStatus::Unavailable)
+    }
+
+    fn target_entry(target: &str, kind: Kind) -> Result<Entry, CredentialStatus> {
+        entry(
+            &format!("io.assignment-manager.notion-cli.v1.{target}"),
+            kind,
+        )
     }
 
     pub(in crate::cli) fn lookup(config: &Config, target: &str, kind: Kind) -> CredentialStatus {
-        let Ok(entry) = entry(target, kind) else {
+        let Ok(entry) = target_entry(target, kind) else {
             return CredentialStatus::Unavailable;
         };
         classify(config, kind, entry.get_secret().map(Zeroizing::new))
     }
 
     pub(in crate::cli) fn notion_client(target: &str) -> Result<NotionClient, CredentialStatus> {
-        let entry = entry(target, Kind::Notion)?;
+        let entry = target_entry(target, Kind::Notion)?;
         let bytes = entry.get_secret().map(Zeroizing::new).map_err(read_error)?;
         client_from_secret(bytes)
     }
@@ -179,7 +192,7 @@ mod windows {
         if !io::stdin().is_terminal() {
             return Err(CredentialStatus::Unavailable);
         }
-        let entry = entry(target, kind)?;
+        let entry = target_entry(target, kind)?;
         let prompt = |label| {
             rpassword::prompt_password(label)
                 .map(Zeroizing::new)
@@ -228,6 +241,10 @@ mod windows {
             CredentialStatus::Missing
         );
         assert_eq!(
+            classify(&config, Kind::Notion, Err(Error::NoDefaultStore)),
+            CredentialStatus::Unavailable
+        );
+        assert_eq!(
             classify(
                 &config,
                 Kind::WebClass,
@@ -247,5 +264,51 @@ mod windows {
             Kind::WebClass,
             br#"{"universityId":"synthetic","password":"synthetic"}"#
         ));
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    #[test]
+    #[ignore = "requires the user's unlocked macOS login Keychain"]
+    fn macos_keychain_round_trip() {
+        // This namespace cannot be selected by any CLI config.
+        let nonce = tempfile::tempdir().unwrap();
+        let name = nonce.path().file_name().unwrap().to_str().unwrap();
+        let service = format!("io.assignment-manager.notion-cli.test.{name}");
+        let config = super::super::tests::config();
+        let kind = Kind::Notion;
+        let record = entry(&service, kind).unwrap();
+        assert_eq!(
+            classify(&config, kind, record.get_secret().map(Zeroizing::new)),
+            CredentialStatus::Missing
+        );
+
+        struct RemoveTestRecord<'a>(&'a Entry);
+        impl Drop for RemoveTestRecord<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.delete_credential();
+            }
+        }
+        let _cleanup = RemoveTestRecord(&record);
+
+        for (value, expected) in [
+            (b"synthetic-token".as_slice(), CredentialStatus::Ready),
+            (b"replacement-token", CredentialStatus::Ready),
+            (b"malformed token", CredentialStatus::Invalid),
+        ] {
+            assert!(
+                record.set_secret(value).is_ok(),
+                "test Keychain save failed"
+            );
+            let reader = entry(&service, kind).unwrap();
+            let loaded = reader.get_secret().map(Zeroizing::new);
+            assert!(loaded.as_ref().is_ok_and(|bytes| bytes.as_slice() == value));
+            assert_eq!(classify(&config, kind, loaded), expected);
+        }
+
+        assert!(
+            record.delete_credential().is_ok(),
+            "test Keychain cleanup failed"
+        );
+        assert!(matches!(record.get_secret(), Err(Error::NoEntry)));
     }
 }

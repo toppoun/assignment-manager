@@ -111,9 +111,17 @@ impl Moodle {
 }
 
 pub(super) fn root() -> Result<PathBuf, ConfigError> {
-    std::env::var_os("LOCALAPPDATA")
+    #[cfg(target_os = "macos")]
+    let (variable, subdirectory) = (
+        "HOME",
+        "Library/Application Support/AssignmentManagerNotion",
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (variable, subdirectory) = ("LOCALAPPDATA", "AssignmentManagerNotion");
+
+    std::env::var_os(variable)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .map(|path| path.join("AssignmentManagerNotion"))
+        .map(|path| path.join(subdirectory))
         .ok_or(ConfigError::Missing)
 }

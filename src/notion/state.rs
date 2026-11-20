@@ -498,6 +498,15 @@ fn check_header(path: &Path) -> Result<(), StateError> {
 }
 
 #[cfg(test)]
+pub(super) fn test_state_dir() -> tempfile::TempDir {
+    let root = std::env::temp_dir();
+    // The default macOS temp directory is reached through the /var symlink.
+    #[cfg(target_os = "macos")]
+    let root = root.canonicalize().unwrap();
+    tempfile::tempdir_in(root).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistence::SqliteStore;
@@ -514,7 +523,7 @@ mod tests {
 
     #[test]
     fn fresh_state_is_atomic_and_foreign_databases_remain_unchanged() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_state_dir();
         let path = root.path().join("state.sqlite3");
         assert!(StateStore::read(&path, TARGET).unwrap().is_none());
         assert!(!path.exists());
@@ -527,7 +536,7 @@ mod tests {
             Err(StateError::InvalidDatabase)
         ));
 
-        let legacy = root.path().join("assignment-manager.db");
+        let legacy = path.with_file_name("assignment-manager.db");
         drop(SqliteStore::open(&legacy).unwrap());
         let old_db = fs::read(&legacy).unwrap();
         assert_eq!(
@@ -543,7 +552,7 @@ mod tests {
 
     #[test]
     fn intents_unknown_and_linked_pages_remain_reserved_after_restart() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_state_dir();
         let path = root.path().join("state.sqlite3");
         StateStore::initialize(&path, TARGET).unwrap();
         let (a, b) = (key('a'), key('b'));
@@ -582,7 +591,7 @@ mod tests {
 
     #[test]
     fn progress_and_fixed_run_issue_roundtrip_without_regressing_timestamps() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_state_dir();
         let path = root.path().join("state.sqlite3");
         StateStore::initialize(&path, TARGET).unwrap();
         let state = StateStore::for_apply(&path, TARGET).unwrap();

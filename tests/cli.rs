@@ -11,13 +11,28 @@ use assignment_manager::notion::state::TargetLock;
 const TARGET: &str = "00000000-0000-4000-8000-000000000001";
 const PROGRAM: &str = env!("CARGO_BIN_EXE_assignment-manager");
 
+fn test_home(temp: &tempfile::TempDir) -> PathBuf {
+    let path = temp.path().to_path_buf();
+    // macOS's default TMPDIR is under the /var symlink, which state paths reject.
+    #[cfg(target_os = "macos")]
+    let path = path.canonicalize().unwrap();
+    path
+}
+
 fn local_root(temp: &tempfile::TempDir) -> PathBuf {
-    temp.path().join("AssignmentManagerNotion")
+    let root = test_home(temp);
+    #[cfg(target_os = "macos")]
+    let root = root.join("Library/Application Support");
+    root.join("AssignmentManagerNotion")
 }
 
 fn call(temp: &tempfile::TempDir, args: &[&str]) -> Output {
+    #[cfg(target_os = "macos")]
+    let variable = "HOME";
+    #[cfg(not(target_os = "macos"))]
+    let variable = "LOCALAPPDATA";
     Command::new(PROGRAM)
-        .env("LOCALAPPDATA", temp.path())
+        .env(variable, test_home(temp))
         .args(args)
         .output()
         .unwrap()
@@ -33,7 +48,7 @@ fn stderr(output: &Output) -> &str {
 
 fn config(temp: &tempfile::TempDir) {
     let root = local_root(temp);
-    fs::create_dir(&root).unwrap();
+    fs::create_dir_all(&root).unwrap();
     fs::write(root.join("config.json"), serde_json::json!({
         "notion":{
             "assignments_data_source_id":TARGET,

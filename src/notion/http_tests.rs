@@ -657,9 +657,9 @@ fn http_relation_cannot_be_replaced_from_an_inconsistent_or_duplicate_projection
 
 #[test]
 fn dry_run_defers_missing_known_pages_and_changed_or_unreconciled_bindings() {
-    use super::state::StateStore;
+    use super::state::{StateStore, test_state_dir};
 
-    let root = tempfile::tempdir().unwrap();
+    let root = test_state_dir();
     let db = root.path().join("state.sqlite3");
     StateStore::initialize(&db, A).unwrap();
     let state = StateStore::for_apply(&db, A).unwrap();
