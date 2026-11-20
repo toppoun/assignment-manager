@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-};
+use std::{collections::HashSet, fmt};
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -57,11 +54,7 @@ impl DryRunReport {
     /// Require a prior binding to agree with the complete snapshot before
     /// proposing a write or marking an assignment unchanged.
     pub fn defer_unreconciled(&mut self, state: &StateSummary) {
-        let known_pages: HashMap<_, _> = state
-            .bindings
-            .iter()
-            .filter_map(|(key, binding)| Some((binding.page_id.as_deref()?, key)))
-            .collect();
+        let known_pages = state.page_owners();
         let mut blocked = HashSet::new();
         for row in &mut self.plan {
             let binding = state.bindings.get(&row.key);
@@ -213,15 +206,19 @@ impl NotionClient {
         schema: &Schema,
         key: Option<&SyncKey>,
     ) -> Result<Vec<NotionAssignment>, NotionError> {
+        self.query_assignment_pages(schema, key, |_, row| Ok(row))
+    }
+
+    pub(super) fn query_assignment_pages<T>(
+        &self,
+        schema: &Schema,
+        key: Option<&SyncKey>,
+        observe: impl Fn(&Value, NotionAssignment) -> Result<T, NotionError>,
+    ) -> Result<Vec<T>, NotionError> {
         let path = format!("/v1/data_sources/{}/query", schema.assignments_id);
         let props = &schema.properties;
-        let filters = property_filters(&[
-            &props.sync_key,
-            &props.title,
-            &props.deadline,
-            &props.source,
-            &props.course,
-        ]);
+        let projection = props.assignment_projection();
+        let filters = property_filters(&projection);
         let mut seen_pages = HashSet::new();
         paginate(
             |cursor| {
@@ -236,7 +233,7 @@ impl NotionClient {
                 self.read(|| self.request(Method::POST, &path, &filters).json(&body))
             },
             |page| {
-                let (mut row, more_relation) = schema.assignment(page)?;
+                let (row, more_relation) = schema.assignment(page)?;
                 if let Some(key) = key
                     && row.sync_key.as_ref() != Some(key)
                 {
@@ -245,17 +242,29 @@ impl NotionClient {
                 if !seen_pages.insert(row.page_id.clone()) {
                     return Err(NotionError::IncompleteSnapshot);
                 }
-                if row.sync_key.is_some() {
-                    row.course_page_ids = self.complete_relation(
-                        &row.page_id,
-                        &props.course,
-                        row.course_page_ids,
-                        more_relation,
-                    )?;
-                }
-                Ok(row)
+                observe(
+                    page,
+                    self.with_complete_relation(schema, row, more_relation)?,
+                )
             },
         )
+    }
+
+    pub(super) fn with_complete_relation(
+        &self,
+        schema: &Schema,
+        mut row: NotionAssignment,
+        more: bool,
+    ) -> Result<NotionAssignment, NotionError> {
+        if row.sync_key.is_some() {
+            row.course_page_ids = self.complete_relation(
+                &row.page_id,
+                &schema.properties.course,
+                row.course_page_ids,
+                more,
+            )?;
+        }
+        Ok(row)
     }
 
     pub(super) fn complete_relation(

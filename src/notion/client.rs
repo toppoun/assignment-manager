@@ -1,4 +1,11 @@
-use std::{error::Error, fmt, io::Read, thread, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    io::Read,
+    sync::Mutex,
+    thread,
+    time::{Duration, Instant},
+};
 
 use reqwest::{
     Method, Url,
@@ -15,6 +22,7 @@ const BASE: &str = "https://api.notion.com";
 const ATTEMPTS: u32 = 3;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
+const REQUEST_INTERVAL: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotionError {
@@ -48,12 +56,20 @@ impl fmt::Display for NotionError {
 
 impl Error for NotionError {}
 
-/// The production transport exposes only read operations. Mutation requests
-/// constructed by the dry-run have no production dispatch method.
+/// The production transport permits read operations only.
 pub struct NotionClient {
     http: Client,
     base: Url,
     retry_base: Duration,
+    interval: Duration,
+    pacing: Mutex<Pacing>,
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    mock_writes: bool,
+}
+
+struct Pacing {
+    next: Instant,
+    cooldown: Option<(NotionError, Option<Instant>)>,
 }
 
 struct Failed {
@@ -114,6 +130,13 @@ impl NotionClient {
             http,
             base: Url::parse(base).map_err(|_| NotionError::Configuration)?,
             retry_base,
+            interval: REQUEST_INTERVAL,
+            pacing: Mutex::new(Pacing {
+                next: Instant::now(),
+                cooldown: None,
+            }),
+            #[cfg(any(test, feature = "synthetic-https-fixture"))]
+            mock_writes: false,
         })
     }
 
@@ -126,13 +149,16 @@ impl NotionClient {
         if !address.ip().is_loopback() {
             return Err(NotionError::Configuration);
         }
-        Self::build(
+        let mut client = Self::build(
             &format!("http://{address}"),
             token,
             false,
             timeout,
             Duration::ZERO,
-        )
+        )?;
+        client.interval = Duration::ZERO;
+        client.mock_writes = true;
+        Ok(client)
     }
 
     pub(super) fn request(
@@ -172,21 +198,47 @@ impl NotionClient {
         unreachable!("bounded retry loop always returns")
     }
 
-    #[cfg(test)]
-    pub(super) fn send_mock_write(
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    pub(super) fn require_mock_writes(&self) -> Result<(), NotionError> {
+        use std::net::IpAddr;
+
+        let loopback = |url: &Url| {
+            url.scheme() == "http"
+                && url.host_str().is_some_and(|host| {
+                    host.trim_matches(['[', ']'])
+                        .parse::<IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+                })
+        };
+        if !self.mock_writes || !loopback(&self.base) {
+            return Err(NotionError::MethodDisabled);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    pub(super) fn send_write(
         &self,
         request: &super::wire::PreparedWrite,
     ) -> Result<serde_json::Value, NotionError> {
-        assert_eq!(
-            self.base.scheme(),
-            "http",
-            "mock writes require a loopback client"
-        );
+        self.require_mock_writes()?;
         let request = self
             .request(request.method().clone(), request.path(), &[])
             .json(request.body())
             .build()
             .map_err(|_| NotionError::Configuration)?;
+        let url = request.url();
+        let valid_path = match *request.method() {
+            Method::POST => url.path() == "/v1/pages",
+            Method::PATCH => url
+                .path()
+                .strip_prefix("/v1/pages/")
+                .is_some_and(|id| uuid(id).as_deref() == Some(id)),
+            _ => false,
+        };
+        if url.origin() != self.base.origin() || url.query().is_some() || !valid_path {
+            return Err(NotionError::MethodDisabled);
+        }
         self.execute(request).map_err(|failure| failure.error)
     }
 
@@ -204,6 +256,24 @@ impl NotionClient {
     }
 
     fn execute<T: DeserializeOwned>(&self, request: Request) -> Result<T, Failed> {
+        // Serialize dispatch through the response headers so a rate limit can
+        // pause subsequent requests, including reconciliation reads.
+        let mut pacing = self.pacing.lock().map_err(|_| NotionError::Transport)?;
+        let now = Instant::now();
+        if let Some((error, until)) = pacing.cooldown {
+            let Some(until) =
+                until.filter(|until| until.saturating_duration_since(now) <= MAX_RETRY_AFTER)
+            else {
+                return Err(Failed {
+                    error,
+                    retry_after: Some(MAX_RETRY_AFTER + Duration::from_secs(1)),
+                });
+            };
+            pacing.next = pacing.next.max(until);
+            pacing.cooldown = None;
+        }
+        thread::sleep(pacing.next.saturating_duration_since(now));
+        pacing.next = Instant::now() + self.interval;
         let response = self.http.execute(request).map_err(|error| {
             if error.is_timeout() {
                 NotionError::Timeout
@@ -229,8 +299,13 @@ impl NotionClient {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_secs);
+            if matches!(error, NotionError::RateLimited | NotionError::Overloaded) {
+                let delay = retry_after.unwrap_or(self.retry_base);
+                pacing.cooldown = Some((error, Instant::now().checked_add(delay)));
+            }
             return Err(Failed { error, retry_after });
         }
+        drop(pacing);
         if response
             .content_length()
             .is_some_and(|size| size > MAX_RESPONSE)

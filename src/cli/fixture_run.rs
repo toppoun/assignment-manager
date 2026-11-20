@@ -1,6 +1,6 @@
 use assignment_manager::{
     moodle_http::{MoodleExportKind, MoodleFeed},
-    notion::{DryRunReport, SyncInput, state::StateSummary},
+    notion::{DryRunReport, SyncInput, fixture, state::StateSummary},
     secured_sync::SecuredSyncClients,
     sync::{WebClassCredentialProvider, acquire_moodle, acquire_webclass_with_reauth},
     webclass_auth::{
@@ -12,6 +12,41 @@ use assignment_manager::{
 };
 
 use super::{AcquisitionStatus, CliError, InspectionReport, Receipt};
+
+pub(super) fn apply(directory: &std::path::Path) -> Result<u8, CliError> {
+    let acquired = acquire(Scenario::BothSuccess)?;
+    let reports =
+        fixture::exercise_apply(&acquired.input, directory).map_err(|error| match error {
+            fixture::ApplyError::State(error) => CliError::State(error),
+            fixture::ApplyError::Notion(error) => {
+                println!("notion_error={}", super::notion_diagnosis(error));
+                CliError::FixtureFailed
+            }
+        })?;
+    let mut ok = matches!(acquired.moodle, AcquisitionStatus::Success)
+        && matches!(acquired.webclass, AcquisitionStatus::Success);
+    for (pass, report) in ["initial", "repeat"].into_iter().zip(reports) {
+        let c = report.counts;
+        println!(
+            "pass={pass} Created={} Updated={} Unchanged={} Conflict={} Deferred={} recovered={} pending={} manual_candidates={}",
+            c.create,
+            c.update,
+            c.unchanged,
+            c.conflict,
+            c.deferred,
+            report.recovered,
+            report.pending,
+            report.manual_candidates
+        );
+        if let Some(error) = report.error {
+            println!("notion_error={}", super::notion_diagnosis(error));
+            ok = false;
+        }
+        ok &= c.conflict == 0 && c.deferred == 0 && report.pending == 0;
+    }
+    println!("result={}", if ok { "success" } else { "partial" });
+    Ok(if ok { 0 } else { 3 })
+}
 
 struct FixtureCredentials;
 

@@ -1,13 +1,13 @@
-//! Notion synchronization preparation, planning, and read-only dry runs.
+//! Notion synchronization planning, read-only dry runs, and loopback apply.
 
+#[cfg(any(test, feature = "synthetic-https-fixture"))]
+mod apply;
 mod client;
 #[cfg(feature = "synthetic-https-fixture")]
 pub mod fixture;
 #[cfg(test)]
 mod http_tests;
 mod inspection;
-#[cfg(test)]
-mod mock_apply;
 mod plan;
 mod reader;
 pub mod state;

@@ -23,6 +23,8 @@ use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
 const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run>\nKIND: moodle, webclass, notion\nFixture build: sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+#[cfg(feature = "synthetic-https-fixture")]
+const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -34,13 +36,14 @@ enum Command {
     Sync(bool),
     NotionCheck,
     NotionFixturePreview,
+    FixtureApply,
 }
 
 impl Command {
     fn uses_fixture(&self) -> bool {
         matches!(
             self,
-            Self::InitState(true) | Self::Status(true) | Self::Sync(true)
+            Self::InitState(true) | Self::Status(true) | Self::Sync(true) | Self::FixtureApply
         )
     }
 
@@ -75,6 +78,7 @@ impl Arguments {
             ["status", "--fixture"] => Command::Status(true),
             ["sync", "--dry-run"] => Command::Sync(false),
             ["sync", "--dry-run", "--fixture"] => Command::Sync(true),
+            ["fixture-apply"] => Command::FixtureApply,
             ["sync", "--dry-run", "--fixture", "--allow-notion-read"] => {
                 Command::NotionFixturePreview
             }
@@ -461,6 +465,9 @@ fn preview_with_client(
 
 #[cfg(feature = "synthetic-https-fixture")]
 fn run_fixture(command: Command, root: PathBuf) -> Result<u8, CliError> {
+    if command == Command::FixtureApply {
+        return fixture_run::apply(&root.join("fixture-apply"));
+    }
     let target = assignment_manager::notion::fixture::target()
         .validated_id()
         .map_err(|_| CliError::FixtureFailed)?;
@@ -496,6 +503,8 @@ fn run_fixture(_: Command, _: PathBuf) -> Result<u8, CliError> {
 fn execute(args: Arguments) -> Result<u8, CliError> {
     if args.command == Command::Help {
         println!("{USAGE}");
+        #[cfg(feature = "synthetic-https-fixture")]
+        println!("{APPLY_USAGE}");
         return Ok(0);
     }
     // Fail before accessing local state when this is an ordinary binary.

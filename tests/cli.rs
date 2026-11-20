@@ -138,10 +138,42 @@ fn a_second_process_is_rejected_and_a_killed_process_releases_the_lock() {
 #[test]
 fn the_default_binary_refuses_fixture_network_and_apply() {
     let temp = tempfile::tempdir().unwrap();
-    let output = call(&temp, &["sync", "--dry-run", "--fixture"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("fixture_feature_required"));
+    for args in [&["sync", "--dry-run", "--fixture"][..], &["fixture-apply"]] {
+        let output = call(&temp, args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains("fixture_feature_required"));
+    }
     assert!(!local_root(&temp).exists());
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+#[test]
+fn cli_fixture_apply_creates_then_resyncs_and_leaves_existing_state_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let rejected = call(&temp, &["fixture-apply", "--allow-notion-read"]);
+    assert_eq!(rejected.status.code(), Some(2));
+    let rejected = call(&temp, &["--config", "unused.json", "fixture-apply"]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(!local_root(&temp).exists());
+
+    let init = call(&temp, &["init-state", "--fixture"]);
+    assert!(init.status.success(), "{}", stderr(&init));
+    let state = local_root(&temp).join("fixture/state.sqlite3");
+    let before = fs::read(&state).unwrap();
+    let output = call(&temp, &["fixture-apply"]);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("pass=initial Created=10 Updated=0 Unchanged=0"));
+    assert!(stdout(&output).contains("pass=repeat Created=0 Updated=0 Unchanged=10"));
+    assert!(stdout(&output).contains("result=success"));
+    assert_eq!(fs::read(&state).unwrap(), before);
+    let fixture_apply = local_root(&temp).join("fixture-apply");
+    assert_eq!(fs::read_dir(fixture_apply).unwrap().count(), 1);
+    assert!(!local_root(&temp).join("targets").exists());
 }
 
 #[cfg(feature = "synthetic-https-fixture")]

@@ -1,17 +1,16 @@
+mod apply_tests;
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use reqwest::Method;
-use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use super::{
-    mock_apply::{self, ApplyError, CreateOutcome},
     tests::{candidate, input, input_with_course, key},
     *,
 };
@@ -136,9 +135,16 @@ fn mock(script: Vec<Exchange>) -> (NotionClient, JoinHandle<()>) {
 }
 
 fn mock_with_timeout(script: Vec<Exchange>, timeout: Duration) -> (NotionClient, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    serve(TcpListener::bind("127.0.0.1:0").unwrap(), script, timeout)
+}
+
+fn serve(
+    listener: TcpListener,
+    script: Vec<Exchange>,
+    timeout: Duration,
+) -> (NotionClient, JoinHandle<()>) {
     listener.set_nonblocking(true).unwrap();
-    let client = NotionClient::for_mock(listener.local_addr().unwrap(), TOKEN, timeout).unwrap();
+    let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for exchange in script {
             let start = Instant::now();
@@ -161,7 +167,10 @@ fn mock_with_timeout(script: Vec<Exchange>, timeout: Duration) -> (NotionClient,
         // A hidden extra send may be queued by the time the last handler exits.
         assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     });
-    (client, server)
+    (
+        NotionClient::for_mock(address, TOKEN, timeout).unwrap(),
+        server,
+    )
 }
 
 fn target() -> NotionTarget {
@@ -233,6 +242,7 @@ fn query(results: Vec<Value>, cursor: Option<&str>) -> Exchange {
 fn page(id: &str, source: &str, database: &str, properties: Value) -> Value {
     json!({
         "object":"page","id":id,"in_trash":false,"properties":properties,
+        "last_edited_time":"2026-11-20T00:00:00Z",
         "parent":{"type":"data_source_id","data_source_id":source,"database_id":database}
     })
 }
@@ -432,8 +442,8 @@ fn http_errors_are_classified_and_reads_have_a_retry_limit() {
         error(504),
         error(503),
         Exchange::json("GET", &path, json!({"success":true})),
-        Exchange::error("GET", &path, 429, "Retry-After: 61\r\n"),
         Exchange::error("GET", &path, 302, "Location: http://127.0.0.1:1/other\r\n"),
+        Exchange::error("GET", &path, 429, "Retry-After: 3600\r\n"),
     ]);
     let (client, server) = mock(script);
     for expected in [
@@ -454,11 +464,15 @@ fn http_errors_are_classified_and_reads_have_a_retry_limit() {
     assert_eq!(client.retrieve_page(PAGE_A, &[]).unwrap()["success"], true);
     assert_eq!(
         client.retrieve_page(PAGE_A, &[]),
+        Err(NotionError::Rejected(302))
+    );
+    assert_eq!(
+        client.retrieve_page(PAGE_A, &[]),
         Err(NotionError::RateLimited)
     );
     assert_eq!(
         client.retrieve_page(PAGE_A, &[]),
-        Err(NotionError::Rejected(302))
+        Err(NotionError::RateLimited)
     );
     server.join().unwrap();
 }
@@ -803,214 +817,6 @@ fn http_deadline_comparison_uses_instants_and_serializes_a_changed_date() {
         &json!({"properties":{"due":{"date":{"start":"2026-11-20T01:30:00Z"}}}})
     );
     server.join().unwrap();
-}
-
-fn exact(expected: SyncKey, rows: Vec<Value>) -> Exchange {
-    query(rows, None).check(move |_, body| {
-        assert_eq!(
-            body["filter"],
-            json!({
-                "property":"sync","rich_text":{"equals":expected.as_str()}
-            })
-        );
-    })
-}
-
-struct JournalPath(PathBuf);
-
-impl JournalPath {
-    fn new() -> Self {
-        let mut bytes = [0; 16];
-        aws_lc_rs::rand::fill(&mut bytes).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "assignment-manager-notion-{:032x}.sqlite",
-            u128::from_ne_bytes(bytes)
-        ));
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        Self(path)
-    }
-
-    fn open(&self) -> Connection {
-        Connection::open(&self.0).unwrap()
-    }
-}
-
-impl Drop for JournalPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-fn journal_page(path: &Path, key: &SyncKey) -> Option<String> {
-    let db = Connection::open(path).unwrap();
-    db.query_row(
-        "SELECT page_id FROM notion_creation WHERE data_source=?1 AND sync_key=?2",
-        [A, key.as_str()],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
-
-#[test]
-fn http_mock_creation_recovers_across_restart_without_resending_ambiguous_posts() {
-    let journal = JournalPath::new();
-    let a = key("a");
-    let b = key("b");
-    let input = input(vec![candidate("a", "Task A"), candidate("b", "Task B")]);
-    let remote_a = task(PAGE_A, Some(&a), "Task A");
-    let remote_b = task(PAGE_B, Some(&b), "Task B");
-    let mut script = schema_exchanges(schema_json());
-    script.push(query(vec![], None));
-    script.extend(schema_exchanges(schema_json()));
-    script.push(exact(a.clone(), vec![]));
-    let journal_path = journal.0.clone();
-    let post_a_key = a.clone();
-    script.push(
-        Exchange::drop_response("POST", "/v1/pages").check(move |_, body| {
-            assert_eq!(
-                body["properties"]["sync"]["rich_text"],
-                json!([text(post_a_key.as_str())])
-            );
-            // A separate SQLite connection can read the committed intent before POST.
-            assert_eq!(journal_page(&journal_path, &post_a_key), None);
-        }),
-    );
-    script.push(exact(b.clone(), vec![]));
-    script.push(Exchange::json("POST", "/v1/pages", remote_b));
-    // Search initially returns zero although the original POST was processed.
-    script.push(exact(a.clone(), vec![]));
-    script.push(exact(a.clone(), vec![remote_a.clone()]));
-    // Previously known pages that become inaccessible, moved or trashed defer.
-    script.push(Exchange::error(
-        "GET",
-        format!("/v1/pages/{PAGE_B}"),
-        404,
-        "",
-    ));
-    let mut moved = remote_a.clone();
-    moved["parent"] = json!({"type":"data_source_id","data_source_id":C,"database_id":C_DB});
-    script.push(Exchange::json("GET", format!("/v1/pages/{PAGE_A}"), moved));
-    let mut trashed = remote_a;
-    trashed["in_trash"] = json!(true);
-    script.push(Exchange::json(
-        "GET",
-        format!("/v1/pages/{PAGE_A}"),
-        trashed,
-    ));
-
-    let (client, server) = mock(script);
-    let db = journal.open();
-    mock_apply::initialize(&db).unwrap();
-    let preview = client.dry_run(&input, &target(), &[]);
-    assert_eq!(preview.counts().create, 2);
-    let for_key = |key: &SyncKey| preview.requests().iter().find(|r| r.key() == key).unwrap();
-    let schema = client.retrieve_schema(&target()).unwrap();
-
-    assert_eq!(
-        mock_apply::create_once(&client, &schema, &db, for_key(&a)).unwrap(),
-        CreateOutcome::Deferred
-    );
-    assert_eq!(
-        mock_apply::create_once(&client, &schema, &db, for_key(&b)).unwrap(),
-        CreateOutcome::Created
-    );
-    drop(db);
-    let db = journal.open();
-    assert_eq!(
-        mock_apply::create_once(&client, &schema, &db, for_key(&a)).unwrap(),
-        CreateOutcome::Deferred
-    );
-    assert_eq!(journal_page(&journal.0, &a), None);
-    assert_eq!(
-        mock_apply::create_once(&client, &schema, &db, for_key(&a)).unwrap(),
-        CreateOutcome::Confirmed
-    );
-    assert_eq!(journal_page(&journal.0, &a).as_deref(), Some(PAGE_A));
-    assert_eq!(journal_page(&journal.0, &b).as_deref(), Some(PAGE_B));
-    for key in [&b, &a, &a] {
-        assert_eq!(
-            mock_apply::create_once(&client, &schema, &db, for_key(key)).unwrap(),
-            CreateOutcome::Deferred
-        );
-    }
-    server.join().unwrap();
-}
-
-#[test]
-fn http_mock_create_rechecks_matches_before_post() {
-    let a = key("a");
-    let input = input(vec![candidate("a", "Task A")]);
-    let mut script = schema_exchanges(schema_json());
-    let mut incomplete = list(vec![], None);
-    incomplete["request_status"] = json!({"type":"incomplete"});
-    script.push(Exchange::json(
-        "POST",
-        format!("/v1/data_sources/{A}/query"),
-        incomplete,
-    ));
-    let existing = task(PAGE_A, Some(&a), "Task A");
-    script.push(exact(
-        a.clone(),
-        vec![existing.clone(), task(PAGE_B, Some(&a), "Duplicate")],
-    ));
-    script.push(exact(a.clone(), vec![existing]));
-    let (client, server) = mock(script);
-    let schema = client.retrieve_schema(&target()).unwrap();
-    let plan = plan_sync(&input, NotionSnapshot::Complete(&[]), &[]);
-    let request = schema.prepare(&plan[0]).unwrap().unwrap();
-    let db = Connection::open_in_memory().unwrap();
-    mock_apply::initialize(&db).unwrap();
-
-    let result = mock_apply::create_once(&client, &schema, &db, &request);
-    assert!(matches!(
-        result,
-        Err(ApplyError::Read(NotionError::IncompleteSnapshot))
-    ));
-    assert_eq!(
-        mock_apply::create_once(&client, &schema, &db, &request).unwrap(),
-        CreateOutcome::Conflict
-    );
-    assert_eq!(
-        mock_apply::create_once(&client, &schema, &db, &request).unwrap(),
-        CreateOutcome::Confirmed
-    );
-    server.join().unwrap();
-}
-
-#[test]
-fn http_mock_write_errors_are_reconciled_before_any_further_creation() {
-    let a = key("a");
-    let input = input(vec![candidate("a", "Task A")]);
-    for status in [429, 529, 503] {
-        let mut script = schema_exchanges(schema_json());
-        script.push(exact(a.clone(), vec![]));
-        script.push(Exchange::error(
-            "POST",
-            "/v1/pages",
-            status,
-            "Retry-After: 0\r\n",
-        ));
-        script.push(exact(a.clone(), vec![task(PAGE_A, Some(&a), "Task A")]));
-        let (client, server) = mock(script);
-        let schema = client.retrieve_schema(&target()).unwrap();
-        let plan = plan_sync(&input, NotionSnapshot::Complete(&[]), &[]);
-        let request = schema.prepare(&plan[0]).unwrap().unwrap();
-        let db = Connection::open_in_memory().unwrap();
-        mock_apply::initialize(&db).unwrap();
-        assert_eq!(
-            mock_apply::create_once(&client, &schema, &db, &request).unwrap(),
-            CreateOutcome::Deferred
-        );
-        assert_eq!(
-            mock_apply::create_once(&client, &schema, &db, &request).unwrap(),
-            CreateOutcome::Confirmed
-        );
-        server.join().unwrap();
-    }
 }
 
 fn inspection_schema() -> Value {

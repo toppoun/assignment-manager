@@ -101,6 +101,16 @@ pub(super) fn property_id(id: &str) -> bool {
 }
 
 impl NotionPropertyIds {
+    pub(super) fn assignment_projection(&self) -> [&str; 5] {
+        [
+            &self.sync_key,
+            &self.title,
+            &self.deadline,
+            &self.source,
+            &self.course,
+        ]
+    }
+
     pub(super) fn fields(&self) -> [(&str, &'static str); 6] {
         [
             (&self.title, "title"),
@@ -308,6 +318,19 @@ impl Schema {
         Ok((row, has_more))
     }
 
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    pub(super) fn manual_title_deadline(&self, page: &Value) -> Option<(String, Option<Deadline>)> {
+        Some((
+            text(page_property(page, &self.properties.title, "title").ok()?).ok()?,
+            read_deadline(page_property(page, &self.properties.deadline, "date").ok()?).ok()?,
+        ))
+    }
+
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    pub(super) fn title_content<'a>(&self, page: &'a Value) -> Result<&'a Value, NotionError> {
+        page_property(page, &self.properties.title, "title")
+    }
+
     pub(super) fn prepare(
         &self,
         entry: &PlannedAssignment,
@@ -379,6 +402,10 @@ pub(super) fn checked_page_id(
     let id = object_id(page, "id").ok_or(NotionError::InvalidResponse)?;
     let parent = &page["parent"];
     if page["in_trash"].as_bool() != Some(false)
+        || ["is_archived", "archived"].iter().any(|flag| {
+            page.get(flag)
+                .is_some_and(|value| value.as_bool() != Some(false))
+        })
         || parent["type"] != "data_source_id"
         || object_id(parent, "data_source_id").as_deref() != Some(source)
         || object_id(parent, "database_id").as_deref() != Some(database)

@@ -122,6 +122,9 @@ Create / Update / Unchanged / Conflict / Deferred の件数を表示します。
 同期状態DBは読み取り専用で開きます。件数と固定分類だけを別の
 `last-dry-run.json` に記録します。
 
+Phase 3Cの合成HTTPモックでの作成・再同期、障害復旧、実書き込みの有効化条件は
+[Notion同期 Phase 3C](docs/NOTION-SYNC-PHASE-3C.md)を参照してください。
+
 ### 授業の対応表と既存課題の移行案
 
 `course_mappings` は人が確認するローカル設定です。たとえば以下のように

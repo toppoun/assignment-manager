@@ -1,4 +1,4 @@
-//! Dedicated SQLite state for future apply operations. Dry runs only open it read-only.
+//! Dedicated SQLite state for apply operations. Dry runs only open it read-only.
 
 use std::{
     collections::HashMap,
@@ -171,6 +171,15 @@ pub struct StateSummary {
     pub last_run: Option<StateRun>,
 }
 
+impl StateSummary {
+    pub(super) fn page_owners(&self) -> HashMap<&str, &SyncKey> {
+        self.bindings
+            .iter()
+            .filter_map(|(key, binding)| Some((binding.page_id.as_deref()?, key)))
+            .collect()
+    }
+}
+
 pub struct StateRun {
     pub finished_at: DateTime<Utc>,
     pub outcome: RunOutcome,
@@ -250,6 +259,13 @@ impl StateStore {
     /// The caller owns the target lock for the duration of its run.
     pub fn for_apply(path: &Path, target: &str) -> Result<Self, StateError> {
         let state = Self::open(path, target, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let integrity: String = state
+            .0
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .map_err(|_| StateError::InvalidDatabase)?;
+        if integrity != "ok" {
+            return Err(StateError::InvalidDatabase);
+        }
         state.summary()?;
         state
             .0
@@ -314,6 +330,30 @@ impl StateStore {
 
     pub fn mark_unknown(&self, key: &SyncKey) -> Result<(), StateError> {
         self.change("UPDATE bindings SET status='unknown' WHERE sync_key=?1 AND status IN ('intent','unknown')", key)
+    }
+
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    pub(super) fn is_owned_by_another_key(
+        &self,
+        page: &str,
+        key: &SyncKey,
+    ) -> Result<bool, StateError> {
+        self.0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM bindings WHERE page_id=?1 AND sync_key<>?2)",
+                params![page, key.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| StateError::Database)
+    }
+
+    /// Release only an intent whose request got an explicit rejection.
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    pub(super) fn release_rejected_create(&self, key: &SyncKey) -> Result<(), StateError> {
+        self.change(
+            "DELETE FROM bindings WHERE sync_key=?1 AND status='intent'",
+            key,
+        )
     }
 
     pub fn mark_reconcile(&self, key: &SyncKey) -> Result<(), StateError> {
@@ -381,7 +421,7 @@ impl StateStore {
         ).map(|_| ()).map_err(|_| StateError::Database)
     }
 
-    fn summary(&self) -> Result<StateSummary, StateError> {
+    pub(super) fn summary(&self) -> Result<StateSummary, StateError> {
         let mut stmt = self
             .0
             .prepare("SELECT sync_key, page_id, status FROM bindings")
