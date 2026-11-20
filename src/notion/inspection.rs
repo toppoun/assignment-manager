@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use super::{
     CourseMapping, DryRunReport, NotionAssignment, NotionClient, NotionError, NotionTarget,
     SyncInput,
+    trial::MANAGED_PROPERTIES,
     wire::{
         Schema, checked_page_id, data_source_parent, page_relations, relation_targets,
         source_options, uuid,
@@ -275,14 +276,10 @@ fn schema_findings<'a>(
         findings.push(finding);
     }
 
-    for (role, name, kind) in [
-        ("status", "状態", "status"),
-        ("priority", "優先度", "select"),
+    for (role, name, kind) in MANAGED_PROPERTIES.into_iter().chain([
         ("subject", "科目", "select"),
         ("category", "種別", "select"),
-        ("recurrence", "繰り返し", "select"),
-        ("notes", "メモ", "rich_text"),
-    ] {
+    ]) {
         findings.push(describe(role, kind, props.get(name).into_iter(), true).0);
     }
     (findings, relation)

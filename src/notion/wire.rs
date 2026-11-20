@@ -11,7 +11,7 @@ use super::{
     NotionAssignment, NotionError, PlanAction, PlannedAssignment, SyncKey, UniversitySource,
 };
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// Property IDs returned by the API for the preconfigured assignment schema.
 /// Renaming a column does not change these IDs.
@@ -40,6 +40,7 @@ pub struct NotionTarget {
     pub properties: NotionPropertyIds,
 }
 
+#[derive(PartialEq, Eq)]
 pub(super) struct Schema {
     pub assignments_id: String,
     pub assignments_database: String,
@@ -318,15 +319,16 @@ impl Schema {
         Ok((row, has_more))
     }
 
-    #[cfg(any(test, feature = "synthetic-https-fixture"))]
-    pub(super) fn manual_title_deadline(&self, page: &Value) -> Option<(String, Option<Deadline>)> {
-        Some((
-            text(page_property(page, &self.properties.title, "title").ok()?).ok()?,
-            read_deadline(page_property(page, &self.properties.deadline, "date").ok()?).ok()?,
+    pub(super) fn manual_title_deadline(
+        &self,
+        page: &Value,
+    ) -> Result<(String, Option<Deadline>), NotionError> {
+        Ok((
+            text(page_property(page, &self.properties.title, "title")?)?,
+            read_deadline(page_property(page, &self.properties.deadline, "date")?)?,
         ))
     }
 
-    #[cfg(any(test, feature = "synthetic-https-fixture"))]
     pub(super) fn title_content<'a>(&self, page: &'a Value) -> Result<&'a Value, NotionError> {
         page_property(page, &self.properties.title, "title")
     }
@@ -355,6 +357,7 @@ impl Schema {
                     props.insert(ids.course.clone(), relation_value(id)?);
                 }
                 PreparedWrite {
+                    target_id: self.assignments_id.clone(),
                     key: entry.key.clone(),
                     method: Method::POST,
                     path: "/v1/pages".into(),
@@ -379,6 +382,7 @@ impl Schema {
                 }
                 let id = uuid(page_id).ok_or(NotionError::InvalidWrite)?;
                 PreparedWrite {
+                    target_id: self.assignments_id.clone(),
                     key: entry.key.clone(),
                     method: Method::PATCH,
                     path: format!("/v1/pages/{id}"),
@@ -489,7 +493,9 @@ fn relation_value(id: &str) -> Result<Value, NotionError> {
 }
 
 /// A request preview with no authorization data or send method.
+#[derive(PartialEq, Eq)]
 pub struct PreparedWrite {
+    pub(super) target_id: String,
     key: SyncKey,
     method: Method,
     path: String,

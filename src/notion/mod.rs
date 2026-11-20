@@ -1,6 +1,5 @@
-//! Notion synchronization planning, read-only dry runs, and loopback apply.
+//! Notion synchronization planning, read-only dry runs, and guarded apply.
 
-#[cfg(any(test, feature = "synthetic-https-fixture"))]
 mod apply;
 mod client;
 #[cfg(feature = "synthetic-https-fixture")]
@@ -13,8 +12,10 @@ mod reader;
 pub mod state;
 #[cfg(test)]
 mod tests;
+mod trial;
 mod wire;
 
+pub use apply::{ApplyError, ApplyPreview, ApplyReport};
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
 pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus, SnapshotSummary};
 pub use plan::{
@@ -22,6 +23,7 @@ pub use plan::{
     NotionSnapshot, PlanAction, PlannedAssignment, plan_sync,
 };
 pub use reader::{DryRunCounts, DryRunReport};
+pub use trial::{TrialAssignment, TrialRole, TrialTarget};
 pub use wire::{NotionPropertyIds, NotionTarget, PreparedWrite};
 
 use std::{

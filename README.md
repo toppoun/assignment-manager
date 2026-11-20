@@ -99,7 +99,7 @@ Notionの「データソースを管理」から両方のデータソースIDを
 次の明示オプションで、公式の `https://api.notion.com` に接続します。
 メタデータと個別ページのGET、および一覧を読む
 `POST /v1/data_sources/{data_source_id}/query` を利用します。
-作成・更新・削除・アーカイブやスキーマ変更のリクエストはCLIから送信できません。
+この読み取り経路からは作成・更新・削除・アーカイブやスキーマ変更を送信しません。
 
 ```sh
 cargo run --locked --offline -- notion-check --allow-notion-read
@@ -124,6 +124,13 @@ Create / Update / Unchanged / Conflict / Deferred の件数を表示します。
 
 Phase 3Cの合成HTTPモックでの作成・再同期、障害復旧、実書き込みの有効化条件は
 [Notion同期 Phase 3C](docs/NOTION-SYNC-PHASE-3C.md)を参照してください。
+
+### macOSの検証用Notionへの試験同期
+
+`notion-trial --target ID` は独立した検証用課題・授業データソースと合成課題1件を使います。
+既定はdry-runです。書き込みには `--allow-notion-write` と、表示された計画の対話承認が必要です。
+検証環境の準備・共有と試験書き込みには別途承認が必要です。設定例と検証手順は
+[Notion同期 Phase 3D](docs/NOTION-SYNC-PHASE-3D.md)を参照してください。
 
 ### 授業の対応表と既存課題の移行案
 

@@ -43,25 +43,7 @@ pub(super) enum ConfigError {
 
 impl Config {
     pub fn read(path: &Path) -> Result<Self, ConfigError> {
-        let file = File::open(path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ConfigError::Missing,
-            _ => ConfigError::Unreadable,
-        })?;
-        if !file
-            .metadata()
-            .map_err(|_| ConfigError::Unreadable)?
-            .is_file()
-        {
-            return Err(ConfigError::Invalid);
-        }
-        let mut data = Vec::new();
-        file.take(65_537)
-            .read_to_end(&mut data)
-            .map_err(|_| ConfigError::Unreadable)?;
-        if data.len() > 65_536 {
-            return Err(ConfigError::Invalid);
-        }
-        Self::parse(&data)
+        Self::parse(&read_bytes(path)?)
     }
 
     pub fn parse(data: &[u8]) -> Result<Self, ConfigError> {
@@ -100,6 +82,28 @@ impl Config {
     pub fn target_id(&self) -> Result<String, ConfigError> {
         self.notion.validated_id().map_err(|_| ConfigError::Invalid)
     }
+}
+
+pub(super) fn read_bytes(path: &Path) -> Result<Vec<u8>, ConfigError> {
+    let file = File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ConfigError::Missing,
+        _ => ConfigError::Unreadable,
+    })?;
+    if !file
+        .metadata()
+        .map_err(|_| ConfigError::Unreadable)?
+        .is_file()
+    {
+        return Err(ConfigError::Invalid);
+    }
+    let mut data = Vec::new();
+    file.take(65_537)
+        .read_to_end(&mut data)
+        .map_err(|_| ConfigError::Unreadable)?;
+    if data.len() > 65_536 {
+        return Err(ConfigError::Invalid);
+    }
+    Ok(data)
 }
 
 impl Moodle {

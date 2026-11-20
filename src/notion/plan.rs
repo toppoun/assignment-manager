@@ -77,6 +77,7 @@ pub enum ConflictReason {
 pub enum DeferredReason {
     IncompleteSnapshot,
     PendingReconciliation,
+    ManualCandidate,
     /// Only an earlier WebClass attempt produced this candidate.
     EarlierAttempt,
     /// The run has no current candidate. Includes failed, skipped, filtered and absent records.

@@ -7,8 +7,9 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{
-    AssignmentPatch, CourseMapping, DryRunCounts, NotionAssignment, NotionClient, NotionError,
-    NotionTarget, PlanAction, PreparedWrite, SyncInput,
+    AssignmentPatch, CourseMapping, DryRunCounts, DryRunReport, NotionAssignment, NotionClient,
+    NotionError, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, TrialAssignment,
+    TrialRole, TrialTarget,
     state::{BindingStatus, StateError, StateStore, StateSummary, TargetLock},
     wire::{Schema, checked_page_id},
 };
@@ -17,6 +18,13 @@ use super::{
 pub enum ApplyError {
     Notion(NotionError),
     State(StateError),
+    PlanChanged,
+}
+
+impl From<NotionError> for ApplyError {
+    fn from(error: NotionError) -> Self {
+        Self::Notion(error)
+    }
 }
 
 impl From<StateError> for ApplyError {
@@ -34,6 +42,60 @@ pub struct ApplyReport {
     pub error: Option<NotionError>,
 }
 
+pub struct ApplyPreview<'a> {
+    plan: &'a PreparedApply,
+}
+
+impl ApplyPreview<'_> {
+    pub fn assignments(&self) -> &[PlannedAssignment] {
+        self.plan.deltas.plan()
+    }
+
+    pub fn summary(&self) -> ApplyReport {
+        self.plan.summary()
+    }
+}
+
+pub(super) enum WriteAccess<'a> {
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
+    Mock,
+    Trial(ApprovedTrial<'a>),
+}
+
+pub(super) struct ApprovedTrial<'a>(&'a TrialTarget);
+
+impl ApprovedTrial<'_> {
+    pub(super) fn target(&self) -> &TrialTarget {
+        self.0
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct PreparedApply {
+    schema: Schema,
+    pages: Vec<Observation>,
+    deltas: DryRunReport,
+    manual_candidates: Vec<(SyncKey, String)>,
+    recovered: Vec<(SyncKey, String)>,
+    pending: usize,
+    missing_bindings: usize,
+}
+
+impl PreparedApply {
+    fn summary(&self) -> ApplyReport {
+        let mut counts = self.deltas.counts();
+        counts.deferred += self.missing_bindings;
+        ApplyReport {
+            counts,
+            recovered: self.recovered.len(),
+            pending: self.pending,
+            manual_candidates: self.manual_candidates.len(),
+            error: None,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
 struct Observation {
     row: NotionAssignment,
     edited_at: Option<DateTime<Utc>>,
@@ -50,11 +112,8 @@ impl Observation {
                 .to_utc();
             (Some(edited_at), Some(schema.title_content(page)?.clone()))
         } else {
-            // Manual fields are optional diagnostic input. They never generate a patch.
-            if let Some((title, deadline)) = schema.manual_title_deadline(page) {
-                row.title = title;
-                row.deadline = deadline;
-            }
+            // An unreadable manual row cannot safely rule out a duplicate candidate.
+            (row.title, row.deadline) = schema.manual_title_deadline(page)?;
             (None, None)
         };
         Ok(Self {
@@ -78,10 +137,59 @@ enum WriteOutcome {
 }
 
 impl NotionClient {
+    pub fn preview_trial(
+        &self,
+        trial: &TrialTarget,
+        assignment: &TrialAssignment,
+        directory: &Path,
+    ) -> Result<ApplyReport, ApplyError> {
+        let (input, mappings) = assignment.input()?;
+        let _lock = TargetLock::acquire(directory)?;
+        let state = StateStore::read(&directory.join("state.sqlite3"), trial.assignment_id())?
+            .ok_or(StateError::InvalidDatabase)?;
+        self.verify_trial_bot(trial, TrialRole::Read)?;
+        let plan = self.prepare_apply(&input, trial.retrieve_schema(self)?, &mappings, state)?;
+        Ok(plan.summary())
+    }
+
+    /// Apply the plan shown to the caller. Recheck it after interactive approval,
+    /// while retaining the same target lock and state connection.
+    pub fn apply_trial(
+        &self,
+        trial: &TrialTarget,
+        assignment: &TrialAssignment,
+        directory: &Path,
+        approve: impl FnOnce(ApplyPreview<'_>) -> bool,
+    ) -> Result<Option<ApplyReport>, ApplyError> {
+        let (input, mappings) = assignment.input()?;
+        let _lock = TargetLock::acquire(directory)?;
+        let store = StateStore::for_apply(&directory.join("state.sqlite3"), trial.assignment_id())?;
+        self.verify_trial_bot(trial, TrialRole::Write)?;
+        let prepare = || -> Result<PreparedApply, ApplyError> {
+            Ok(self.prepare_apply(
+                &input,
+                trial.retrieve_schema(self)?,
+                &mappings,
+                store.summary()?,
+            )?)
+        };
+        let plan = prepare()?;
+        if !approve(ApplyPreview { plan: &plan }) {
+            return Ok(None);
+        }
+        let fresh = prepare()?;
+        if fresh != plan {
+            return Err(ApplyError::PlanChanged);
+        }
+        self.execute_apply(fresh, &store, &WriteAccess::Trial(ApprovedTrial(trial)))
+            .map(Some)
+    }
+
+    #[cfg(any(test, feature = "synthetic-https-fixture"))]
     pub(super) fn apply(
         &self,
         input: &SyncInput,
-        target: &NotionTarget,
+        target: &super::NotionTarget,
         mappings: &[CourseMapping],
         directory: &Path,
     ) -> Result<ApplyReport, ApplyError> {
@@ -89,59 +197,85 @@ impl NotionClient {
         let target_id = target.validated_id().map_err(ApplyError::Notion)?;
         let _lock = TargetLock::acquire(directory)?;
         let store = StateStore::for_apply(&directory.join("state.sqlite3"), &target_id)?;
-        let mut state = store.summary()?;
-
-        let snapshot = self.retrieve_schema(target).and_then(|schema| {
-            self.query_assignment_pages(&schema, None, |page, row| {
-                Observation::new(&schema, page, row)
-            })
-            .map(|pages| (schema, pages))
-        });
-        let (schema, pages) = match snapshot {
-            Ok(snapshot) => snapshot,
+        let state = store.summary()?;
+        let plan = match self.retrieve_schema(target) {
+            Ok(schema) => self.prepare_apply(input, schema, mappings, state),
             Err(error) => {
                 return Ok(unavailable(input, &state, error));
             }
         };
-        let recovered = reconcile_creates(&store, &state, &pages)?;
-        if recovered != 0 {
-            state = store.summary()?;
+        match plan {
+            Ok(plan) => self.execute_apply(plan, &store, &WriteAccess::Mock),
+            Err(error) => Ok(unavailable(input, &store.summary()?, error)),
         }
-        let mut report = ApplyReport {
-            pending: state.pending,
+    }
+
+    fn prepare_apply(
+        &self,
+        input: &SyncInput,
+        schema: Schema,
+        mappings: &[CourseMapping],
+        mut state: StateSummary,
+    ) -> Result<PreparedApply, NotionError> {
+        let mut pages = self.query_assignment_pages(&schema, None, |page, row| {
+            Observation::new(&schema, page, row)
+        })?;
+        pages.sort_unstable_by(|a, b| a.row.page_id.cmp(&b.row.page_id));
+        let recovered = recoverable_intents(&state, &pages);
+        for (key, page) in &recovered {
+            let binding = state.bindings.get_mut(key).expect("known intent");
+            binding.status = BindingStatus::Linked;
+            binding.page_id = Some(page.clone());
+        }
+        let rows: Vec<_> = pages.iter().map(|page| page.row.clone()).collect();
+        let mut deltas = self.plan_from_rows(input, &schema, &rows, mappings)?;
+        let manual_candidates = deltas.defer_manual_candidates(&rows);
+        deltas.defer_unreconciled(&state);
+        let planned_keys: HashSet<_> = deltas.plan().iter().map(|entry| &entry.key).collect();
+        let missing_bindings = state
+            .bindings
+            .keys()
+            .filter(|key| !planned_keys.contains(key))
+            .count();
+        Ok(PreparedApply {
+            schema,
+            pages,
+            deltas,
+            manual_candidates,
+            pending: state.pending - recovered.len(),
             recovered,
+            missing_bindings,
+        })
+    }
+
+    fn execute_apply(
+        &self,
+        plan: PreparedApply,
+        store: &StateStore,
+        access: &WriteAccess<'_>,
+    ) -> Result<ApplyReport, ApplyError> {
+        let mut report = ApplyReport {
+            recovered: plan.recovered.len(),
+            manual_candidates: plan.manual_candidates.len(),
             ..ApplyReport::default()
         };
-        let rows: Vec<_> = pages.iter().map(|page| page.row.clone()).collect();
-        let mut planned = match self.plan_from_rows(input, &schema, &rows, mappings) {
-            Ok(plan) => plan,
-            Err(error) => {
-                let mut report = unavailable(input, &state, error);
-                report.recovered = recovered;
-                return Ok(report);
-            }
-        };
-        planned.defer_unreconciled(&state);
-        let requests: HashMap<_, _> = planned
+        store.record_manual_candidates(&plan.manual_candidates)?;
+        for (key, id) in &plan.recovered {
+            store.confirm(key, id)?;
+        }
+        let requests: HashMap<_, _> = plan
+            .deltas
             .requests()
             .iter()
             .map(|request| (request.key(), request))
             .collect();
-        let by_id: HashMap<_, _> = pages
+        let by_id: HashMap<_, _> = plan
+            .pages
             .iter()
             .map(|page| (page.row.page_id.as_str(), page))
             .collect();
-        let mut manuals: HashMap<&str, Vec<_>> = HashMap::new();
-        for page in pages.iter().filter(|page| page.row.sync_key.is_none()) {
-            manuals
-                .entry(&page.row.title)
-                .or_default()
-                .push(&page.row.deadline);
-        }
         let mut stop_writes = false;
-        let mut planned_keys = HashSet::new();
-        for entry in planned.plan() {
-            planned_keys.insert(&entry.key);
+        for entry in plan.deltas.plan() {
             report.counts.course_relation_mismatch += usize::from(entry.course_relation_mismatch);
             let action = &entry.action;
             let outcome = match action {
@@ -153,24 +287,17 @@ impl NotionClient {
                     continue;
                 }
                 _ if stop_writes => WriteOutcome::Deferred(None),
-                PlanAction::Create { assignment, .. } => {
-                    if manuals
-                        .get(assignment.title.as_str())
-                        .is_some_and(|deadlines| deadlines.contains(&&assignment.deadline))
-                    {
-                        report.manual_candidates += 1;
-                        WriteOutcome::Deferred(None)
-                    } else {
-                        self.apply_create(&schema, &store, requests[&entry.key])?
-                    }
+                PlanAction::Create { .. } => {
+                    self.apply_create(&plan.schema, store, requests[&entry.key], access)?
                 }
                 PlanAction::Update { page_id, patch } => {
                     store.confirm(&entry.key, page_id)?;
                     self.apply_update(
-                        &schema,
+                        &plan.schema,
                         by_id[page_id.as_str()],
                         patch,
                         requests[&entry.key],
+                        access,
                     )
                 }
             };
@@ -189,11 +316,7 @@ impl NotionClient {
                 }
             }
         }
-        report.counts.deferred += state
-            .bindings
-            .keys()
-            .filter(|key| !planned_keys.contains(key))
-            .count();
+        report.counts.deferred += plan.missing_bindings;
         report.pending = store.summary()?.pending;
         Ok(report)
     }
@@ -203,6 +326,7 @@ impl NotionClient {
         schema: &Schema,
         store: &StateStore,
         request: &PreparedWrite,
+        access: &WriteAccess<'_>,
     ) -> Result<WriteOutcome, StateError> {
         let key = request.key();
         // A fresh, fully paginated exact match reduces the race with external writers.
@@ -225,7 +349,7 @@ impl NotionClient {
         if !store.reserve_create(key)? {
             return Ok(WriteOutcome::Deferred(None));
         }
-        match self.send_write(request) {
+        match self.send_write(request, access) {
             Ok(page) => {
                 let id =
                     checked_page_id(&page, &schema.assignments_id, &schema.assignments_database)
@@ -259,6 +383,7 @@ impl NotionClient {
         baseline: &Observation,
         patch: &AssignmentPatch,
         request: &PreparedWrite,
+        access: &WriteAccess<'_>,
     ) -> WriteOutcome {
         let verify = || -> Result<Observation, NotionError> {
             let page = self.retrieve_page(
@@ -277,7 +402,7 @@ impl NotionClient {
             Ok(_) => return WriteOutcome::Deferred(Some(NotionError::Conflict)),
             Err(error) => return WriteOutcome::Deferred(Some(error)),
         }
-        let failure = match self.send_write(request) {
+        let failure = match self.send_write(request, access) {
             Ok(page) => {
                 if let Ok((row, more)) = schema.assignment(&page)
                     && row.page_id == baseline.row.page_id
@@ -301,11 +426,7 @@ impl NotionClient {
     }
 }
 
-fn reconcile_creates(
-    store: &StateStore,
-    state: &StateSummary,
-    pages: &[Observation],
-) -> Result<usize, StateError> {
+fn recoverable_intents(state: &StateSummary, pages: &[Observation]) -> Vec<(SyncKey, String)> {
     let known_pages = state.page_owners();
     let mut matches: HashMap<_, Vec<_>> = HashMap::new();
     for page in pages {
@@ -316,7 +437,7 @@ fn reconcile_creates(
                 .push(page.row.page_id.as_str());
         }
     }
-    let mut recovered = 0;
+    let mut recovered = Vec::new();
     for (key, binding) in &state.bindings {
         if binding.status == BindingStatus::Linked {
             continue;
@@ -325,13 +446,14 @@ fn reconcile_creates(
             && binding.page_id.as_deref().is_none_or(|known| known == *id)
             && known_pages.get(id).is_none_or(|owner| *owner == key)
         {
-            store.confirm(key, id)?;
-            recovered += 1;
+            recovered.push((key.clone(), (*id).into()));
         }
     }
-    Ok(recovered)
+    recovered.sort_unstable();
+    recovered
 }
 
+#[cfg(any(test, feature = "synthetic-https-fixture"))]
 fn unavailable(input: &SyncInput, state: &StateSummary, error: NotionError) -> ApplyReport {
     let plan = super::DryRunReport::incomplete(input, error);
     let keys: HashSet<_> = plan.plan().iter().map(|entry| &entry.key).collect();

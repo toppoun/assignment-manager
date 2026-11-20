@@ -15,7 +15,11 @@ use reqwest::{
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
-use super::wire::{property_id, uuid};
+use super::{
+    apply::WriteAccess,
+    trial::PRODUCTION_DATA_SOURCES,
+    wire::{PreparedWrite, property_id, uuid},
+};
 
 pub const NOTION_VERSION: &str = "2026-03-11";
 const BASE: &str = "https://api.notion.com";
@@ -28,6 +32,7 @@ const REQUEST_INTERVAL: Duration = Duration::from_millis(350);
 pub enum NotionError {
     Configuration,
     Authentication,
+    CredentialMismatch,
     Forbidden,
     NotFound,
     Conflict,
@@ -56,7 +61,7 @@ impl fmt::Display for NotionError {
 
 impl Error for NotionError {}
 
-/// The production transport permits read operations only.
+/// The regular API exposes only reads. Mutations require an approved trial or a loopback fixture.
 pub struct NotionClient {
     http: Client,
     base: Url,
@@ -216,12 +221,30 @@ impl NotionClient {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "synthetic-https-fixture"))]
     pub(super) fn send_write(
         &self,
-        request: &super::wire::PreparedWrite,
+        request: &PreparedWrite,
+        access: &WriteAccess<'_>,
     ) -> Result<serde_json::Value, NotionError> {
-        self.require_mock_writes()?;
+        match access {
+            #[cfg(any(test, feature = "synthetic-https-fixture"))]
+            WriteAccess::Mock => self.require_mock_writes()?,
+            WriteAccess::Trial(approval) => {
+                let real_origin =
+                    self.base.origin() == Url::parse(BASE).expect("fixed URL").origin();
+                #[cfg(test)]
+                let real_origin = real_origin || self.require_mock_writes().is_ok();
+                if !real_origin || request.target_id != approval.target().assignment_id() {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
+        }
+        if PRODUCTION_DATA_SOURCES.contains(&request.target_id.as_str())
+            || (request.method() == Method::POST
+                && request.body()["parent"]["data_source_id"] != request.target_id)
+        {
+            return Err(NotionError::MethodDisabled);
+        }
         let request = self
             .request(request.method().clone(), request.path(), &[])
             .json(request.body())
@@ -333,6 +356,7 @@ impl NotionClient {
 fn permits_read(method: &Method, path: &str) -> bool {
     let parts: Vec<_> = path.split('/').collect();
     let id = match (method, parts.as_slice()) {
+        (&Method::GET, ["", "v1", "users", "me"]) => return true,
         (&Method::GET, ["", "v1", "data_sources" | "pages", id])
         | (&Method::POST, ["", "v1", "data_sources", id, "query"]) => id,
         (&Method::GET, ["", "v1", "pages", id, "properties", property])

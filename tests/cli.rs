@@ -83,6 +83,66 @@ fn invalid_arguments_and_configuration_are_reported_without_echoing_secrets() {
 }
 
 #[test]
+fn trial_write_requires_explicit_flag_and_target() {
+    let temp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["notion-trial", "--allow-notion-write"],
+        vec!["notion-trial", "--target", TARGET, "--apply"],
+        vec![
+            "notion-trial",
+            "--target",
+            TARGET,
+            "--dry-run",
+            "--allow-notion-write",
+        ],
+    ] {
+        let output = call(&temp, &args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains("invalid_arguments"));
+    }
+    assert!(!local_root(&temp).exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn trial_cli_defaults_to_dry_run_and_refuses_redirected_apply_before_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let denied = call(
+        &temp,
+        &["notion-trial", "--target", TARGET, "--allow-notion-write"],
+    );
+    assert_eq!(denied.status.code(), Some(2));
+    assert!(stderr(&denied).contains("trial_requires_terminal"));
+    let preview = call(&temp, &["notion-trial", "--target", TARGET]);
+    assert_eq!(preview.status.code(), Some(2));
+    assert!(stderr(&preview).contains("configuration_missing"));
+    assert!(!local_root(&temp).exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn trial_cli_rejects_a_production_target_before_credentials_or_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let prod = "41d859347e84811ca9bb000b8b646c3f";
+    let root = local_root(&temp);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("trial.json"), serde_json::json!({
+        "notion":{
+            "assignments_data_source_id":prod,
+            "courses_data_source_id":"00000000-0000-4000-8000-000000000002",
+            "properties":{"title":"title","deadline":"date","course":"course","submission_url":"url","sync_key":"sync","source":"source"}
+        },
+        "read_bot_id":"00000000-0000-4000-8000-000000000011",
+        "write_bot_id":"00000000-0000-4000-8000-000000000012",
+        "assignment":{"title":"Synthetic task"}
+    }).to_string()).unwrap();
+    let output = call(&temp, &["notion-trial", "--target", prod, "init-state"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("trial_target_rejected"));
+    assert!(!root.join("trial-targets").exists());
+}
+
+#[test]
 fn hold_test_lock_child() {
     let Some(directory) = std::env::var_os("ASSIGNMENT_MANAGER_TEST_LOCK_CHILD") else {
         return;

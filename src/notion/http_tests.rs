@@ -1,4 +1,5 @@
 mod apply_tests;
+mod trial_tests;
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -991,7 +992,8 @@ fn read_transport_rejects_write_endpoints_and_other_routes_before_network() {
         (Method::PATCH, format!("/v1/data_sources/{A}")),
         (Method::POST, "/v1/data_sources".to_owned()),
         (Method::POST, "/v1/search".to_owned()),
-        (Method::GET, "/v1/users/me".to_owned()),
+        (Method::POST, "/v1/users/me".to_owned()),
+        (Method::GET, format!("/v1/users/{A}")),
         (Method::GET, query_path.clone()),
         (Method::POST, format!("{query_path}/")),
         (Method::POST, format!("/v1/data_sources/{A}/%71uery")),

@@ -95,6 +95,9 @@ pub(super) fn notion_client(
 #[cfg(any(windows, target_os = "macos"))]
 pub(super) use native::{lookup, notion_client, register};
 
+#[cfg(target_os = "macos")]
+pub(super) use native::{register_trial, trial_client};
+
 #[cfg(any(windows, target_os = "macos"))]
 mod native {
     use std::io::{self, IsTerminal};
@@ -121,12 +124,12 @@ mod native {
         String::deserialize(de).map(Zeroizing::new)
     }
 
-    fn entry(service: &str, kind: Kind) -> Result<Entry, CredentialStatus> {
+    fn entry(service: &str, account: &str) -> Result<Entry, CredentialStatus> {
         #[cfg(windows)]
-        let result = assignment_manager::windows_credentials::local_entry(service, kind.code());
+        let result = assignment_manager::windows_credentials::local_entry(service, account);
         #[cfg(target_os = "macos")]
         let result = apple_native_keyring_store::keychain::Store::new()
-            .and_then(|store| store.build(service, kind.code(), None));
+            .and_then(|store| store.build(service, account, None));
         result.map_err(|_| CredentialStatus::Unavailable)
     }
 
@@ -134,23 +137,72 @@ mod native {
         format!("io.assignment-manager.notion-cli.v1.{target}")
     }
 
-    fn read_secret(service: &str, kind: Kind) -> Result<Zeroizing<Vec<u8>>, CredentialStatus> {
+    fn read_secret(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>, CredentialStatus> {
         #[cfg(target_os = "macos")]
         let _no_ui = super::macos::suppress_interaction_if(
             !io::stdin().is_terminal() || !io::stderr().is_terminal(),
         )?;
-        entry(service, kind)?
+        entry(service, account)?
             .get_secret()
             .map(Zeroizing::new)
             .map_err(read_error)
     }
 
     pub(in crate::cli) fn lookup(config: &Config, target: &str, kind: Kind) -> CredentialStatus {
-        classify(config, kind, read_secret(&service_name(target), kind))
+        classify(
+            config,
+            kind,
+            read_secret(&service_name(target), kind.code()),
+        )
     }
 
     pub(in crate::cli) fn notion_client(target: &str) -> Result<NotionClient, CredentialStatus> {
-        client_from_secret(read_secret(&service_name(target), Kind::Notion)?)
+        client_from_secret(read_secret(&service_name(target), Kind::Notion.code())?)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trial_item(
+        target: &assignment_manager::notion::TrialTarget,
+        role: assignment_manager::notion::TrialRole,
+    ) -> (String, &'static str) {
+        use assignment_manager::notion::TrialRole;
+        let service = format!(
+            "io.assignment-manager.notion-trial.v1.{}.{}",
+            target.assignment_id(),
+            target.bot_id(role)
+        );
+        let account = match role {
+            TrialRole::Read => "trial-read",
+            TrialRole::Write => "trial-write",
+        };
+        (service, account)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::cli) fn trial_client(
+        target: &assignment_manager::notion::TrialTarget,
+        role: assignment_manager::notion::TrialRole,
+    ) -> Result<NotionClient, CredentialStatus> {
+        let (service, account) = trial_item(target, role);
+        client_from_secret(read_secret(&service, account)?)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::cli) fn register_trial(
+        target: &assignment_manager::notion::TrialTarget,
+        role: assignment_manager::notion::TrialRole,
+    ) -> Result<(), CredentialStatus> {
+        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            return Err(CredentialStatus::Unavailable);
+        }
+        let (service, account) = trial_item(target, role);
+        let registration = super::macos::Registration::open(&service, account)?;
+        confirm_replace(registration.exists())?;
+        let token = prompt("Notion trial connection token (hidden): ")?;
+        client_from_secret(Zeroizing::new(token.as_bytes().to_vec()))?;
+        registration
+            .save(token.as_bytes())
+            .map_err(|_| CredentialStatus::Unavailable)
     }
 
     fn client_from_secret(bytes: Zeroizing<Vec<u8>>) -> Result<NotionClient, CredentialStatus> {
@@ -192,6 +244,23 @@ mod native {
         }
     }
 
+    fn prompt(label: &str) -> Result<Zeroizing<String>, CredentialStatus> {
+        rpassword::prompt_password(label)
+            .map(Zeroizing::new)
+            .map_err(|_| CredentialStatus::Unavailable)
+    }
+
+    fn confirm_replace(exists: bool) -> Result<(), CredentialStatus> {
+        if exists
+            && !prompt("Replace existing credential? [y/N]: ")?
+                .trim()
+                .eq_ignore_ascii_case("y")
+        {
+            return Err(CredentialStatus::Cancelled);
+        }
+        Ok(())
+    }
+
     pub(in crate::cli) fn register(
         config: &Config,
         target: &str,
@@ -206,25 +275,14 @@ mod native {
         #[cfg(target_os = "macos")]
         let exists = registration.exists();
         #[cfg(windows)]
-        let entry = entry(&service, kind)?;
+        let entry = entry(&service, kind.code())?;
         #[cfg(windows)]
         let exists = match entry.get_attributes() {
             Ok(_) => true,
             Err(Error::NoEntry) => false,
             Err(_) => return Err(CredentialStatus::Unavailable),
         };
-        let prompt = |label| {
-            rpassword::prompt_password(label)
-                .map(Zeroizing::new)
-                .map_err(|_| CredentialStatus::Unavailable)
-        };
-        if exists
-            && !prompt("Replace existing credential? [y/N]: ")?
-                .trim()
-                .eq_ignore_ascii_case("y")
-        {
-            return Err(CredentialStatus::Cancelled);
-        }
+        confirm_replace(exists)?;
         let bytes = match kind {
             Kind::Moodle => Zeroizing::new(
                 prompt("Moodle calendar URL (hidden): ")?
@@ -307,6 +365,28 @@ mod native {
 
     #[cfg(all(test, target_os = "macos"))]
     #[test]
+    fn trial_credential_items_do_not_alias_each_other_or_the_legacy_item() {
+        use assignment_manager::notion::{TrialRole, TrialTarget};
+
+        let config = super::super::tests::config();
+        let id = config.target_id().unwrap();
+        let target = TrialTarget::new(
+            config.notion,
+            &id,
+            "00000000-0000-4000-8000-000000000011",
+            "00000000-0000-4000-8000-000000000012",
+        )
+        .unwrap();
+        let (read_service, read_account) = trial_item(&target, TrialRole::Read);
+        let (write_service, write_account) = trial_item(&target, TrialRole::Write);
+        assert_ne!(read_service, write_service);
+        assert_ne!(read_service, service_name(&id));
+        assert_ne!(write_service, service_name(&id));
+        assert_ne!(read_account, write_account);
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    #[test]
     #[ignore = "requires the user's unlocked macOS login Keychain"]
     fn macos_keychain_round_trip() {
         use security_framework::os::macos::keychain::SecKeychain;
@@ -318,9 +398,9 @@ mod native {
         let service = format!("io.assignment-manager.notion-cli.test.{name}");
         let config = super::super::tests::config();
         let kind = Kind::Notion;
-        let record = entry(&service, kind).unwrap();
+        let record = entry(&service, kind.code()).unwrap();
         assert_eq!(
-            classify(&config, kind, read_secret(&service, kind)),
+            classify(&config, kind, read_secret(&service, kind.code())),
             CredentialStatus::Missing
         );
 
@@ -344,18 +424,18 @@ mod native {
             registration.save(value).unwrap_or_else(|error| {
                 panic!("saving test item {service} ({expected:?}): {error}")
             });
-            let loaded = read_secret(&service, kind);
+            let loaded = read_secret(&service, kind.code());
             assert!(loaded.as_ref().is_ok_and(|bytes| bytes.as_slice() == value));
             assert_eq!(classify(&config, kind, loaded), expected);
         }
         assert!(stale.save(b"unconfirmed-token").is_err());
         assert_eq!(
-            classify(&config, kind, read_secret(&service, kind)),
+            classify(&config, kind, read_secret(&service, kind.code())),
             CredentialStatus::Invalid
         );
         record.delete_credential().unwrap();
         assert_eq!(
-            classify(&config, kind, read_secret(&service, kind)),
+            classify(&config, kind, read_secret(&service, kind.code())),
             CredentialStatus::Missing
         );
 
@@ -397,7 +477,7 @@ mod native {
             let _no_ui = super::macos::suppress_interaction_if(true).unwrap();
             assert!(!SecKeychain::user_interaction_allowed().unwrap());
             assert_eq!(
-                classify(&config, kind, read_secret(&service, kind)),
+                classify(&config, kind, read_secret(&service, kind.code())),
                 CredentialStatus::Unavailable
             );
             assert!(!SecKeychain::user_interaction_allowed().unwrap());
@@ -411,7 +491,7 @@ mod native {
             "cannot delete test item {service}"
         );
         assert_eq!(
-            classify(&config, kind, read_secret(&service, kind)),
+            classify(&config, kind, read_secret(&service, kind.code())),
             CredentialStatus::Missing
         );
     }

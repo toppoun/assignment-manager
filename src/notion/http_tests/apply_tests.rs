@@ -238,6 +238,16 @@ fn http_apply_reports_manual_candidates_and_rechecks_the_key_before_post() {
     let report = apply(&client, &input, &[], &dir);
     assert_eq!(report.manual_candidates, 1);
     assert_eq!(report.counts.deferred, 1);
+    let db = Connection::open(dir.path().join("state.sqlite3")).unwrap();
+    let pair: (String, String) = db
+        .query_row(
+            "SELECT sync_key,page_id FROM manual_candidates",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pair, (key.as_str().into(), MANUAL.into()));
+    assert!(open_state(dir.path()).binding(&key).unwrap().is_none());
     assert_eq!(apply(&client, &input, &[], &dir).counts.conflict, 1);
     assert_eq!(apply(&client, &input, &[], &dir).counts.deferred, 1);
     assert_eq!(apply(&client, &input, &[], &dir).counts.unchanged, 1);
@@ -687,7 +697,10 @@ fn write_transport_itself_blocks_prepared_post_and_patch_for_the_real_origin() {
     for rows in [&[][..], &[existing]] {
         let plan = plan_sync(&input, NotionSnapshot::Complete(rows), &[]);
         let request = schema.prepare(&plan[0]).unwrap().unwrap();
-        assert_eq!(real.send_write(&request), Err(NotionError::MethodDisabled));
+        assert_eq!(
+            real.send_write(&request, &super::super::apply::WriteAccess::Mock),
+            Err(NotionError::MethodDisabled)
+        );
     }
     server.join().unwrap();
 }

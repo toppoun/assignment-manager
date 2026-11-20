@@ -1,4 +1,7 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -26,6 +29,7 @@ pub struct DryRunCounts {
     pub course_relation_mismatch: usize,
 }
 
+#[derive(PartialEq, Eq)]
 pub struct DryRunReport {
     plan: Vec<PlannedAssignment>,
     requests: Vec<PreparedWrite>,
@@ -92,6 +96,39 @@ impl DryRunReport {
             } += 1;
         }
         counts
+    }
+
+    pub(super) fn defer_manual_candidates(
+        &mut self,
+        rows: &[NotionAssignment],
+    ) -> Vec<(SyncKey, String)> {
+        let mut manuals = HashMap::<&str, Vec<&NotionAssignment>>::new();
+        for row in rows.iter().filter(|row| row.sync_key.is_none()) {
+            manuals.entry(&row.title).or_default().push(row);
+        }
+        let mut matches = Vec::new();
+        let mut blocked = HashSet::new();
+        for row in &mut self.plan {
+            let PlanAction::Create { assignment, .. } = &row.action else {
+                continue;
+            };
+            let before = matches.len();
+            if let Some(pages) = manuals.get(assignment.title.as_str()) {
+                matches.extend(
+                    pages
+                        .iter()
+                        .filter(|page| page.deadline == assignment.deadline)
+                        .map(|page| (row.key.clone(), page.page_id.clone())),
+                );
+            }
+            if matches.len() != before {
+                blocked.insert(&row.key);
+                row.action = PlanAction::Deferred(DeferredReason::ManualCandidate);
+            }
+        }
+        self.requests
+            .retain(|request| !blocked.contains(request.key()));
+        matches
     }
 }
 

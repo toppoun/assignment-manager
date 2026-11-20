@@ -332,7 +332,6 @@ impl StateStore {
         self.change("UPDATE bindings SET status='unknown' WHERE sync_key=?1 AND status IN ('intent','unknown')", key)
     }
 
-    #[cfg(any(test, feature = "synthetic-https-fixture"))]
     pub(super) fn is_owned_by_another_key(
         &self,
         page: &str,
@@ -348,12 +347,39 @@ impl StateStore {
     }
 
     /// Release only an intent whose request got an explicit rejection.
-    #[cfg(any(test, feature = "synthetic-https-fixture"))]
     pub(super) fn release_rejected_create(&self, key: &SyncKey) -> Result<(), StateError> {
         self.change(
             "DELETE FROM bindings WHERE sync_key=?1 AND status='intent'",
             key,
         )
+    }
+
+    pub(super) fn record_manual_candidates(
+        &self,
+        matches: &[(SyncKey, String)],
+    ) -> Result<(), StateError> {
+        if matches.is_empty() {
+            return Ok(());
+        }
+        // Additive to Phase 3C state. Candidate history is separate from bindings.
+        let tx = self
+            .0
+            .unchecked_transaction()
+            .map_err(|_| StateError::Database)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS manual_candidates (
+                sync_key TEXT NOT NULL, page_id TEXT NOT NULL,
+                PRIMARY KEY(sync_key,page_id)
+            ) STRICT;",
+        )
+        .map_err(|_| StateError::Database)?;
+        for (key, page) in matches {
+            tx.execute(
+                "INSERT INTO manual_candidates VALUES (?1,?2) ON CONFLICT(sync_key,page_id) DO NOTHING",
+                params![key.as_str(), page],
+            ).map_err(|_| StateError::Database)?;
+        }
+        tx.commit().map_err(|_| StateError::Database)
     }
 
     pub fn mark_reconcile(&self, key: &SyncKey) -> Result<(), StateError> {

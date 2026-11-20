@@ -4,6 +4,7 @@ mod credentials;
 mod fixture_run;
 #[cfg(test)]
 mod tests;
+mod trial;
 
 use std::{
     fs::File,
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
-const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run>\nKIND: moodle, webclass, notion\nFixture build: sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run>\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 #[cfg(feature = "synthetic-https-fixture")]
 const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)";
 
@@ -37,6 +38,7 @@ enum Command {
     NotionCheck,
     NotionFixturePreview,
     FixtureApply,
+    NotionTrial(String, trial::Command),
 }
 
 impl Command {
@@ -83,6 +85,9 @@ impl Arguments {
                 Command::NotionFixturePreview
             }
             ["notion-check", "--allow-notion-read"] => Command::NotionCheck,
+            ["notion-trial", "--target", id, rest @ ..] => {
+                Command::NotionTrial((*id).into(), trial::Command::parse(rest)?)
+            }
             ["credentials", "set", kind] => {
                 Command::Register(Kind::parse(kind).ok_or(CliError::Usage)?)
             }
@@ -103,6 +108,12 @@ enum CliError {
     Credential(CredentialStatus),
     FixtureUnavailable,
     NetworkDisabled,
+    #[cfg(not(target_os = "macos"))]
+    TrialUnavailable,
+    #[cfg(target_os = "macos")]
+    TrialTargetRejected,
+    #[cfg(target_os = "macos")]
+    TrialRequiresTerminal,
     #[cfg(feature = "synthetic-https-fixture")]
     FixtureFailed,
     Receipt,
@@ -125,6 +136,12 @@ impl CliError {
             Self::Credential(_) => "credential_unavailable",
             Self::FixtureUnavailable => "fixture_feature_required",
             Self::NetworkDisabled => "network_disabled",
+            #[cfg(not(target_os = "macos"))]
+            Self::TrialUnavailable => "trial_requires_macos",
+            #[cfg(target_os = "macos")]
+            Self::TrialTargetRejected => "trial_target_rejected",
+            #[cfg(target_os = "macos")]
+            Self::TrialRequiresTerminal => "trial_requires_terminal",
             #[cfg(feature = "synthetic-https-fixture")]
             Self::FixtureFailed => "fixture_failed",
             Self::Receipt => "receipt_unavailable",
@@ -138,6 +155,10 @@ impl CliError {
             | Self::Credential(_)
             | Self::FixtureUnavailable
             | Self::NetworkDisabled => 2,
+            #[cfg(not(target_os = "macos"))]
+            Self::TrialUnavailable => 2,
+            #[cfg(target_os = "macos")]
+            Self::TrialTargetRejected | Self::TrialRequiresTerminal => 2,
             Self::State(StateError::Busy) => 4,
             _ => 1,
         }
@@ -365,6 +386,7 @@ fn notion_diagnosis(error: NotionError) -> &'static str {
     match error {
         NotionError::Configuration => "configuration_invalid",
         NotionError::Authentication => "authentication_failed",
+        NotionError::CredentialMismatch => "credential_mismatch",
         NotionError::Forbidden => "forbidden",
         NotionError::NotFound => "not_found_or_not_shared",
         NotionError::SchemaMismatch => "schema_mismatch",
@@ -510,6 +532,9 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
     // Fail before accessing local state when this is an ordinary binary.
     if args.command.needs_fixture_build() && !cfg!(feature = "synthetic-https-fixture") {
         return Err(CliError::FixtureUnavailable);
+    }
+    if let Command::NotionTrial(id, command) = args.command {
+        return trial::execute(&id, command, args.config);
     }
     let root = config::root()?;
     if args.command.uses_fixture() {
