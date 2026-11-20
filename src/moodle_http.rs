@@ -136,6 +136,7 @@ pub enum MoodleHttpError {
     Timeout,
     Request,
     HttpStatus(StatusCode),
+    UnexpectedResponse,
     BodyRead,
     BodyDecode,
 }
@@ -155,6 +156,7 @@ impl fmt::Display for MoodleHttpError {
             Self::Timeout => write!(f, "Moodle calendar request timed out"),
             Self::Request => write!(f, "Moodle calendar request failed"),
             Self::HttpStatus(status) => write!(f, "Moodle calendar returned HTTP {status}"),
+            Self::UnexpectedResponse => write!(f, "expected a complete Moodle calendar response"),
             Self::BodyRead => write!(f, "could not read Moodle calendar response"),
             Self::BodyDecode => write!(f, "Moodle calendar response is not UTF-8"),
         }
@@ -231,8 +233,17 @@ impl MoodleClient {
                 }
             })?;
         let status = response.status();
-        if !status.is_success() {
+        if status != StatusCode::OK {
             return Err(MoodleHttpError::HttpStatus(status));
+        }
+        // This endpoint is consumed as one complete export. Reject range and
+        // link metadata until there is a verified continuation contract.
+        if response
+            .headers()
+            .contains_key(reqwest::header::CONTENT_RANGE)
+            || response.headers().contains_key(reqwest::header::LINK)
+        {
+            return Err(MoodleHttpError::UnexpectedResponse);
         }
         read_text(response, BodyKind::MoodleIcs).map_err(|error| match error {
             NetworkError::Timeout => MoodleHttpError::Timeout,
@@ -366,6 +377,39 @@ mod tests {
         finish(server);
         assert_eq!(error, MoodleHttpError::HttpStatus(StatusCode::FORBIDDEN));
         assert_secret_free(&error);
+    }
+
+    #[test]
+    fn partial_or_linked_export_cannot_be_a_successful_empty_calendar() {
+        let empty = include_str!("../fixtures/moodle/calendar_empty.ics");
+        for (status, headers, expected) in [
+            (
+                "206 Partial Content",
+                "",
+                MoodleHttpError::HttpStatus(StatusCode::PARTIAL_CONTENT),
+            ),
+            (
+                "200 OK",
+                "Content-Range: bytes 0-99/200\r\n",
+                MoodleHttpError::UnexpectedResponse,
+            ),
+            (
+                "200 OK",
+                "Link: </more?token=synthetic-query-token>; rel=next\r\n",
+                MoodleHttpError::UnexpectedResponse,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let (feed, server) =
+                mock_response_at(listener, status, headers, empty.as_bytes().to_vec());
+            let error = MoodleClient::new()
+                .unwrap()
+                .fetch_calendar(&feed)
+                .unwrap_err();
+            assert_eq!(error, expected);
+            assert_secret_free(&error);
+            assert_no_request(&finish(server));
+        }
     }
 
     #[test]

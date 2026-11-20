@@ -65,6 +65,107 @@ pub fn exercise_apply(input: &SyncInput, directory: &Path) -> Result<[ApplyRepor
     ])
 }
 
+#[cfg(test)]
+#[test]
+fn university_keys_reconcile_the_same_notion_pages_with_independent_state() {
+    use crate::{
+        domain::Deadline,
+        moodle_http::{MoodleExportKind, MoodleFeed},
+        secured_sync::SecuredSyncClients,
+        sync::{WebClassAcquisition, acquire_moodle, acquire_webclass_once},
+        webclass_auth::{
+            HoseiCredentials,
+            synthetic::{
+                MOODLE_URL, Scenario, SyntheticUniversity, UNIVERSITY_ID, UNIVERSITY_PASSWORD,
+            },
+        },
+    };
+
+    let acquire = || {
+        let university = SyntheticUniversity::start(Scenario::BothSuccess);
+        let mut clients = SecuredSyncClients::new(university.policy());
+        clients.begin_run();
+        let feed = MoodleFeed::new(
+            "default.course-related",
+            MoodleExportKind::CourseRelated,
+            MOODLE_URL,
+        )
+        .unwrap();
+        let moodle = acquire_moodle(&clients.moodle().unwrap(), &feed).unwrap();
+        let session = clients
+            .authenticator()
+            .login(HoseiCredentials::new(UNIVERSITY_ID, UNIVERSITY_PASSWORD))
+            .unwrap();
+        let webclass = acquire_webclass_once(&session);
+        assert_eq!(webclass.result(), Ok(()));
+        SyncInput::from_acquisitions(
+            Some(&moodle),
+            Some(&WebClassAcquisition::new(vec![webclass], Ok(()))),
+        )
+        .unwrap()
+    };
+
+    let (client, _server) = start_server(true).unwrap();
+    let directory = super::state::test_state_dir();
+    let target = target();
+    let target_id = target.validated_id().unwrap();
+    let first = acquire();
+    let second = acquire();
+    assert_eq!(first.assignments().len(), 10);
+    assert_eq!(first.assignments(), second.assignments());
+    // Fixed UTF-8 byte-level vectors run identically on every host.
+    for (key, title, due, course) in [
+        (
+            "v1:b7e92444ae37a18bb36c597fd2e6bd2ba0999bff4ece1984c465aba44cb977aa",
+            "演習課題01",
+            "2026-09-27T14:59:00Z",
+            "Java2-2026",
+        ),
+        (
+            "v1:f2683d509d2cc28d68ced0815d6c3cd4012d5ef6fa592db1c56ef3c3ef6aefd1",
+            "演習課題A",
+            "2026-10-31T14:59:59Z",
+            "fixture-course-002",
+        ),
+    ] {
+        let assignment = &first.assignments()[&key.parse().unwrap()];
+        assert_eq!(assignment.title, title);
+        assert_eq!(
+            assignment.deadline,
+            Some(Deadline::DateTime(due.parse().unwrap()))
+        );
+        assert_eq!(assignment.course_key.as_ref().unwrap().id, course);
+        assert_eq!(assignment.submission_url, None);
+    }
+
+    let initial_dir = directory.path().join("端末 A");
+    std::fs::create_dir(&initial_dir).unwrap();
+    let initial_state = initial_dir.join("state.sqlite3");
+    StateStore::initialize(&initial_state, &target_id).unwrap();
+    let created = client.apply(&first, &target, &[], &initial_dir).unwrap();
+    assert_eq!(created.error, None);
+    assert_eq!(created.counts.create, 10);
+    let existing = StateStore::read(&initial_state, &target_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(existing.bindings.len(), 10);
+
+    let fresh_dir = directory.path().join("端末 B");
+    std::fs::create_dir(&fresh_dir).unwrap();
+    let fresh_state = fresh_dir.join("state.sqlite3");
+    StateStore::initialize(&fresh_state, &target_id).unwrap();
+    let empty = StateStore::read(&fresh_state, &target_id).unwrap().unwrap();
+    assert!(empty.bindings.is_empty());
+    let reconciled = client.apply(&second, &target, &[], &fresh_dir).unwrap();
+    assert_eq!(reconciled.error, None);
+    assert_eq!(reconciled.counts.unchanged, 10);
+    assert_eq!(reconciled.counts.create, 0);
+    assert_eq!(reconciled.counts.update, 0);
+    assert_eq!(reconciled.pending, 0);
+    let matched = StateStore::read(&fresh_state, &target_id).unwrap().unwrap();
+    assert_eq!(matched.page_owners(), existing.page_owners());
+}
+
 fn start_server(writable: bool) -> std::io::Result<(NotionClient, FixtureServer)> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     listener.set_nonblocking(true)?;

@@ -86,6 +86,11 @@ pub(super) fn register(_: &Config, _: &str, _: Kind) -> Result<(), CredentialSta
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
+pub(super) fn moodle_url(_: &str) -> Result<zeroize::Zeroizing<String>, CredentialStatus> {
+    Err(CredentialStatus::Unavailable)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn notion_client(
     _: &str,
 ) -> Result<assignment_manager::notion::NotionClient, CredentialStatus> {
@@ -93,7 +98,7 @@ pub(super) fn notion_client(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub(super) use native::{lookup, notion_client, register};
+pub(super) use native::{lookup, moodle_url, notion_client, register};
 
 #[cfg(target_os = "macos")]
 pub(super) use native::{register_trial, trial_client};
@@ -158,6 +163,12 @@ mod native {
 
     pub(in crate::cli) fn notion_client(target: &str) -> Result<NotionClient, CredentialStatus> {
         client_from_secret(read_secret(&service_name(target), Kind::Notion.code())?)
+    }
+
+    pub(in crate::cli) fn moodle_url(target: &str) -> Result<Zeroizing<String>, CredentialStatus> {
+        let bytes = read_secret(&service_name(target), Kind::Moodle.code())?;
+        let url = std::str::from_utf8(&bytes).map_err(|_| CredentialStatus::Invalid)?;
+        Ok(Zeroizing::new(url.to_owned()))
     }
 
     #[cfg(target_os = "macos")]

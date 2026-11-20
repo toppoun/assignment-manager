@@ -5,7 +5,7 @@ use std::fmt;
 
 #[cfg(test)]
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, REFERER, USER_AGENT};
+use reqwest::header::{ACCEPT, CONTENT_RANGE, CONTENT_TYPE, LINK, LOCATION, REFERER, USER_AGENT};
 use reqwest::{StatusCode, Url};
 
 use crate::university_network::{
@@ -147,7 +147,12 @@ impl WebClassClient {
         if !status.is_success() {
             return Err(WebClassHttpError::HttpStatus(status));
         }
-        if status != StatusCode::OK {
+        // Only a complete array per request is supported. A link or range may
+        // describe data outside it, so fail without following the link.
+        if status != StatusCode::OK
+            || response.headers().contains_key(CONTENT_RANGE)
+            || response.headers().contains_key(LINK)
+        {
             return Err(WebClassHttpError::UnexpectedResponse);
         }
 
@@ -352,6 +357,51 @@ mod tests {
         let (client, server) = mock_response("200 OK", "Content-Type: application/json\r\n", b"[]");
         assert_eq!(client.fetch_contents_json("").unwrap(), "[]");
         assert!(finish(server).starts_with(&format!("GET {CONTENTS_PATH}?group_id= HTTP/1.1\r\n")));
+    }
+
+    #[test]
+    fn partial_or_paginated_response_is_distinct_from_an_empty_course_list() {
+        use crate::sync::{WebClassSyncError, acquire_webclass_once};
+
+        for (status, metadata, body, expected) in [
+            ("200 OK", "", "[]", Ok(())),
+            (
+                "206 Partial Content",
+                "",
+                "[]",
+                Err(WebClassSyncError::Fetch),
+            ),
+            (
+                "200 OK",
+                "Content-Range: items 0-1/3\r\n",
+                "[]",
+                Err(WebClassSyncError::Fetch),
+            ),
+            (
+                "200 OK",
+                "Link: </more?token=synthetic-query-token>; rel=next\r\n",
+                "[]",
+                Err(WebClassSyncError::Fetch),
+            ),
+            (
+                "200 OK",
+                "",
+                r#"{"data":[],"next":"synthetic-query-token"}"#,
+                Err(WebClassSyncError::Parse),
+            ),
+        ] {
+            let (client, server) = mock_response(
+                status,
+                &format!("Content-Type: application/json\r\n{metadata}"),
+                body.as_bytes(),
+            );
+            let attempt = acquire_webclass_once(&client);
+            assert_eq!(attempt.result(), expected);
+            assert_eq!(attempt.course_list().is_some(), expected.is_ok());
+            assert!(attempt.groups().is_empty());
+            assert!(!format!("{attempt:?}").contains(SYNTHETIC_TOKEN));
+            assert!(finish(server).starts_with(&format!("GET {COURSES_PATH} ")));
+        }
     }
 
     #[test]

@@ -250,9 +250,14 @@ fn acquisition_without_a_store_matches_both_legacy_imports() {
     f.exchanges[2].extend(full_sync());
     f.exchanges[2].extend(full_sync());
     let calendar_responses = (0..2)
-        .map(|_| {
+        .map(|pass| {
             let mut response = moodle_response(200);
-            response.body = COURSE_ICS.into();
+            let lf = COURSE_ICS.replace("\r\n", "\n");
+            response.body = if pass == 0 {
+                lf
+            } else {
+                lf.replace('\n', "\r\n")
+            };
             response
         })
         .collect();

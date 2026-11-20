@@ -51,6 +51,15 @@ Windowsでは `%LOCALAPPDATA%\AssignmentManagerNotion\config.json` に置きま�
 終了コードは成功 `0`、実行失敗 `1`、設定・資格情報などの不足 `2`、
 部分成功または確認待ち `3`、多重実行 `4` です。
 
+大学取得だけをローカルで検証するには、合成HTTPSを使用します。
+
+```sh
+cargo run --locked --offline --features synthetic-https-fixture -- university-check --fixture
+```
+
+Moodleの実データ読み取り手順、WebClassの認証上の制約、両OSの検証条件は
+[Notion同期 Phase 4A](docs/NOTION-SYNC-PHASE-4A.md)を参照してください。
+
 ### macOSでのビルドとローカル検証
 
 Xcode Command Line ToolsとRustを入れ、初回は `cargo fetch --locked --target "$(rustc --print host-tuple)"` で依存関係を取得します。

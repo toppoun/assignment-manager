@@ -198,11 +198,59 @@ fn a_second_process_is_rejected_and_a_killed_process_releases_the_lock() {
 #[test]
 fn the_default_binary_refuses_fixture_network_and_apply() {
     let temp = tempfile::tempdir().unwrap();
-    for args in [&["sync", "--dry-run", "--fixture"][..], &["fixture-apply"]] {
+    for args in [
+        &["sync", "--dry-run", "--fixture"][..],
+        &["fixture-apply"],
+        &["university-check", "--fixture"],
+    ] {
         let output = call(&temp, args);
         assert_eq!(output.status.code(), Some(2));
         assert!(stderr(&output).contains("fixture_feature_required"));
     }
+    assert!(!local_root(&temp).exists());
+}
+
+#[test]
+fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    for args in [
+        &["university-check", "moodle"][..],
+        &["university-check", "webclass", "--allow-university-read"],
+        &["university-check", "--fixture", "--allow-university-read"],
+        &["--config", "unused.json", "university-check", "--fixture"],
+    ] {
+        let output = call(&temp, args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains("invalid_arguments"));
+    }
+    assert!(!local_root(&temp).exists());
+
+    config(&temp);
+    let output = call(
+        &temp,
+        &["university-check", "moodle", "--allow-university-read"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).contains("moodle acquired=0 failures=1 error=setup"));
+    assert!(stderr(&output).contains("source_disabled"));
+    assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+#[test]
+fn university_fixture_prints_only_counts_and_creates_no_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = call(&temp, &["university-check", "--fixture"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).lines().collect::<Vec<_>>(),
+        [
+            "moodle acquired=1 failures=0",
+            "webclass acquired=9 failures=0",
+            "result=success"
+        ]
+    );
+    assert!(stderr(&output).is_empty());
     assert!(!local_root(&temp).exists());
 }
 

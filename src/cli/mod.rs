@@ -5,6 +5,7 @@ mod fixture_run;
 #[cfg(test)]
 mod tests;
 mod trial;
+mod university;
 
 use std::{
     fs::File,
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
-const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run>\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read>\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture, sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 #[cfg(feature = "synthetic-https-fixture")]
 const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)";
 
@@ -38,6 +39,8 @@ enum Command {
     NotionCheck,
     NotionFixturePreview,
     FixtureApply,
+    UniversityMoodle,
+    UniversityFixture,
     NotionTrial(String, trial::Command),
 }
 
@@ -50,7 +53,7 @@ impl Command {
     }
 
     fn needs_fixture_build(&self) -> bool {
-        self.uses_fixture() || matches!(self, Self::NotionFixturePreview)
+        self.uses_fixture() || matches!(self, Self::NotionFixturePreview | Self::UniversityFixture)
     }
 }
 
@@ -81,6 +84,8 @@ impl Arguments {
             ["sync", "--dry-run"] => Command::Sync(false),
             ["sync", "--dry-run", "--fixture"] => Command::Sync(true),
             ["fixture-apply"] => Command::FixtureApply,
+            ["university-check", "moodle", "--allow-university-read"] => Command::UniversityMoodle,
+            ["university-check", "--fixture"] => Command::UniversityFixture,
             ["sync", "--dry-run", "--fixture", "--allow-notion-read"] => {
                 Command::NotionFixturePreview
             }
@@ -93,7 +98,7 @@ impl Arguments {
             }
             _ => return Err(CliError::Usage),
         };
-        if config.is_some() && command.uses_fixture() {
+        if config.is_some() && (command.uses_fixture() || command == Command::UniversityFixture) {
             return Err(CliError::Usage);
         }
         Ok(Self { command, config })
@@ -535,6 +540,18 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
     }
     if let Command::NotionTrial(id, command) = args.command {
         return trial::execute(&id, command, args.config);
+    }
+    #[cfg(feature = "synthetic-https-fixture")]
+    if args.command == Command::UniversityFixture {
+        use assignment_manager::webclass_auth::synthetic::Scenario;
+        return Ok(university::fixture(Scenario::BothSuccess));
+    }
+    if args.command == Command::UniversityMoodle {
+        let path = match args.config {
+            Some(path) => path,
+            None => config::root()?.join("config.json"),
+        };
+        return university::moodle(&Config::read(&path)?);
     }
     let root = config::root()?;
     if args.command.uses_fixture() {
