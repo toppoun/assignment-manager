@@ -143,6 +143,7 @@ fn cli_fixture_exercises_both_sources_and_never_changes_the_state_database() {
         "moodle=success",
         "webclass=success",
         "Create=10 Update=0 Unchanged=0 Conflict=0 Deferred=0",
+        "course_relation_mismatch=0",
         "result=success",
     ] {
         assert!(stdout(&first).contains(line), "{}", stdout(&first));

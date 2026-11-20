@@ -6,6 +6,7 @@ use std::{
 use crate::{domain::Deadline, import::ExternalRecordKey};
 use serde::Deserialize;
 
+use super::wire::uuid;
 use super::{SyncAssignment, SyncInput, SyncKey, UniversitySource};
 
 /// The read projection needed to compare source-owned properties. A row with
@@ -18,7 +19,7 @@ pub struct NotionAssignment {
     pub source: Option<UniversitySource>,
     pub title: String,
     pub deadline: Option<Deadline>,
-    /// All page IDs in the source-owned course relation.
+    /// All page IDs in the course relation on a managed page.
     pub course_page_ids: Vec<String>,
 }
 
@@ -39,7 +40,7 @@ pub struct CourseMapping {
 
 impl CourseMapping {
     pub fn has_valid_page_id(&self) -> bool {
-        super::wire::uuid(&self.page_id).is_some()
+        uuid(&self.page_id).is_some()
     }
 }
 
@@ -50,7 +51,7 @@ pub struct AssignmentPatch {
     pub title: Option<String>,
     /// None omits the property. Some(None) explicitly clears the deadline.
     pub deadline: Option<Option<Deadline>>,
-    /// When present, replace the source-owned relation with this single page.
+    /// When present, fill a course relation that was empty in the complete snapshot.
     pub course_page_id: Option<String>,
 }
 
@@ -103,6 +104,8 @@ pub enum PlanAction {
 pub struct PlannedAssignment {
     pub key: SyncKey,
     pub action: PlanAction,
+    /// A populated relation differs from the single mapped course page.
+    pub course_relation_mismatch: bool,
 }
 
 /// Produce one action per managed synchronization key in lexicographic key
@@ -124,6 +127,7 @@ pub fn plan_sync(
             .map(|key| PlannedAssignment {
                 key: key.clone(),
                 action: PlanAction::Deferred(DeferredReason::IncompleteSnapshot),
+                course_relation_mismatch: false,
             })
             .collect();
     };
@@ -146,12 +150,12 @@ pub fn plan_sync(
         pages_by_course
             .entry(&mapping.course_key)
             .or_default()
-            .insert(mapping.page_id.as_str());
+            .insert(uuid(&mapping.page_id));
     }
 
     keys.into_iter()
         .map(|key| {
-            let action = plan_assignment(
+            let (action, course_relation_mismatch) = plan_assignment(
                 input.assignments.get(key),
                 input.earlier_attempt.contains(key),
                 pages_by_key.get(key).map_or(&[], Vec::as_slice),
@@ -161,6 +165,7 @@ pub fn plan_sync(
             PlannedAssignment {
                 key: key.clone(),
                 action,
+                course_relation_mismatch,
             }
         })
         .collect()
@@ -171,8 +176,8 @@ fn plan_assignment(
     earlier_attempt: bool,
     matches: &[&NotionAssignment],
     repeated_page_ids: &HashSet<&str>,
-    pages_by_course: &HashMap<&ExternalRecordKey, BTreeSet<&str>>,
-) -> PlanAction {
+    pages_by_course: &HashMap<&ExternalRecordKey, BTreeSet<Option<String>>>,
+) -> (PlanAction, bool) {
     let page = match matches {
         [] => None,
         [page]
@@ -181,15 +186,26 @@ fn plan_assignment(
         {
             Some(*page)
         }
-        [_] => return PlanAction::Conflict(ConflictReason::InvalidOrRepeatedPage),
-        _ => return PlanAction::Conflict(ConflictReason::DuplicateSyncKey),
+        [_] => {
+            return (
+                PlanAction::Conflict(ConflictReason::InvalidOrRepeatedPage),
+                false,
+            );
+        }
+        _ => {
+            return (
+                PlanAction::Conflict(ConflictReason::DuplicateSyncKey),
+                false,
+            );
+        }
     };
     let Some(assignment) = assignment else {
-        return PlanAction::Deferred(if earlier_attempt {
+        let reason = if earlier_attempt {
             DeferredReason::EarlierAttempt
         } else {
             DeferredReason::NoValidatedCandidate
-        });
+        };
+        return (PlanAction::Deferred(reason), false);
     };
 
     let course_page_id = match assignment
@@ -199,31 +215,38 @@ fn plan_assignment(
     {
         None => None,
         Some(pages) => {
-            let Some(&id) = pages
-                .first()
-                .filter(|id| pages.len() == 1 && !id.trim().is_empty())
-            else {
-                return PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping);
+            let Some(Some(id)) = pages.first().filter(|_| pages.len() == 1) else {
+                return (
+                    PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping),
+                    false,
+                );
             };
             Some(id)
         }
     };
     let Some(page) = page else {
-        return PlanAction::Create {
-            assignment: assignment.clone(),
-            course_page_id: course_page_id.map(str::to_owned),
-        };
+        return (
+            PlanAction::Create {
+                assignment: assignment.clone(),
+                course_page_id: course_page_id.cloned(),
+            },
+            false,
+        );
     };
 
+    let (course_page_id, course_relation_mismatch) =
+        match (course_page_id, page.course_page_ids.as_slice()) {
+            (id, []) => (id.cloned(), false),
+            (Some(id), [current]) if uuid(current).as_ref() == Some(id) => (None, false),
+            (id, _) => (None, id.is_some()),
+        };
     let patch = AssignmentPatch {
         source: (page.source != Some(assignment.source)).then_some(assignment.source),
         title: (page.title != assignment.title).then(|| assignment.title.clone()),
         deadline: (page.deadline != assignment.deadline).then(|| assignment.deadline.clone()),
-        course_page_id: course_page_id
-            .filter(|id| !matches!(page.course_page_ids.as_slice(), [current] if current == id))
-            .map(str::to_owned),
+        course_page_id,
     };
-    if patch == AssignmentPatch::default() {
+    let action = if patch == AssignmentPatch::default() {
         PlanAction::Unchanged {
             page_id: page.page_id.clone(),
         }
@@ -232,5 +255,6 @@ fn plan_assignment(
             page_id: page.page_id.clone(),
             patch,
         }
-    }
+    };
+    (action, course_relation_mismatch)
 }

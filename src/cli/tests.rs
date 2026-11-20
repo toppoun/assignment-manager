@@ -85,6 +85,21 @@ fn accepts_only_explicit_notion_read_and_a_legacy_config() {
     assert_eq!(notion_diagnosis(NotionError::Forbidden), "forbidden");
 }
 
+#[test]
+fn reads_dry_run_receipts_written_before_course_relation_diagnostics() {
+    let receipt: Receipt = serde_json::from_value(json!({
+        "finished_at":"2026-11-20T00:00:00Z",
+        "moodle":"success",
+        "webclass":"success",
+        "counts":{"create":0,"update":1,"unchanged":2,"conflict":0,"deferred":0},
+        "outcome":"success",
+        "issue":null
+    }))
+    .unwrap();
+    assert_eq!(receipt.counts.update, 1);
+    assert_eq!(receipt.counts.course_relation_mismatch, 0);
+}
+
 #[cfg(feature = "synthetic-https-fixture")]
 #[test]
 fn complete_cli_dry_run_uses_mock_and_leaves_state_unchanged() {

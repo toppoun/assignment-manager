@@ -56,7 +56,7 @@ fn validated(scope: SyncScope, candidates: Vec<AssignmentCandidate>) -> Acquired
     .unwrap()
 }
 
-pub(super) fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition {
+fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition {
     MoodleAcquisition {
         assignments: validated(SyncScope::MoodleFeed(FEED.into()), candidates),
         courses: HashMap::new(),
@@ -65,6 +65,26 @@ pub(super) fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition 
 
 pub(super) fn input(candidates: Vec<AssignmentCandidate>) -> SyncInput {
     SyncInput::from_acquisitions(Some(&moodle(candidates)), None).unwrap()
+}
+
+pub(super) fn input_with_course(
+    candidates: Vec<AssignmentCandidate>,
+) -> (SyncInput, ExternalRecordKey) {
+    let mut acquired = moodle(candidates);
+    let course_key = external(OriginKind::Moodle, FEED, "course-a");
+    for candidate in acquired.assignments.batch().as_slice() {
+        acquired.courses.insert(
+            candidate.external_key.clone(),
+            SourceCourse {
+                external_key: course_key.clone(),
+                name: "Course A".into(),
+            },
+        );
+    }
+    (
+        SyncInput::from_acquisitions(Some(&acquired), None).unwrap(),
+        course_key,
+    )
 }
 
 fn group(id: &str, tasks: &[(&str, &str)]) -> AcquiredAssignments {
@@ -448,22 +468,13 @@ fn notion_defers_unverified_snapshots_and_missing_source_candidates() {
 
 #[test]
 fn notion_plans_relations_only_for_exact_unambiguous_mappings() {
-    let mut acquired = moodle(vec![candidate("a", "Title")]);
-    let key_of_course = external(OriginKind::Moodle, FEED, "course-a");
-    acquired.courses.insert(
-        external(OriginKind::Moodle, FEED, "a"),
-        SourceCourse {
-            external_key: key_of_course.clone(),
-            name: "Course A".into(),
-        },
-    );
-    let input = SyncInput::from_acquisitions(Some(&acquired), None).unwrap();
-    let mut row = moodle_row("a", "Title");
-    row.course_page_ids = vec!["existing".into()];
-    let rows = [row];
+    const MAPPED: &str = "00000000-0000-4000-8000-00000000000a";
+    const OTHER: &str = "00000000-0000-4000-8000-00000000000b";
+    let (input, course_key) = input_with_course(vec![candidate("a", "Title")]);
+    let rows = [moodle_row("a", "Title")];
     let mut mappings = vec![CourseMapping {
         course_key: external(OriginKind::Moodle, "other-feed", "course-a"),
-        page_id: "wrong".into(),
+        page_id: OTHER.into(),
     }];
     let unmapped = plan_sync(&input, NotionSnapshot::Complete(&rows), &mappings);
     assert_eq!(
@@ -472,41 +483,90 @@ fn notion_plans_relations_only_for_exact_unambiguous_mappings() {
             page_id: "a".into()
         }
     );
+    let created = plan_sync(&input, NotionSnapshot::Complete(&[]), &mappings);
+    assert!(matches!(
+        created[0].action,
+        PlanAction::Create {
+            course_page_id: None,
+            ..
+        }
+    ));
 
-    mappings.push(CourseMapping {
-        course_key: key_of_course.clone(),
-        page_id: "explicit".into(),
-    });
+    mappings.extend(
+        [MAPPED.to_owned(), MAPPED.replace('-', "").to_uppercase()].map(|page_id| CourseMapping {
+            course_key: course_key.clone(),
+            page_id,
+        }),
+    );
     let mapped = plan_sync(&input, NotionSnapshot::Complete(&rows), &mappings);
     assert_eq!(
         mapped[0].action,
         PlanAction::Update {
             page_id: "a".into(),
             patch: AssignmentPatch {
-                course_page_id: Some("explicit".into()),
+                course_page_id: Some(MAPPED.into()),
                 ..AssignmentPatch::default()
             }
         }
     );
     let created = plan_sync(&input, NotionSnapshot::Complete(&[]), &mappings);
     assert!(
-        matches!(&created[0].action, PlanAction::Create { course_page_id: Some(id), .. } if id == "explicit")
+        matches!(&created[0].action, PlanAction::Create { course_page_id: Some(id), .. } if id == MAPPED)
     );
 
-    mappings.push(CourseMapping {
-        course_key: key_of_course,
-        page_id: "ambiguous".into(),
-    });
-    let ambiguous = plan_sync(&input, NotionSnapshot::Complete(&rows), &mappings);
-    assert_eq!(
-        ambiguous[0].action,
-        PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping)
-    );
-    mappings.reverse();
-    assert_eq!(
-        plan_sync(&input, NotionSnapshot::Complete(&rows), &mappings),
-        ambiguous
-    );
+    for invalid_or_conflicting in [OTHER, "invalid"] {
+        mappings.push(CourseMapping {
+            course_key: course_key.clone(),
+            page_id: invalid_or_conflicting.into(),
+        });
+        for snapshot in [&rows[..], &[]] {
+            let ambiguous = plan_sync(&input, NotionSnapshot::Complete(snapshot), &mappings);
+            assert_eq!(
+                ambiguous[0].action,
+                PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping)
+            );
+            mappings.reverse();
+            assert_eq!(
+                plan_sync(&input, NotionSnapshot::Complete(snapshot), &mappings),
+                ambiguous
+            );
+            mappings.reverse();
+        }
+        mappings.pop();
+    }
+}
+
+#[test]
+fn notion_preserves_populated_course_relations_and_diagnoses_mismatches() {
+    const MAPPED: &str = "00000000-0000-4000-8000-00000000000a";
+    const OTHER: &str = "00000000-0000-4000-8000-00000000000b";
+    let (input, course_key) = input_with_course(vec![candidate("a", "Title")]);
+    let mappings = [CourseMapping {
+        course_key,
+        page_id: MAPPED.into(),
+    }];
+    let mut manual = snapshot_row("manual", None, UniversitySource::Moodle, "Title");
+    manual.course_page_ids = vec![OTHER.into()];
+
+    for (links, mismatch) in [
+        (&[MAPPED][..], false),
+        (&[OTHER][..], true),
+        (&[MAPPED, OTHER][..], true),
+    ] {
+        let mut row = moodle_row("a", "Title");
+        row.course_page_ids = links.iter().map(|id| (*id).into()).collect();
+        let rows = [row, manual.clone()];
+        let plan = plan_sync(&input, NotionSnapshot::Complete(&rows), &mappings);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].key, key("a"));
+        assert_eq!(
+            plan[0].action,
+            PlanAction::Unchanged {
+                page_id: "a".into()
+            }
+        );
+        assert_eq!(plan[0].course_relation_mismatch, mismatch, "{links:?}");
+    }
 }
 
 #[test]

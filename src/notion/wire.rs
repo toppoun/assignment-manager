@@ -20,7 +20,7 @@ pub struct NotionPropertyIds {
     pub title: String,
     /// Date, accepting a single calendar date or an RFC 3339 instant.
     pub deadline: String,
-    /// Configure a source-owned Relation column.
+    /// Relation column populated from a verified mapping when empty or on creation.
     pub course: String,
     /// URL column verified during schema validation and omitted from writes.
     pub submission_url: String,

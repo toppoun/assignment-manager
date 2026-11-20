@@ -248,6 +248,7 @@ impl Receipt {
             "Create={} Update={} Unchanged={} Conflict={} Deferred={}",
             c.create, c.update, c.unchanged, c.conflict, c.deferred
         );
+        println!("course_relation_mismatch={}", c.course_relation_mismatch);
         println!(
             "result={} issue={}",
             self.outcome.code(),

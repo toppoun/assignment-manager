@@ -25,6 +25,8 @@ pub struct DryRunCounts {
     pub unchanged: usize,
     pub conflict: usize,
     pub deferred: usize,
+    #[serde(default)]
+    pub course_relation_mismatch: usize,
 }
 
 pub struct DryRunReport {
@@ -87,6 +89,7 @@ impl DryRunReport {
     pub fn counts(&self) -> DryRunCounts {
         let mut counts = DryRunCounts::default();
         for entry in &self.plan {
+            counts.course_relation_mismatch += usize::from(entry.course_relation_mismatch);
             *match entry.action {
                 PlanAction::Create { .. } => &mut counts.create,
                 PlanAction::Update { .. } => &mut counts.update,
@@ -104,8 +107,13 @@ impl fmt::Display for DryRunReport {
         let counts = self.counts();
         write!(
             f,
-            "Create={} Update={} Unchanged={} Conflict={} Deferred={}",
-            counts.create, counts.update, counts.unchanged, counts.conflict, counts.deferred
+            "Create={} Update={} Unchanged={} Conflict={} Deferred={} course_relation_mismatch={}",
+            counts.create,
+            counts.update,
+            counts.unchanged,
+            counts.conflict,
+            counts.deferred,
+            counts.course_relation_mismatch
         )?;
         if let Some(error) = self.error {
             write!(f, " ({error})")?;
@@ -148,16 +156,10 @@ impl NotionClient {
         rows: &[NotionAssignment],
         mappings: &[CourseMapping],
     ) -> Result<DryRunReport, NotionError> {
-        let mappings: Vec<_> = mappings
-            .iter()
-            .map(|mapping| {
-                Ok(CourseMapping {
-                    course_key: mapping.course_key.clone(),
-                    page_id: uuid(&mapping.page_id).ok_or(NotionError::Configuration)?,
-                })
-            })
-            .collect::<Result<_, NotionError>>()?;
-        let plan = plan_sync(input, NotionSnapshot::Complete(rows), &mappings);
+        if mappings.iter().any(|mapping| !mapping.has_valid_page_id()) {
+            return Err(NotionError::Configuration);
+        }
+        let plan = plan_sync(input, NotionSnapshot::Complete(rows), mappings);
         let mut verified = HashSet::new();
         let mut requests = Vec::new();
         for entry in &plan {

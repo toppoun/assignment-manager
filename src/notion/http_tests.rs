@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 
 use super::{
     mock_apply::{self, ApplyError, CreateOutcome},
-    tests::{candidate, input, key, moodle},
+    tests::{candidate, input, input_with_course, key},
     *,
 };
-use crate::{domain::Deadline, sync::SourceCourse};
+use crate::domain::Deadline;
 
 const TOKEN: &str = "synthetic-notion-secret";
 const A: &str = "00000000-0000-4000-8000-000000000001";
@@ -27,6 +27,8 @@ const PAGE_B: &str = "00000000-0000-4000-8000-000000000006";
 const MANUAL: &str = "00000000-0000-4000-8000-000000000007";
 const COURSE: &str = "00000000-0000-4000-8000-000000000008";
 const OLD_COURSE: &str = "00000000-0000-4000-8000-000000000009";
+const PAGE_C: &str = "00000000-0000-4000-8000-00000000000a";
+const PAGE_D: &str = "00000000-0000-4000-8000-00000000000b";
 
 type Inspect = Box<dyn FnOnce(&str, &Value) + Send>;
 struct Exchange {
@@ -278,30 +280,26 @@ fn item_list(ids: &[&str], cursor: Option<&str>) -> Value {
 }
 
 #[test]
-fn http_dry_run_previews_writes_after_complete_pagination_and_reconverges() {
+fn http_dry_run_previews_safe_relation_patches_after_complete_pagination() {
     let a = key("a");
     let b = key("b");
-    let mut second = candidate("b", "New title");
-    second.deadline = None;
-    let mut acquired = moodle(vec![candidate("a", "New task"), second]);
-    let assignment_key = acquired.assignments().batch().as_slice()[1]
-        .external_key
-        .clone();
-    let mut course_key = assignment_key.clone();
-    course_key.id = "external-course".into();
-    acquired.courses.insert(
-        assignment_key,
-        SourceCourse {
-            external_key: course_key.clone(),
-            name: "Course".into(),
-        },
-    );
-    let input = SyncInput::from_acquisitions(Some(&acquired), None).unwrap();
+    let c = key("c");
+    let d = key("d");
+    let (input, course_key) = input_with_course(vec![
+        candidate("a", "New task"),
+        candidate("b", "New title"),
+        candidate("c", "Fill course"),
+        candidate("d", "Keep course"),
+    ]);
     let mapping = CourseMapping {
         course_key,
         page_id: COURSE.into(),
     };
-    let manual = task(MANUAL, None, "New task");
+    let mut manual = task(MANUAL, None, "New task");
+    manual["properties"]["授業"]["relation"] = json!([{"id":OLD_COURSE}]);
+    let empty = task(PAGE_C, Some(&c), "Fill course");
+    let mut mismatch = task(PAGE_D, Some(&d), "Keep course");
+    mismatch["properties"]["授業"]["relation"] = json!([{"id":OLD_COURSE}]);
     let mut original = task(PAGE_B, Some(&b), "Old title");
     original["properties"]["期限"]["date"] =
         json!({"start":"2026-11-20","end":null,"time_zone":null});
@@ -316,9 +314,15 @@ fn http_dry_run_previews_writes_after_complete_pagination_and_reconverges() {
             assert!(body.get("start_cursor").is_none());
         }),
     );
-    script.push(query(vec![original.clone()], None).check(|_, body| {
-        assert_eq!(body["start_cursor"], "cursor/value");
-    }));
+    script.push(
+        query(
+            vec![original.clone(), empty.clone(), mismatch.clone()],
+            None,
+        )
+        .check(|_, body| {
+            assert_eq!(body["start_cursor"], "cursor/value");
+        }),
+    );
     let property_path = format!("/v1/pages/{PAGE_B}/properties/R%3Ael");
     script.push(Exchange::json(
         "GET",
@@ -339,44 +343,41 @@ fn http_dry_run_previews_writes_after_complete_pagination_and_reconverges() {
     let mut updated = original.clone();
     updated["properties"]["タイトル（改名済）"]["title"] = json!([text("New title")]);
     updated["properties"]["期限"]["date"] = Value::Null;
+    updated["properties"]["授業"]["relation"] = json!([{"id":COURSE}, {"id":OLD_COURSE}]);
     updated["properties"]["授業"]["has_more"] = json!(false);
-    let expected_patch = json!({"properties":{
-        "title":{"title":[text("New title")]},
-        "due":{"date":null},
-        "R%3Ael":{"relation":[{"id":COURSE}]}
-    }});
-    script.push(
-        Exchange::json("PATCH", format!("/v1/pages/{PAGE_B}"), updated.clone()).check(
-            move |_, body| {
-                assert_eq!(body, &expected_patch);
-            },
-        ),
-    );
+    let mut filled = empty;
+    filled["properties"]["授業"]["relation"] = json!([{"id":COURSE}]);
+    let mut created = task(PAGE_A, Some(&a), "New task");
+    created["properties"]["授業"]["relation"] = json!([{"id":COURSE}]);
+
+    // Both dry runs permit only schema, query, and property/page reads.
     script.extend(schema_exchanges(schema_json()));
     script.push(query(
-        vec![manual, task(PAGE_A, Some(&a), "New task"), updated],
+        vec![manual, created, updated, filled, mismatch],
         None,
     ));
     let (client, server) = mock(script);
-    let db = Connection::open_in_memory().unwrap();
-    mock_apply::initialize(&db).unwrap();
 
     let report = client.dry_run(&input, &target(), std::slice::from_ref(&mapping));
     assert_eq!(report.error(), None);
     assert_eq!(
         report.to_string(),
-        "Create=1 Update=1 Unchanged=0 Conflict=0 Deferred=0"
+        "Create=1 Update=2 Unchanged=1 Conflict=0 Deferred=0 course_relation_mismatch=2"
     );
-    assert_eq!(report.plan().len(), 2);
-    let count: i64 = db
-        .query_row("SELECT count(*) FROM notion_creation", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(count, 0);
-    let create = report
-        .requests()
-        .iter()
-        .find(|r| r.method() == Method::POST)
-        .unwrap();
+    assert_eq!(report.plan().len(), 4);
+    for entry in report.plan() {
+        assert_eq!(
+            entry.course_relation_mismatch,
+            entry.key == b || entry.key == d
+        );
+    }
+    assert_eq!(report.requests().len(), 3);
+    let request = |key| report.requests().iter().find(|r| r.key() == key).unwrap();
+    let create = request(&a);
+    assert_eq!(
+        (create.method(), create.path()),
+        (&Method::POST, "/v1/pages")
+    );
     assert_eq!(
         create.body(),
         &json!({
@@ -384,26 +385,35 @@ fn http_dry_run_previews_writes_after_complete_pagination_and_reconverges() {
             "properties":{
                 "title":{"title":[text("New task")]},
                 "orig":{"select":{"id":"option-md"}},
-                "sync":{"rich_text":[text(a.as_str())]}
+                "sync":{"rich_text":[text(a.as_str())]},
+                "R%3Ael":{"relation":[{"id":COURSE}]}
             }
         })
     );
-    let patch = report
-        .requests()
-        .iter()
-        .find(|r| r.method() == Method::PATCH)
-        .unwrap();
-    // Dispatch is an explicit operation available only inside this mock test.
-    let returned = client.send_mock_write(patch).unwrap();
-    for managed in ["状態", "優先度", "メモ", "繰り返し", "提出URL"] {
-        assert_eq!(
-            returned["properties"][managed],
-            original["properties"][managed]
-        );
-    }
+    let patch = request(&b);
+    assert_eq!(patch.method(), Method::PATCH);
+    assert_eq!(patch.path(), format!("/v1/pages/{PAGE_B}"));
+    assert_eq!(
+        patch.body(),
+        &json!({"properties":{
+            "title":{"title":[text("New title")]},
+            "due":{"date":null}
+        }})
+    );
+    let fill = request(&c);
+    assert_eq!(fill.method(), Method::PATCH);
+    assert_eq!(fill.path(), format!("/v1/pages/{PAGE_C}"));
+    assert_eq!(
+        fill.body(),
+        &json!({"properties":{
+            "R%3Ael":{"relation":[{"id":COURSE}]}
+        }})
+    );
 
     let repeat = client.dry_run(&input, &target(), &[mapping]);
-    assert_eq!(repeat.counts().unchanged, 2);
+    assert_eq!(repeat.error(), None);
+    assert_eq!(repeat.counts().unchanged, 4);
+    assert_eq!(repeat.counts().course_relation_mismatch, 2);
     assert!(repeat.requests().is_empty());
     server.join().unwrap();
 }
@@ -748,7 +758,11 @@ fn http_duplicate_key_on_a_later_page_is_a_conflict() {
 
 #[test]
 fn http_unreadable_relation_page_suppresses_an_update() {
-    let input = input(vec![candidate("a", "New")]);
+    let (input, course_key) = input_with_course(vec![candidate("a", "New")]);
+    let mappings = [CourseMapping {
+        course_key,
+        page_id: COURSE.into(),
+    }];
     let mut row = task(PAGE_A, Some(&key("a")), "Old");
     row["properties"]["授業"]["has_more"] = json!(true);
     let mut script = schema_exchanges(schema_json());
@@ -760,7 +774,7 @@ fn http_unreadable_relation_page_suppresses_an_update() {
         "",
     ));
     let (client, server) = mock(script);
-    let report = client.dry_run(&input, &target(), &[]);
+    let report = client.dry_run(&input, &target(), &mappings);
     assert_eq!(report.error(), Some(NotionError::NotFound));
     assert_eq!(report.counts().deferred, 1);
     assert!(report.requests().is_empty());
