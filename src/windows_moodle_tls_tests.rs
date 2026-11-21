@@ -581,12 +581,20 @@ fn windows_saved_moodle_crl_offline() {
     )
     .unwrap();
     println!("windows_saved_pair_crl=verified");
-    let peer = evidence.check_peer(
-        &evidence.leaf,
-        std::slice::from_ref(&evidence.issuer),
-        &ServerName::try_from(host).unwrap(),
-        UnixTime::now(),
+    let store = MemoryStore::new().unwrap();
+    let leaf = store
+        .add_certificate(&evidence.leaf, true)
+        .unwrap()
+        .unwrap();
+    store.add_certificate(&evidence.issuer, false).unwrap();
+    store.add_crl(&evidence.crl).unwrap();
+    let chain = Chain::build(null_mut(), &store, &leaf, &filetime(UnixTime::now())).unwrap();
+    let flags = unsafe { (*chain.0).TrustStatus.dwErrorStatus };
+    println!(
+        "windows_saved_partial_chain={}",
+        flags & CERT_TRUST_IS_PARTIAL_CHAIN != 0
     );
+    let peer = chain.check(host, &evidence.issuer);
     match peer {
         Ok(()) => println!("windows_saved_cached_chain=verified"),
         Err(MoodleCrlError::CertificateChain | MoodleCrlError::RevocationUnconfirmed) => println!(

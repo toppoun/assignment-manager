@@ -215,6 +215,7 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
     let temp = tempfile::tempdir().unwrap();
     for args in [
         &["university-check", "moodle"][..],
+        &["university-check", "moodle", "--require-windows-vpn"],
         &["university-check", "webclass", "--allow-university-read"],
         &["university-check", "--fixture", "--allow-university-read"],
         &["--config", "unused.json", "university-check", "--fixture"],
@@ -253,7 +254,12 @@ fn university_moodle_stops_before_credentials_without_crl_evidence() {
     let check = || {
         call(
             &temp,
-            &["university-check", "moodle", "--allow-university-read"],
+            &[
+                "university-check",
+                "moodle",
+                "--allow-university-read",
+                "--require-windows-vpn",
+            ],
         )
     };
     for evidence in [

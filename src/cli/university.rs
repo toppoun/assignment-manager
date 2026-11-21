@@ -6,7 +6,11 @@ use assignment_manager::{
 
 use super::{CliError, Config, CredentialStatus, credentials};
 
-pub(super) fn moodle(config: &Config, config_dir: &std::path::Path) -> Result<u8, CliError> {
+pub(super) fn moodle(
+    config: &Config,
+    config_dir: &std::path::Path,
+    require_windows_vpn: bool,
+) -> Result<u8, CliError> {
     let source = config
         .moodle
         .as_ref()
@@ -25,6 +29,10 @@ pub(super) fn moodle(config: &Config, config_dir: &std::path::Path) -> Result<u8
             &config_dir.join(&files.issuer_certificate),
             &config_dir.join(&files.crl),
         ) {
+            Ok(policy) if require_windows_vpn => match policy.with_moodle_windows_vpn() {
+                Ok(policy) => policy,
+                Err(_) => return Ok(crl_failure("vpn_route_unconfirmed")),
+            },
             Ok(policy) => policy,
             Err(error) => return Ok(crl_failure(error.diagnostic())),
         }
@@ -32,6 +40,9 @@ pub(super) fn moodle(config: &Config, config_dir: &std::path::Path) -> Result<u8
     #[cfg(not(windows))]
     {
         let _ = config_dir;
+        if require_windows_vpn {
+            return Ok(crl_failure("vpn_route_unconfirmed"));
+        }
         if source.windows_crl.is_some() {
             return Ok(crl_failure("tls_revocation_unconfirmed"));
         }

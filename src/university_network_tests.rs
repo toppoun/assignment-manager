@@ -165,6 +165,8 @@ fn resolve(lookup: Arc<dyn Resolve>, host: &str) -> Result<Vec<SocketAddr>, Netw
         fixture_peers: Vec::new(),
         hosts: vec![HOST.into()],
         lookup,
+        #[cfg(windows)]
+        vpn: None,
         peer: None,
         loopback_origins: false,
     };
@@ -190,6 +192,71 @@ fn dns_returns_only_the_entire_validated_a_aaaa_set_and_no_port_override() {
     addresses[0].set_port(0);
     assert_eq!(resolve(lookup, HOST).unwrap(), addresses);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_vpn_selects_one_peer_after_all_dns_checks_and_never_resolves_twice() {
+    let first = addr("8.8.8.8");
+    let vpn_peer = addr("1.1.1.1");
+    let ipv6 = addr("2606:4700:4700::1111");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (answers, expected, selections) in [
+        (vec![first, ipv6, vpn_peer], Ok(vpn_peer), 1),
+        (
+            vec![vpn_peer, addr("127.0.0.1")],
+            Err(RequestFailure::DnsPolicy),
+            0,
+        ),
+        (
+            vec![vpn_peer; MAX_DNS_ANSWERS + 1],
+            Err(RequestFailure::DnsPolicy),
+            0,
+        ),
+        (vec![first, ipv6], Err(RequestFailure::VpnRoute), 1),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let lookup = Arc::new(FakeLookup::new(vec![answers]));
+        let resolver = GuardedResolver {
+            hosts: vec![HOST.into()],
+            lookup: lookup.clone(),
+            vpn: Some(Arc::new(OneShotVpn {
+                started: std::sync::atomic::AtomicBool::new(false),
+                select: Box::new(move |checked| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    checked.iter().copied().find(|peer| *peer == vpn_peer)
+                }),
+            })),
+            #[cfg(feature = "synthetic-https-fixture")]
+            fixture_peers: vec![],
+            peer: None,
+            loopback_origins: false,
+        };
+        assert!(matches!(
+            runtime.block_on(resolver.resolve("other.synthetic.invalid".parse().unwrap())),
+            Err(error) if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::DnsPolicy)
+        ));
+        match (
+            runtime.block_on(resolver.resolve(HOST.parse().unwrap())),
+            expected,
+        ) {
+            (Ok(peers), Ok(peer)) => assert_eq!(peers.collect::<Vec<_>>(), [peer]),
+            (Err(error), Err(reason)) => {
+                assert_eq!(error.downcast_ref::<RequestFailure>(), Some(&reason));
+            }
+            _ => panic!("unexpected VPN route result"),
+        }
+        assert!(matches!(
+            runtime.block_on(resolver.resolve(HOST.parse().unwrap())),
+            Err(error) if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::DnsPolicy)
+        ));
+        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), selections);
+    }
 }
 
 #[test]
@@ -913,6 +980,8 @@ fn dns_deadline_fails_closed() {
     let resolver = GuardedResolver {
         hosts: vec![HOST.into()],
         lookup: Arc::new(PendingLookup),
+        #[cfg(windows)]
+        vpn: None,
         #[cfg(feature = "synthetic-https-fixture")]
         fixture_peers: Vec::new(),
         peer: None,

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
+#[cfg(any(windows, test))]
 use std::net::SocketAddr;
 
 use reqwest::{
@@ -24,6 +24,8 @@ use reqwest::{
 
 #[cfg(windows)]
 pub use crate::windows_moodle_tls::MoodleCrlError;
+#[cfg(windows)]
+use crate::windows_moodle_vpn::WindowsMoodleVpn;
 
 pub(crate) const HOPPII_ORIGIN: &str = "https://hoppii2025.hosei.ac.jp";
 pub(crate) const IDP_ORIGIN: &str = "https://idp.hosei.ac.jp";
@@ -40,6 +42,8 @@ pub struct NetworkPolicy {
     moodle: Option<(String, String)>,
     #[cfg(windows)]
     pub(crate) moodle_windows_crl: Option<Arc<crate::windows_moodle_tls::CrlEvidence>>,
+    #[cfg(windows)]
+    moodle_windows_vpn: Option<WindowsMoodleVpn>,
     #[cfg(feature = "synthetic-https-fixture")]
     pub(crate) synthetic: Option<Arc<crate::webclass_auth::synthetic::FixedNetwork>>,
     #[cfg(test)]
@@ -83,6 +87,17 @@ impl NetworkPolicy {
         self.moodle_windows_crl = Some(Arc::new(crate::windows_moodle_tls::CrlEvidence::load(
             host, leaf, issuer, crl,
         )?));
+        Ok(self)
+    }
+
+    /// Require an active Fortinet IPv4 connection and restrict the next Moodle
+    /// client to one fully checked DNS result reached through that connection.
+    #[cfg(windows)]
+    pub fn with_moodle_windows_vpn(mut self) -> Result<Self, NetworkError> {
+        if self.moodle_windows_crl.is_none() {
+            return Err(NetworkError::Policy);
+        }
+        self.moodle_windows_vpn = Some(WindowsMoodleVpn::connected().ok_or(NetworkError::Policy)?);
         Ok(self)
     }
 
@@ -348,6 +363,8 @@ pub(crate) enum RequestFailure {
     DnsLookup,
     DnsTimeout,
     DnsPolicy,
+    #[cfg(windows)]
+    VpnRoute,
     TcpConnect,
     TlsHandshake,
     TlsProtocol,
@@ -374,6 +391,8 @@ impl RequestFailure {
             Self::DnsLookup => "dns_lookup",
             Self::DnsTimeout => "dns_timeout",
             Self::DnsPolicy => "dns_policy",
+            #[cfg(windows)]
+            Self::VpnRoute => "vpn_route_unconfirmed",
             Self::TcpConnect => "tcp_connect",
             Self::TlsHandshake => "tls_handshake",
             Self::TlsProtocol => "tls_protocol",
@@ -489,10 +508,15 @@ pub(crate) enum Source {
     WebClass,
 }
 
-struct SystemLookup;
+struct SystemLookup {
+    absolute_name: bool,
+}
 impl Resolve for SystemLookup {
     fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_owned();
+        let mut host = name.as_str().to_owned();
+        if self.absolute_name && !host.ends_with('.') {
+            host.push('.');
+        }
         Box::pin(async move {
             let result = tokio::net::lookup_host((host, 0))
                 .await
@@ -505,6 +529,8 @@ impl Resolve for SystemLookup {
 struct GuardedResolver {
     hosts: Vec<String>,
     lookup: Arc<dyn Resolve>,
+    #[cfg(windows)]
+    vpn: Option<Arc<OneShotVpn>>,
     #[cfg(feature = "synthetic-https-fixture")]
     fixture_peers: Vec<std::net::SocketAddr>,
     #[cfg(test)]
@@ -512,9 +538,28 @@ struct GuardedResolver {
     #[cfg(test)]
     loopback_origins: bool,
 }
+
+#[cfg(windows)]
+type SelectVpnPeer = dyn Fn(&[SocketAddr]) -> Option<SocketAddr> + Send + Sync;
+
+#[cfg(windows)]
+struct OneShotVpn {
+    started: std::sync::atomic::AtomicBool,
+    select: Box<SelectVpnPeer>,
+}
+
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         if !self.hosts.iter().any(|h| h == name.as_str()) {
+            return Box::pin(async { Err(RequestFailure::DnsPolicy.into()) });
+        }
+        #[cfg(windows)]
+        let vpn = self.vpn.clone();
+        #[cfg(windows)]
+        if vpn
+            .as_ref()
+            .is_some_and(|vpn| vpn.started.swap(true, std::sync::atomic::Ordering::Relaxed))
+        {
             return Box::pin(async { Err(RequestFailure::DnsPolicy.into()) });
         }
         let lookup = self.lookup.resolve(name);
@@ -548,6 +593,11 @@ impl Resolve for GuardedResolver {
             }
             if checked.is_empty() {
                 return Err(RequestFailure::DnsPolicy.into());
+            }
+            #[cfg(windows)]
+            if let Some(vpn) = vpn {
+                let selected = (vpn.select)(&checked).ok_or(RequestFailure::VpnRoute)?;
+                return Ok(Box::new([selected].into_iter()) as Addrs);
             }
             Ok(Box::new(checked.into_iter()) as Addrs)
         })
@@ -609,7 +659,16 @@ impl Transport {
         source: Source,
         cookies: Option<Arc<SessionCookies>>,
     ) -> Result<Self, NetworkError> {
-        let lookup: Arc<dyn Resolve> = Arc::new(SystemLookup);
+        #[cfg(windows)]
+        let vpn = match source {
+            Source::Moodle => policy.moodle_windows_vpn,
+            Source::WebClass => None,
+        };
+        #[cfg(windows)]
+        let absolute_name = vpn.is_some();
+        #[cfg(not(windows))]
+        let absolute_name = false;
+        let lookup: Arc<dyn Resolve> = Arc::new(SystemLookup { absolute_name });
         #[cfg(feature = "synthetic-https-fixture")]
         let lookup: Arc<dyn Resolve> = policy
             .synthetic
@@ -621,6 +680,13 @@ impl Transport {
         let resolver = GuardedResolver {
             hosts: policy.hosts(source),
             lookup,
+            #[cfg(windows)]
+            vpn: vpn.map(|vpn| {
+                Arc::new(OneShotVpn {
+                    started: std::sync::atomic::AtomicBool::new(false),
+                    select: Box::new(move |answers| vpn.select(answers)),
+                })
+            }),
             #[cfg(feature = "synthetic-https-fixture")]
             fixture_peers: policy
                 .synthetic
@@ -682,6 +748,10 @@ impl Transport {
                 .tls_backend_preconfigured(config)
                 .http1_only()
                 .pool_max_idle_per_host(0);
+        }
+        #[cfg(windows)]
+        if let Some(vpn) = vpn {
+            builder = builder.local_address(IpAddr::V4(vpn.source));
         }
         let client = reqwest::blocking::ClientBuilder::from(builder)
             // Blocking Response::Read polls outside Tokio. Its finite wait timeout
