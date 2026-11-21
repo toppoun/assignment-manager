@@ -551,7 +551,8 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             Some(path) => path,
             None => config::root()?.join("config.json"),
         };
-        return university::moodle(&Config::read(&path)?);
+        let directory = path.parent().unwrap_or(Path::new("."));
+        return university::moodle(&Config::read(&path)?, directory);
     }
     let root = config::root()?;
     if args.command.uses_fixture() {

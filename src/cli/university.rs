@@ -6,13 +6,37 @@ use assignment_manager::{
 
 use super::{CliError, Config, CredentialStatus, credentials};
 
-pub(super) fn moodle(config: &Config) -> Result<u8, CliError> {
+pub(super) fn moodle(config: &Config, config_dir: &std::path::Path) -> Result<u8, CliError> {
+    let source = config
+        .moodle
+        .as_ref()
+        .ok_or(CliError::Credential(CredentialStatus::Disabled))
+        .inspect_err(|_| {
+            print_source("moodle", 0, Some("setup"));
+        })?;
+    let policy = source.policy()?;
+    #[cfg(windows)]
+    let policy = {
+        let Some(files) = source.windows_crl.as_ref() else {
+            return Ok(crl_failure("tls_revocation_unconfirmed"));
+        };
+        match policy.with_moodle_windows_crl(
+            &config_dir.join(&files.leaf_certificate),
+            &config_dir.join(&files.issuer_certificate),
+            &config_dir.join(&files.crl),
+        ) {
+            Ok(policy) => policy,
+            Err(error) => return Ok(crl_failure(error.diagnostic())),
+        }
+    };
+    #[cfg(not(windows))]
+    {
+        let _ = config_dir;
+        if source.windows_crl.is_some() {
+            return Ok(crl_failure("tls_revocation_unconfirmed"));
+        }
+    }
     let prepare = || {
-        let source = config
-            .moodle
-            .as_ref()
-            .ok_or(CliError::Credential(CredentialStatus::Disabled))?;
-        let policy = source.policy()?;
         let url = credentials::moodle_url(&config.target_id()?).map_err(CliError::Credential)?;
         policy
             .validate_moodle_url(&url)
@@ -27,6 +51,12 @@ pub(super) fn moodle(config: &Config) -> Result<u8, CliError> {
     clients.begin_run();
     let success = check_moodle(&clients, &feed);
     Ok(finish(success))
+}
+
+fn crl_failure(diagnostic: &'static str) -> u8 {
+    print_source("moodle", 0, Some("fetch"));
+    println!("moodle diagnostic={diagnostic}");
+    finish(false)
 }
 
 fn check_moodle(clients: &SecuredSyncClients, feed: &MoodleFeed) -> bool {

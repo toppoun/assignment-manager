@@ -94,11 +94,13 @@ dependencies = [
  "apple-native-keyring-store",
  "aws-lc-rs",
  "chrono",
+ "hyper",
  "ical",
  "keyring-core",
  "reqwest",
  "rpassword",
  "rusqlite",
+ "rustls",
  "scraper",
  "security-framework",
  "serde",
@@ -106,6 +108,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-native-keyring-store",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -236,6 +236,53 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
     assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
 }
 
+#[cfg(windows)]
+#[test]
+fn university_moodle_stops_before_credentials_without_crl_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    config(&temp);
+    let path = local_root(&temp).join("config.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    settings["moodle"] = serde_json::json!({
+        "host": "moodle-crl.synthetic.invalid",
+        "path": "/calendar/export_execute.php",
+        "scope": "default.course-related"
+    });
+    fs::write(&path, settings.to_string()).unwrap();
+    let check = || {
+        call(
+            &temp,
+            &["university-check", "moodle", "--allow-university-read"],
+        )
+    };
+    for evidence in [
+        None,
+        Some(serde_json::json!({
+            "leaf_certificate": "synthetic-missing-leaf.cer",
+            "issuer_certificate": "synthetic-missing-issuer.cer",
+            "crl": "synthetic-missing.crl"
+        })),
+    ] {
+        if let Some(evidence) = evidence {
+            settings["moodle"]["windows_crl"] = evidence;
+            fs::write(&path, settings.to_string()).unwrap();
+        }
+        let output = check();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            stdout(&output).lines().collect::<Vec<_>>(),
+            [
+                "moodle acquired=0 failures=1 error=fetch",
+                "moodle diagnostic=tls_revocation_unconfirmed",
+                "result=failed"
+            ]
+        );
+        assert!(stderr(&output).is_empty());
+        assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
+    }
+}
+
 #[cfg(feature = "synthetic-https-fixture")]
 #[test]
 fn university_fixture_prints_only_counts_and_creates_no_state() {

@@ -22,6 +22,9 @@ use reqwest::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, HeaderValue, REFERER},
 };
 
+#[cfg(windows)]
+pub use crate::windows_moodle_tls::MoodleCrlError;
+
 pub(crate) const HOPPII_ORIGIN: &str = "https://hoppii2025.hosei.ac.jp";
 pub(crate) const IDP_ORIGIN: &str = "https://idp.hosei.ac.jp";
 pub(crate) const WEBCLASS_ORIGIN: &str = "https://lms2025.hosei.ac.jp";
@@ -35,6 +38,8 @@ const MAX_DNS_ANSWERS: usize = 64;
 #[derive(Clone, Default)]
 pub struct NetworkPolicy {
     moodle: Option<(String, String)>,
+    #[cfg(windows)]
+    pub(crate) moodle_windows_crl: Option<Arc<crate::windows_moodle_tls::CrlEvidence>>,
     #[cfg(feature = "synthetic-https-fixture")]
     pub(crate) synthetic: Option<Arc<crate::webclass_auth::synthetic::FixedNetwork>>,
     #[cfg(test)]
@@ -55,7 +60,29 @@ impl NetworkPolicy {
         {
             return Err(NetworkError::Policy);
         }
+        #[cfg(windows)]
+        if self.moodle_windows_crl.is_some()
+            && self.moodle.as_ref().is_some_and(|(known, _)| known != host)
+        {
+            return Err(NetworkError::Policy);
+        }
         self.moodle = Some((host.into(), path.into()));
+        Ok(self)
+    }
+
+    /// Bind locally supplied DER evidence to the configured Moodle host.
+    /// This checks the files offline, independent of any previous verification record.
+    #[cfg(windows)]
+    pub fn with_moodle_windows_crl(
+        mut self,
+        leaf: &std::path::Path,
+        issuer: &std::path::Path,
+        crl: &std::path::Path,
+    ) -> Result<Self, MoodleCrlError> {
+        let (host, _) = self.moodle.as_ref().ok_or(MoodleCrlError::Evidence)?;
+        self.moodle_windows_crl = Some(Arc::new(crate::windows_moodle_tls::CrlEvidence::load(
+            host, leaf, issuer, crl,
+        )?));
         Ok(self)
     }
 
@@ -330,6 +357,8 @@ pub(crate) enum RequestFailure {
     TlsRevoked,
     TlsRevocation,
     TlsCertificateOther,
+    #[cfg(windows)]
+    TlsCertificateChanged,
     HttpExchange,
     RequestTimeout,
     ConnectionUnknown,
@@ -354,6 +383,8 @@ impl RequestFailure {
             Self::TlsRevoked => "tls_certificate_revoked",
             Self::TlsRevocation => "tls_revocation_unconfirmed",
             Self::TlsCertificateOther => "tls_certificate_other",
+            #[cfg(windows)]
+            Self::TlsCertificateChanged => "tls_certificate_changed",
             Self::HttpExchange => "http_exchange",
             Self::RequestTimeout => "request_timeout_stage_unknown",
             Self::ConnectionUnknown => "connection_stage_unknown",
@@ -387,6 +418,13 @@ fn tls_failure(error: &rustls::Error, connecting: bool) -> RequestFailure {
             | Cert::ExpiredRevocationList
             | Cert::ExpiredRevocationListContext { .. }
             | Cert::InvalidOcspResponse => Failure::TlsRevocation,
+            #[cfg(windows)]
+            Cert::Other(error)
+                if error.0.downcast_ref::<MoodleCrlError>()
+                    == Some(&MoodleCrlError::CertificateChanged) =>
+            {
+                Failure::TlsCertificateChanged
+            }
             _ => Failure::TlsCertificateOther,
         },
         rustls::Error::InvalidCertRevocationList(_) => Failure::TlsRevocation,
@@ -634,6 +672,16 @@ impl Transport {
             if !fixture {
                 builder = policy.test.configure(builder);
             }
+        }
+        #[cfg(windows)]
+        if let (Source::Moodle, Some(evidence)) = (source, &policy.moodle_windows_crl) {
+            let config = Arc::clone(evidence)
+                .client_config()
+                .map_err(|_| NetworkError::Initialization)?;
+            builder = builder
+                .tls_backend_preconfigured(config)
+                .http1_only()
+                .pool_max_idle_per_host(0);
         }
         let client = reqwest::blocking::ClientBuilder::from(builder)
             // Blocking Response::Read polls outside Tokio. Its finite wait timeout

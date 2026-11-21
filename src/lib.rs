@@ -14,5 +14,7 @@ pub mod webclass_auth;
 pub mod webclass_http;
 #[cfg(windows)]
 pub mod windows_credentials;
+#[cfg(windows)]
+mod windows_moodle_tls;
 
 pub mod secured_sync;

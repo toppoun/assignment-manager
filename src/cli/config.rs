@@ -32,6 +32,16 @@ pub(super) struct Moodle {
     pub host: String,
     pub path: String,
     pub scope: String,
+    pub windows_crl: Option<WindowsMoodleCrl>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) struct WindowsMoodleCrl {
+    pub leaf_certificate: PathBuf,
+    pub issuer_certificate: PathBuf,
+    pub crl: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
