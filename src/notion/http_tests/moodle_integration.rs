@@ -97,7 +97,7 @@ fn stored_rows(input: &SyncInput) -> Vec<Value> {
 
 #[test]
 fn live_moodle_plan_scopes_courses_and_handles_independent_deltas_and_repeats() {
-    let input = input_fixture();
+    let mut input = input_fixture();
     let entries = mappings_fixture();
     let mappings = MoodlePreviewMappings::new(&entries).unwrap();
     let target = target_fixture();
@@ -107,6 +107,7 @@ fn live_moodle_plan_scopes_courses_and_handles_independent_deltas_and_repeats() 
     partial[1]["properties"]["期限"]["date"] = json!({"start":"2026-11-01T00:00:00Z"});
     partial.push(task(MANUAL, None, "Manual record"));
     let mut script = scoped_snapshot(partial);
+    script.extend(scoped_snapshot(matching.clone()));
     script.extend(scoped_snapshot(matching.clone()));
     let (client, server) = mock(script);
 
@@ -131,9 +132,22 @@ fn live_moodle_plan_scopes_courses_and_handles_independent_deltas_and_repeats() 
     }
     let saved = std::fs::read(&path).unwrap();
     let state = || state::StateStore::read(&path, A).unwrap().unwrap();
-    let report = client
-        .preview_moodle_integration(&target, &input, &mappings, state())
+    let (report, audit) = client
+        .preview_moodle_integration_with_audit(&target, &input, &mappings, state())
         .unwrap();
+    assert_eq!(
+        audit,
+        MoodleBindingAudit {
+            linked: 3,
+            moodle_present: 3,
+            notion_exact: 3,
+            update: 2,
+            unchanged: 1,
+            title_changes: 1,
+            deadline_changes: 1,
+            ..Default::default()
+        }
+    );
     let counts = report.counts_for(&input);
     assert_eq!(
         counts,
@@ -167,7 +181,25 @@ fn live_moodle_plan_scopes_courses_and_handles_independent_deltas_and_repeats() 
         }
     );
     assert!(repeated.requests().is_empty());
+    let missing = input.assignments().keys().nth(1).unwrap().clone();
+    input.assignments.remove(&missing);
+    let (reduced, audit) = client
+        .preview_moodle_integration_with_audit(&target, &input, &mappings, state())
+        .unwrap();
+    assert_eq!(
+        audit,
+        MoodleBindingAudit {
+            linked: 3,
+            moodle_present: 2,
+            notion_exact: 3,
+            unchanged: 2,
+            ..Default::default()
+        }
+    );
+    assert_eq!(reduced.counts_for(&input).unchanged, 3);
+    assert!(reduced.requests().is_empty());
     assert_eq!(std::fs::read(path).unwrap(), saved);
+    assert_eq!(client.read_counts(), (18, 0));
     server.join().unwrap();
 }
 

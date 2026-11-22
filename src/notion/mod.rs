@@ -18,7 +18,9 @@ mod trial;
 mod wire;
 
 pub use apply::{ApplyError, ApplyPreview, ApplyReport};
-pub use apply::{MOODLE_INTEGRATION_SCOPE, MoodlePreviewCoverage, MoodlePreviewMappings};
+pub use apply::{
+    MOODLE_INTEGRATION_SCOPE, MoodleBindingAudit, MoodlePreviewCoverage, MoodlePreviewMappings,
+};
 #[cfg(feature = "synthetic-https-fixture")]
 pub use apply::{MoodleCreatePreview, MoodleUpdatePreview};
 #[cfg(any(windows, test))]

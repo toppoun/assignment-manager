@@ -53,17 +53,34 @@ pub(super) fn execute(
         Acquisition::Stopped(code) => return Ok(code),
     };
     let result = plan_acquisition(acquired.as_ref(), &mappings, |input| {
-        let preview =
-            client.preview_moodle_integration(&target, input, &mappings, state.unwrap_or_default());
-        if preview.is_ok() {
-            println!(
-                "notion=ready reader=verified schemas=verified course_pages_verified={}",
-                notion_config.course_mappings.len()
-            );
-        }
-        preview
-            .map(|report| report.counts_for(input))
-            .map_err(CliError::MoodlePlanNotion)
+        let (report, audit) = client
+            .preview_moodle_integration_with_audit(
+                &target,
+                input,
+                &mappings,
+                state.unwrap_or_default(),
+            )
+            .map_err(CliError::MoodlePlanNotion)?;
+        println!(
+            "notion=ready reader=verified schemas=verified course_pages_verified={}",
+            notion_config.course_mappings.len()
+        );
+        println!(
+            "linked_check total={} moodle_present={} moodle_absent={} notion_exact={} notion_missing={} notion_duplicate={} page_mismatch={} create={} update={} unchanged={} title_changes={} deadline_changes={}",
+            audit.linked,
+            audit.moodle_present,
+            audit.linked - audit.moodle_present,
+            audit.notion_exact,
+            audit.notion_missing,
+            audit.notion_duplicate,
+            audit.page_mismatch,
+            audit.create,
+            audit.update,
+            audit.unchanged,
+            audit.title_changes,
+            audit.deadline_changes,
+        );
+        Ok(report.counts_for(input))
     });
     let (operations, retries) = client.read_counts();
     println!("notion_read operations={operations} retries={retries}");

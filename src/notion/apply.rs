@@ -14,7 +14,7 @@ mod moodle_integration;
 #[cfg(any(windows, test))]
 mod moodle_live_create;
 pub use moodle_integration::{
-    MOODLE_INTEGRATION_SCOPE, MoodlePreviewCoverage, MoodlePreviewMappings,
+    MOODLE_INTEGRATION_SCOPE, MoodleBindingAudit, MoodlePreviewCoverage, MoodlePreviewMappings,
 };
 #[cfg(any(windows, test))]
 pub use moodle_live_create::{MoodleLiveCreateChoices, MoodleLiveCreateResult, MoodleLiveTarget};
