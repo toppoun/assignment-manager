@@ -16,6 +16,8 @@ pub struct MoodleEvent {
     pub uid: String,
     pub summary: String,
     pub description: Option<String>,
+    /// An explicit cancellation excludes this event from assignment candidates.
+    pub cancelled: bool,
     /// Decoded TEXT values, in source order across all CATEGORIES properties.
     /// Empty values and duplicates are retained; no business normalization occurs.
     /// `Ok(vec![])` means absent metadata. `Err` means unusable category syntax,
@@ -301,6 +303,13 @@ fn parse_event(
     let description = property(properties, "DESCRIPTION")?
         .map(|value| decode_text(value.value.as_deref().unwrap_or("")))
         .transpose()?;
+    let cancelled = properties.iter().any(|property| {
+        property.name.eq_ignore_ascii_case("STATUS")
+            && property
+                .value
+                .as_deref()
+                .is_some_and(|status| status.eq_ignore_ascii_case("CANCELLED"))
+    });
     let dtstart = property(properties, "DTSTART")?
         .ok_or(MoodleParseError::MissingDtstart { event_index })
         .and_then(|value| parse_datetime(value, "DTSTART", event_index))?;
@@ -315,6 +324,7 @@ fn parse_event(
         uid,
         summary,
         description,
+        cancelled,
         categories,
         dtstart,
         dtend,
@@ -391,7 +401,9 @@ fn parse_datetime(
 }
 
 pub fn classify_event(event: &MoodleEvent) -> MoodleEventKind {
-    if normalized_title(&event.summary, "の提出期限").is_some() {
+    if event.cancelled {
+        MoodleEventKind::Unknown
+    } else if normalized_title(&event.summary, "の提出期限").is_some() {
         MoodleEventKind::SubmissionDeadline
     } else if normalized_title(&event.summary, "の受験可能期間の開始").is_some() {
         MoodleEventKind::AvailabilityStart
@@ -408,9 +420,8 @@ fn normalized_title(summary: &str, suffix: &str) -> Option<String> {
     let title = title
         .strip_prefix('「')
         .and_then(|inner| inner.strip_suffix('」'))
-        .filter(|inner| !inner.is_empty())
         .unwrap_or(title);
-    (!title.is_empty()).then(|| title.to_owned())
+    (!title.trim().is_empty()).then(|| title.to_owned())
 }
 
 /// `scope` is a stable caller-provided feed label, never a calendar URL or token.
@@ -723,6 +734,52 @@ mod tests {
         let events = parse_calendar(EMPTY).unwrap();
         assert!(events.is_empty());
         assert!(map_events(&events, SCOPE).is_empty());
+    }
+
+    #[test]
+    fn cancelled_deadline_events_remain_present_but_do_not_become_candidates() {
+        for suffix in ["の提出期限", "の受験可能期間の終了"] {
+            let confirmed = category_calendar("STATUS:CONFIRMED").replace("の提出期限", suffix);
+            let confirmed = map_events(&parse_calendar(&confirmed).unwrap(), SCOPE);
+            assert_eq!(confirmed.len(), 1);
+
+            for status in ["STATUS:CANCELLED", "status:cancelled"] {
+                let cancelled = category_calendar(status).replace("の提出期限", suffix);
+                let events = parse_calendar(&cancelled).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(confirmed[0].external_key.id, events[0].uid);
+                assert!(map_events(&events, SCOPE).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_suffix_alone_does_not_supply_a_title() {
+        for prefix in ["", " ", "「」", "「　」"] {
+            let calendar = category_calendar("").replace("「Synthetic task」", prefix);
+            let events = parse_calendar(&calendar).unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(map_events(&events, SCOPE).is_empty(), "empty title case");
+        }
+    }
+
+    #[test]
+    fn same_feed_and_uid_keep_the_key_when_title_deadline_and_category_change() {
+        let original = category_calendar("CATEGORIES:Course A");
+        let updated = original
+            .replace("Synthetic task", "Edited task")
+            .replace("20261004T000000Z", "20261005T010000Z")
+            .replace("Course A", "Course B");
+        let original = &parse_calendar(&original).unwrap()[0];
+        let updated = &parse_calendar(&updated).unwrap()[0];
+        let feed = course_feed();
+        let before = map_event(original, feed.scope()).unwrap();
+        let after = map_event(updated, feed.scope()).unwrap();
+        assert_eq!(before.external_key, after.external_key);
+        assert_ne!(before.title, after.title);
+        assert_ne!(before.deadline, after.deadline);
+        assert_eq!(single_course_category(original, &feed), Some("Course A"));
+        assert_eq!(single_course_category(updated, &feed), Some("Course B"));
     }
 
     #[test]
