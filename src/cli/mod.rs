@@ -84,12 +84,19 @@ enum Command {
         review_local: bool,
     },
     UniversityWebClass {
-        fixture: bool,
+        mode: WebClassCheckMode,
         review_local: bool,
     },
     UniversityFixture,
     UniversityReviewFixture,
     NotionTrial(String, trial::Command),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WebClassCheckMode {
+    Live,
+    Fixture,
+    Local,
 }
 
 impl Command {
@@ -107,7 +114,10 @@ impl Command {
                 Self::NotionFixturePreview
                     | Self::UniversityFixture
                     | Self::UniversityReviewFixture
-                    | Self::UniversityWebClass { fixture: true, .. }
+                    | Self::UniversityWebClass {
+                        mode: WebClassCheckMode::Fixture,
+                        ..
+                    }
                     | Self::MoodleFixturePlan
                     | Self::MoodleNotionPlan { .. }
             )
@@ -243,8 +253,21 @@ impl Arguments {
                 mode @ ("--allow-university-read" | "--fixture"),
                 rest @ ..,
             ] if matches!(rest, [] | ["--review-local"]) => Command::UniversityWebClass {
-                fixture: *mode == "--fixture",
+                mode: if *mode == "--fixture" {
+                    WebClassCheckMode::Fixture
+                } else {
+                    WebClassCheckMode::Live
+                },
                 review_local: !rest.is_empty(),
+            },
+            [
+                "university-check",
+                "webclass",
+                "--courses-only",
+                "--check-local",
+            ] => Command::UniversityWebClass {
+                mode: WebClassCheckMode::Local,
+                review_local: false,
             },
             ["sync", "--dry-run", "--fixture", "--allow-notion-read"] => {
                 Command::NotionFixturePreview
@@ -264,7 +287,10 @@ impl Arguments {
                     command,
                     Command::UniversityFixture
                         | Command::UniversityReviewFixture
-                        | Command::UniversityWebClass { fixture: true, .. }
+                        | Command::UniversityWebClass {
+                            mode: WebClassCheckMode::Fixture,
+                            ..
+                        }
                 ))
         {
             return Err(CliError::Usage);
@@ -713,6 +739,9 @@ fn run_fixture(_: Command, _: PathBuf) -> Result<u8, CliError> {
 fn execute(args: Arguments) -> Result<u8, CliError> {
     if args.command == Command::Help {
         println!("{USAGE}");
+        println!(
+            "Offline WebClass preflight: --config PATH university-check webclass --courses-only --check-local"
+        );
         #[cfg(windows)]
         println!(
             "Moodle integration: --config NOTION_CONFIG sync moodle --dry-run --moodle-config MOODLE_CONFIG --allow-university-read [--require-windows-vpn | --on-campus] --allow-notion-read"
@@ -815,21 +844,19 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             review_local,
         );
     }
-    if let Command::UniversityWebClass {
-        fixture,
-        review_local,
-    } = args.command
-    {
+    if let Command::UniversityWebClass { mode, review_local } = args.command {
         #[cfg(feature = "synthetic-https-fixture")]
-        if fixture {
+        if mode == WebClassCheckMode::Fixture {
             return Ok(university::webclass::fixture(review_local));
         }
-        let _ = fixture; // Fixture commands are rejected above in a normal build.
         let path = match args.config {
             Some(path) => path,
             None => config::root()?.join("config.json"),
         };
-        return university::webclass::check(&Config::read(&path)?, review_local);
+        if mode == WebClassCheckMode::Local {
+            return university::webclass::check_local(&path);
+        }
+        return university::webclass::check(&path, review_local);
     }
     let root = config::root()?;
     if args.command.uses_fixture() {

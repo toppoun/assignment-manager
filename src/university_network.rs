@@ -22,6 +22,8 @@ use reqwest::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, HeaderValue, REFERER},
 };
 
+use crate::webclass_auth::course_check::CourseCheck;
+
 #[cfg(windows)]
 pub use crate::windows_moodle_tls::MoodleCrlError;
 #[cfg(windows)]
@@ -644,6 +646,7 @@ pub(crate) struct Transport {
     policy: Option<(NetworkPolicy, Source)>,
     cookies: Option<Arc<SessionCookies>>,
     run: Option<Arc<RunBudget>>,
+    course_check: Option<CourseCheck>,
 }
 impl Transport {
     pub(crate) fn desktop(client: Client) -> Self {
@@ -652,6 +655,7 @@ impl Transport {
             policy: None,
             cookies: None,
             run: None,
+            course_check: None,
         }
     }
     pub(crate) fn secured(
@@ -765,6 +769,7 @@ impl Transport {
             policy: Some((policy, source)),
             cookies,
             run: None,
+            course_check: None,
         })
     }
     pub(crate) fn get(&self, url: Url) -> RequestBuilder {
@@ -775,6 +780,12 @@ impl Transport {
     }
     pub(crate) fn set_run_budget(&mut self, run: Option<Arc<RunBudget>>) {
         self.run = run;
+    }
+    pub(crate) fn restrict_course_check(&mut self, check: CourseCheck) {
+        self.course_check = Some(check);
+    }
+    pub(crate) fn is_course_check(&self) -> bool {
+        self.course_check.is_some()
     }
     pub(crate) fn shares_run(&self, run: &Arc<RunBudget>) -> bool {
         self.run.as_ref().is_some_and(|r| Arc::ptr_eq(r, run))
@@ -797,9 +808,24 @@ impl Transport {
         self.send_with_detail(request).map_err(|(error, _)| error)
     }
 
+    pub(crate) fn send_course_list(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<Response, NetworkError> {
+        self.execute(request, true).map_err(|(error, _)| error)
+    }
+
     pub(crate) fn send_with_detail(
         &self,
         request: RequestBuilder,
+    ) -> Result<Response, (NetworkError, RequestFailure)> {
+        self.execute(request, false)
+    }
+
+    fn execute(
+        &self,
+        request: RequestBuilder,
+        course_list: bool,
     ) -> Result<Response, (NetworkError, RequestFailure)> {
         let rejected = (NetworkError::Policy, RequestFailure::Policy);
         let limit = (NetworkError::ResourceLimit, RequestFailure::ResourceLimit);
@@ -839,6 +865,17 @@ impl Transport {
             let state = lease.0.0.lock().map_err(|_| limit)?;
             *request.timeout_mut() =
                 Some(REQUEST_TIMEOUT.min(RunBudget::remaining(&state).map_err(|_| limit)?));
+        }
+        if let Some(check) = &self.course_check {
+            check
+                .reserve(request.method(), request.url(), course_list)
+                .map_err(|error| {
+                    if error == NetworkError::Policy {
+                        rejected
+                    } else {
+                        limit
+                    }
+                })?;
         }
         let inner = self.client.execute(request).map_err(|e| {
             let error = if e.is_timeout() {

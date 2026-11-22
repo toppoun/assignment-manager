@@ -11,7 +11,7 @@ use reqwest::{StatusCode, Url};
 use crate::university_network::{
     BodyKind, NetworkError, Transport, WEBCLASS_ORIGIN as ORIGIN, read_text,
 };
-const COURSES_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/courses";
+pub(crate) const COURSES_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/courses";
 const CONTENTS_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
 const DASHBOARD_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/dashboard";
 const LOGIN_PATH: &str = "/webclass/login.php";
@@ -79,7 +79,7 @@ impl WebClassClient {
 
     /// Return raw JSON text; JSON validity and course interpretation belong to the parser.
     pub fn fetch_courses_json(&self) -> Result<String, WebClassHttpError> {
-        self.fetch_json(self.endpoint(COURSES_PATH))
+        self.fetch_json(self.endpoint(COURSES_PATH), true)
     }
 
     /// Return raw JSON text with one safely encoded `group_id` query parameter.
@@ -88,7 +88,7 @@ impl WebClassClient {
     pub fn fetch_contents_json(&self, group_id: &str) -> Result<String, WebClassHttpError> {
         let mut url = self.endpoint(CONTENTS_PATH);
         url.query_pairs_mut().append_pair("group_id", group_id);
-        self.fetch_json(url)
+        self.fetch_json(url, false)
     }
 
     pub(crate) fn shares_run(
@@ -115,23 +115,25 @@ impl WebClassClient {
             .expect("fixed WebClass endpoint paths are valid URLs")
     }
 
-    fn fetch_json(&self, url: Url) -> Result<String, WebClassHttpError> {
-        let response = self
+    fn fetch_json(&self, url: Url, course_list: bool) -> Result<String, WebClassHttpError> {
+        let request = self
             .http
-            .send(
-                self.http
-                    .get(url)
-                    .header(ACCEPT, "application/json")
-                    .header(REFERER, self.endpoint(DASHBOARD_PATH).as_str())
-                    .header(USER_AGENT, APPLICATION_USER_AGENT),
-            )
-            .map_err(|error| {
-                if error == NetworkError::Timeout {
-                    WebClassHttpError::Timeout
-                } else {
-                    WebClassHttpError::Request
-                }
-            })?;
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .header(REFERER, self.endpoint(DASHBOARD_PATH).as_str())
+            .header(USER_AGENT, APPLICATION_USER_AGENT);
+        let response = if course_list {
+            self.http.send_course_list(request)
+        } else {
+            self.http.send(request)
+        }
+        .map_err(|error| {
+            if error == NetworkError::Timeout {
+                WebClassHttpError::Timeout
+            } else {
+                WebClassHttpError::Request
+            }
+        })?;
 
         let status = response.status();
         if status.is_redirection()

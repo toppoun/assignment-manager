@@ -19,9 +19,16 @@ use crate::university_network::{
     Source, Transport, WEBCLASS_ORIGIN, read_text,
 };
 
+pub(crate) mod course_check;
+use course_check::{CourseCheck, CourseRequestMeter};
+pub use course_check::{WebClassMethodCounts, WebClassRequestCounts};
+
 const USER_PAGE: &str = "/portal/u001/index.php";
+const PORTAL_PUBLIC_PATH: &str = "/portal/index.php";
+const PORTAL_LOGIN_PATH: &str = "/portal/login/login.php";
 const PORTAL_PUBLIC: &str = "/portal/index.php?next=";
 const PORTAL_LOGIN: &str = "/portal/login/login.php?next=";
+const PARM_PATH: &str = "/portal/sso/Parm.php";
 const PARM: &str = "/portal/sso/Parm.php?auth_mode=1&group_id=";
 const AUTHENTICATE: &str = "/openam/json/authenticate";
 const XUI: &str = "/openam/XUI/";
@@ -99,6 +106,8 @@ pub enum ProtocolReason {
     InvalidJsRedirect,
     InvalidTarget,
     UnexpectedOrigin,
+    RequestNotAllowed,
+    RedirectWouldReplayPost,
     UserInfo,
 }
 
@@ -112,6 +121,8 @@ pub enum HoseiAuthError {
     ProtocolChanged(AuthStep),
     ProtocolChangedWithReason(AuthStep, ProtocolReason),
     RedirectLimit(AuthStep),
+    ConsentRequired,
+    RequestLimit,
     ConsentFailed,
     HoppiiSessionFailed,
     ApiVerificationFailed,
@@ -138,6 +149,8 @@ impl fmt::Display for HoseiAuthError {
             Self::RedirectLimit(step) => {
                 write!(f, "Hosei authentication redirect limit reached at {step:?}")
             }
+            Self::ConsentRequired => f.write_str("Hosei SAML consent is required"),
+            Self::RequestLimit => f.write_str("WebClass course-check request limit reached"),
             Self::ConsentFailed => write!(f, "Hosei SAML consent failed"),
             Self::HoppiiSessionFailed => {
                 write!(f, "HOPPII application session was not established")
@@ -215,14 +228,27 @@ impl HoseiAuthenticator {
         &self,
         credentials: HoseiCredentials<'_>,
     ) -> Result<WebClassClient, HoseiAuthError> {
-        self.login_with_course_check(credentials, Self::verify_courses)
+        self.login_checked(credentials, None, Self::verify_courses)
     }
 
     /// The caller verifies the new session with its courses request. Keep this
     /// internal so an unverified client cannot be returned through the public API.
-    pub(crate) fn login_with_course_check<T, E: From<HoseiAuthError>>(
+    pub(crate) fn login_for_course_check<T, E: From<HoseiAuthError>>(
         &self,
         credentials: HoseiCredentials<'_>,
+        meter: CourseRequestMeter,
+        check: impl FnOnce(WebClassClient) -> Result<T, E>,
+    ) -> Result<T, E> {
+        if self.policy.is_none() {
+            return Err(HoseiAuthError::ClientInitialization.into());
+        }
+        self.login_checked(credentials, Some(meter), check)
+    }
+
+    fn login_checked<T, E: From<HoseiAuthError>>(
+        &self,
+        credentials: HoseiCredentials<'_>,
+        meter: Option<CourseRequestMeter>,
         check: impl FnOnce(WebClassClient) -> Result<T, E>,
     ) -> Result<T, E> {
         #[cfg(feature = "synthetic-https-fixture")]
@@ -234,17 +260,25 @@ impl HoseiAuthenticator {
         }
         #[cfg(any(test, feature = "synthetic-https-fixture"))]
         if let Some(endpoints) = &self.test_endpoints {
-            return check(self.connect_webclass(credentials, endpoints)?);
+            let restriction = meter.map(|meter| CourseCheck::new(endpoints, true, meter));
+            return check(self.connect_webclass(credentials, endpoints, restriction)?);
         }
-        check(self.connect_webclass(credentials, &AuthEndpoints::production())?)
+        let endpoints = AuthEndpoints::production();
+        let restriction = meter.map(|meter| CourseCheck::new(&endpoints, false, meter));
+        check(self.connect_webclass(credentials, &endpoints, restriction)?)
     }
 
     fn connect_webclass(
         &self,
         credentials: HoseiCredentials<'_>,
         endpoints: &AuthEndpoints,
+        restriction: Option<CourseCheck>,
     ) -> Result<WebClassClient, HoseiAuthError> {
-        let session = AuthSession::with_policy(endpoints, self.policy.clone(), self.run.clone())?;
+        let mut session =
+            AuthSession::with_policy(endpoints, self.policy.clone(), self.run.clone())?;
+        if let Some(restriction) = restriction {
+            session.http.restrict_course_check(restriction);
+        }
         let auth_url = session.discover_openam()?;
         let success = session.authenticate(&auth_url, credentials)?;
         let success_url = resolve_destination(
@@ -253,6 +287,9 @@ impl HoseiAuthenticator {
             &endpoints.idp,
             AuthStep::OpenAmSuccess,
         )?;
+        if session.http.is_course_check() && success_url.path() == CONSENT {
+            return Err(HoseiAuthError::ConsentRequired);
+        }
         session.install_openam_cookie(success.token_id())?;
         drop(success);
         session.saml_to_hoppii(success_url)?;
@@ -360,9 +397,21 @@ impl<'a> AuthSession<'a> {
     }
 
     fn send(&self, request: RequestBuilder, step: AuthStep) -> Result<Response, HoseiAuthError> {
-        self.http
-            .send(request)
-            .map_err(|error| transport_error(error, step))
+        self.http.send(request).map_err(|error| {
+            if self.http.is_course_check() {
+                match error {
+                    NetworkError::Policy => {
+                        return HoseiAuthError::ProtocolChangedWithReason(
+                            step,
+                            ProtocolReason::RequestNotAllowed,
+                        );
+                    }
+                    NetworkError::ResourceLimit => return HoseiAuthError::RequestLimit,
+                    _ => {}
+                }
+            }
+            transport_error(error, step)
+        })
     }
 
     fn discover_openam(&self) -> Result<Url, HoseiAuthError> {
@@ -455,6 +504,9 @@ impl<'a> AuthSession<'a> {
                 redirect_destination(&response, &self.endpoints.idp, AuthStep::Consent)?;
             if consent_url.path() != CONSENT {
                 return Err(HoseiAuthError::ProtocolChanged(AuthStep::Consent));
+            }
+            if self.http.is_course_check() {
+                return Err(HoseiAuthError::ConsentRequired);
             }
             drop(response);
             self.consent(&consent_url)?
@@ -560,6 +612,17 @@ impl<'a> AuthSession<'a> {
                 return Ok(response);
             }
             let target = redirect_destination(&response, &self.endpoints.hoppii, response_step)?;
+            if self.http.is_course_check()
+                && !matches!(
+                    target.path(),
+                    USER_PAGE | PORTAL_PUBLIC_PATH | PORTAL_LOGIN_PATH
+                )
+            {
+                return Err(HoseiAuthError::ProtocolChangedWithReason(
+                    response_step,
+                    ProtocolReason::RequestNotAllowed,
+                ));
+            }
             if followed == MAX_REDIRECTS {
                 return Err(HoseiAuthError::RedirectLimit(response_step));
             }
@@ -648,6 +711,18 @@ impl<'a> AuthSession<'a> {
         for followed in 0..=MAX_REDIRECTS {
             let base = response.url().clone();
             let target = if is_redirect(response.status()) {
+                if self.http.is_course_check()
+                    && followed == 0
+                    && matches!(
+                        response.status(),
+                        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+                    )
+                {
+                    return Err(protocol_changed(
+                        step,
+                        ProtocolReason::RedirectWouldReplayPost,
+                    ));
+                }
                 let target = redirect_destination(&response, &self.endpoints.webclass, step)?;
                 drop(response);
                 Some(target)
@@ -661,8 +736,13 @@ impl<'a> AuthSession<'a> {
                         step,
                     )?),
                     // End uninterpretable navigation; login still requires API verification.
-                    Ok(None) | Err(WebClassAuthParseError::InvalidRedirect) => None,
-                    Err(_) => {
+                    Ok(None) if !self.http.is_course_check() || base.path() == "/webclass/" => None,
+                    Err(WebClassAuthParseError::InvalidRedirect)
+                        if !self.http.is_course_check() =>
+                    {
+                        None
+                    }
+                    Ok(None) | Err(_) => {
                         return Err(protocol_changed(step, ProtocolReason::InvalidJsRedirect));
                     }
                 }

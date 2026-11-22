@@ -37,6 +37,7 @@ pub use reader::{DryRunCounts, DryRunReport};
 #[cfg(feature = "synthetic-https-fixture")]
 pub use trial::MoodleCreateTarget;
 pub use trial::{TrialAssignment, TrialRole, TrialTarget, VerificationTarget};
+pub use wire::uuid as normalize_data_source_id;
 pub use wire::{NotionPropertyIds, NotionTarget, PreparedWrite};
 
 use std::{

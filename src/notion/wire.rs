@@ -51,7 +51,8 @@ pub(super) struct Schema {
     webclass_option: String,
 }
 
-pub(super) fn uuid(value: &str) -> Option<String> {
+/// Canonical form of an ID used as a local credential namespace or API target.
+pub fn uuid(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let valid = match bytes.len() {
         32 => bytes.iter().all(u8::is_ascii_hexdigit),

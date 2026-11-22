@@ -346,11 +346,42 @@ fn webclass_course_check_reports_only_counts_without_creating_local_state() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         stdout(&output).lines().collect::<Vec<_>>(),
-        ["webclass courses=3 validation=passed", "result=success"]
+        [
+            "webclass requests hoppii_get=6 hoppii_post=1 idp_get=2 idp_post=3 lms_get=4 lms_post=1 courses_get=1 total=17",
+            "webclass courses=3 validation=passed",
+            "result=success",
+        ]
     );
     assert!(stderr(&output).is_empty());
     assert!(!local_root(&temp).exists());
     assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn webclass_local_check_rejects_extra_config_fields_without_echoing_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("course-check.json");
+    fs::write(
+        &path,
+        serde_json::json!({"credential_namespace": TARGET, "password":"synthetic-private-value"})
+            .to_string(),
+    )
+    .unwrap();
+    let output = call(
+        &temp,
+        &[
+            "--config",
+            path.to_str().unwrap(),
+            "university-check",
+            "webclass",
+            "--courses-only",
+            "--check-local",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("configuration_invalid"));
+    assert!(!stderr(&output).contains("synthetic-private-value"));
+    assert!(!local_root(&temp).exists());
 }
 
 #[cfg(windows)]

@@ -20,7 +20,10 @@ use crate::{
         WebClassCourse, WebClassMapError, WebClassParseError, map_contents_for_group,
         parse_contents, parse_courses,
     },
-    webclass_auth::{HoseiAuthError, HoseiAuthenticator, HoseiCredentials},
+    webclass_auth::{
+        HoseiAuthError, HoseiAuthenticator, HoseiCredentials, WebClassRequestCounts,
+        course_check::CourseRequestMeter,
+    },
     webclass_http::{WebClassClient, WebClassHttpError},
 };
 
@@ -340,8 +343,19 @@ impl std::error::Error for WebClassCourseListError {}
 pub fn login_and_acquire_webclass_courses(
     authenticator: &HoseiAuthenticator,
     credentials: HoseiCredentials<'_>,
-) -> Result<AcquiredWebClassCourses, WebClassCourseListError> {
-    authenticator.login_with_course_check(credentials, |client| acquire_webclass_courses(&client))
+) -> WebClassCourseCheck {
+    let meter = CourseRequestMeter::default();
+    let result = authenticator.login_for_course_check(credentials, meter.clone(), |client| {
+        acquire_webclass_courses(&client)
+    });
+    let requests = *meter.lock().unwrap_or_else(|error| error.into_inner());
+    WebClassCourseCheck { result, requests }
+}
+
+#[derive(Debug)]
+pub struct WebClassCourseCheck {
+    pub result: Result<AcquiredWebClassCourses, WebClassCourseListError>,
+    pub requests: WebClassRequestCounts,
 }
 
 /// One pass over the course list in response order. On failure, earlier groups

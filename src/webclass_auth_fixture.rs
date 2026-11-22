@@ -507,7 +507,7 @@ impl FullFlow {
             .map(|(listener, exchanges)| script(listener, exchanges))
             .collect::<Vec<_>>();
         let result = authenticator
-            .connect_webclass(HoseiCredentials::new(STUDENT, PASSWORD), &self.endpoints)
+            .connect_webclass(HoseiCredentials::new(STUDENT, PASSWORD), &self.endpoints, None)
             .and_then(HoseiAuthenticator::verify_courses);
         if use_returned_client {
             assert_eq!(

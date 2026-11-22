@@ -11,9 +11,10 @@ use std::fmt;
 
 pub use acquisition::{
     AcquiredAssignments, AcquiredWebClassCourses, MoodleAcquisition, MoodleAcquisitionError,
-    SourceCourse, WebClassAcquisition, WebClassAcquisitionAttempt, WebClassCourseListError,
-    acquire_moodle, acquire_moodle_with_diagnostic, acquire_webclass_group, acquire_webclass_once,
-    acquire_webclass_with_reauth, login_and_acquire_webclass_courses,
+    SourceCourse, WebClassAcquisition, WebClassAcquisitionAttempt, WebClassCourseCheck,
+    WebClassCourseListError, acquire_moodle, acquire_moodle_with_diagnostic,
+    acquire_webclass_group, acquire_webclass_once, acquire_webclass_with_reauth,
+    login_and_acquire_webclass_courses,
 };
 use acquisition::{
     WebClassEvent, acquire_webclass_courses, run_with_webclass_reauth, visit_moodle,

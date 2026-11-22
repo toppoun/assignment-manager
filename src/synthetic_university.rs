@@ -41,6 +41,7 @@ pub enum Scenario {
     MoodleEmpty,
     MoodleDuplicate,
     WebClassFailure,
+    WebClassCourses,
     BothFailure,
     AuthExpiredOnce,
     AuthExpiredTwice,
@@ -115,7 +116,8 @@ pub struct SyntheticUniversity {
 }
 impl SyntheticUniversity {
     pub fn start(scenario: Scenario) -> Self {
-        let mut flow = FullFlow::with_origins(true, Some(origins()));
+        let consent = !matches!(scenario, Scenario::WebClassCourses);
+        let mut flow = FullFlow::with_origins(consent, Some(origins()));
         flow.exchanges[2].last_mut().unwrap().body = COURSE_DATA.into();
         for exchanges in &mut flow.exchanges {
             for exchange in exchanges {
@@ -226,7 +228,7 @@ fn serve(
             assert_eq!(request.headers["host"], stream.conn.server_name().unwrap());
             control.requests.fetch_add(1, Ordering::SeqCst);
             let scenario = *control.scenario.lock().unwrap();
-            // Reuse the existing complete SSO + consent fixture for every login.
+            // Replay the fixture's SSO sequence for every login.
             let starts_login = (role == 0 && request.target == USER_PAGE && queue.is_empty())
                 || (role == 1 && request.target.starts_with("/idp/sso?") && queue.is_empty())
                 || (role == 2 && request.target == "/webclass/singlesignon.php");

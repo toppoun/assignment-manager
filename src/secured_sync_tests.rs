@@ -13,9 +13,12 @@ use crate::{
         self, AcquiredWebClassCourses, MoodleSyncError, SourceCourse, WebClassCourseListError,
         WebClassCredentialProvider, WebClassReauthSyncError, WebClassSyncError,
     },
-    university_network::NetworkError,
+    university_network::{NetworkError, Transport},
 };
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::{
+    Method,
+    dns::{Addrs, Name, Resolve, Resolving},
+};
 use std::{
     net::SocketAddr,
     sync::{
@@ -107,7 +110,10 @@ fn origins() -> [Url; 3] {
         .map(|h| Url::parse(&format!("https://{h}.synthetic.invalid")).unwrap())
 }
 fn flow() -> FullFlow {
-    let mut flow = FullFlow::with_origins(true, Some(origins()));
+    secured_flow(true)
+}
+fn secured_flow(consent: bool) -> FullFlow {
+    let mut flow = FullFlow::with_origins(consent, Some(origins()));
     flow.exchanges[2].last_mut().unwrap().body = COURSE_DATA.into();
     // Web Referers intentionally strip the query, including the fixed PARM URL.
     for exchanges in &mut flow.exchanges {
@@ -189,9 +195,30 @@ fn finish_all(servers: Vec<JoinHandle<TcpListener>>) {
 fn acquire_only_courses(
     response: Exchange,
 ) -> Result<AcquiredWebClassCourses, WebClassCourseListError> {
-    let mut fixture = flow();
+    let mut fixture = secured_flow(false);
     // The only allowed API request is the course GET at the end of login.
     *fixture.exchanges[2].last_mut().unwrap() = response.cookie("wc_test", "synthetic-cookie");
+    run_course_check(fixture).result
+}
+
+fn run_course_check(fixture: FullFlow) -> sync::WebClassCourseCheck {
+    let expected = fixture
+        .exchanges
+        .each_ref()
+        .map(|exchanges| WebClassMethodCounts {
+            get: exchanges
+                .iter()
+                .filter(|exchange| exchange.method == "GET")
+                .count() as u8,
+            post: exchanges
+                .iter()
+                .filter(|exchange| exchange.method == "POST")
+                .count() as u8,
+        });
+    let courses_get = fixture.exchanges[2]
+        .iter()
+        .filter(|exchange| exchange.target == COURSES)
+        .count();
     let (mut clients, servers, _) = start(fixture, vec![]);
     clients.begin_run();
     let result = sync::login_and_acquire_webclass_courses(
@@ -199,6 +226,15 @@ fn acquire_only_courses(
         HoseiCredentials::new(STUDENT, PASSWORD),
     );
     finish_all(servers);
+    assert_eq!(
+        [
+            result.requests.hoppii,
+            result.requests.idp,
+            result.requests.webclass
+        ],
+        expected
+    );
+    assert_eq!(usize::from(result.requests.courses_get), courses_get);
     result
 }
 
@@ -327,18 +363,12 @@ fn course_only_login_detects_empty_invalid_or_incomplete_lists_without_retry() {
 
 #[test]
 fn course_only_login_stops_at_rejected_authentication_without_calling_the_api() {
-    let mut fixture = flow();
+    let mut fixture = secured_flow(false);
     fixture.exchanges[0].truncate(1);
     fixture.exchanges[1].truncate(3);
     fixture.exchanges[1][2].status = 401;
     fixture.exchanges[2].clear();
-    let (mut clients, servers, _) = start(fixture, vec![]);
-    clients.begin_run();
-    let error = sync::login_and_acquire_webclass_courses(
-        &clients.authenticator(),
-        HoseiCredentials::new(STUDENT, PASSWORD),
-    )
-    .unwrap_err();
+    let error = run_course_check(fixture).result.unwrap_err();
     assert_eq!(
         error,
         WebClassCourseListError::Authentication(HoseiAuthError::HttpStatus(
@@ -346,7 +376,114 @@ fn course_only_login_stops_at_rejected_authentication_without_calling_the_api() 
             StatusCode::UNAUTHORIZED,
         ))
     );
+}
+
+#[test]
+fn course_only_stops_before_any_consent_post_and_leaves_normal_login_available() {
+    let mut fixture = flow();
+    fixture.exchanges[0].truncate(1);
+    fixture.exchanges[1].truncate(5);
+    fixture.exchanges[2].clear();
+    let check = run_course_check(fixture);
+    assert_eq!(
+        check.result.unwrap_err(),
+        WebClassCourseListError::Authentication(HoseiAuthError::ConsentRequired)
+    );
+    assert_eq!(check.requests.idp, WebClassMethodCounts { get: 2, post: 3 });
+    let (mut clients, servers, _) = start(flow(), vec![]);
+    clients.begin_run();
+    clients
+        .authenticator()
+        .login(HoseiCredentials::new(STUDENT, PASSWORD))
+        .unwrap();
     finish_all(servers);
+}
+
+#[test]
+fn course_only_blocks_unknown_redirects_and_does_not_send_cookies_or_log_urls() {
+    const PRIVATE_QUERY: &str = "synthetic-private-stop-query";
+    for path in ["/webclass/unexpected", COURSES, CONTENTS] {
+        let mut fixture = secured_flow(false);
+        fixture.exchanges[2].truncate(1);
+        fixture.exchanges[2][0]
+            .response_headers
+            .iter_mut()
+            .find(|(name, _)| *name == "Location")
+            .unwrap()
+            .1 = format!("{path}?token={PRIVATE_QUERY}");
+        let error = run_course_check(fixture).result.unwrap_err();
+        assert_eq!(
+            error,
+            WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChangedWithReason(
+                AuthStep::WebClassRedirect,
+                ProtocolReason::RequestNotAllowed,
+            ))
+        );
+        assert!(!format!("{error:?} {error}").contains(PRIVATE_QUERY));
+    }
+}
+
+#[test]
+fn course_only_blocks_an_unverified_saml_post_target_before_transmitting() {
+    let mut fixture = secured_flow(false);
+    fixture.exchanges[0].truncate(1);
+    fixture.exchanges[2].clear();
+    let saml = &mut fixture.exchanges[1].last_mut().unwrap().body;
+    *saml = saml.replace("/saml/acs?", "/saml/unknown?");
+    let error = run_course_check(fixture).result.unwrap_err();
+    assert_eq!(
+        error,
+        WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChangedWithReason(
+            AuthStep::HoppiiAcs,
+            ProtocolReason::RequestNotAllowed,
+        ))
+    );
+}
+
+#[test]
+fn course_only_redirects_never_replay_a_post_but_preserve_get() {
+    for status in [307, 308] {
+        let mut fixture = secured_flow(false);
+        fixture.exchanges[2].truncate(1);
+        fixture.exchanges[2][0].status = status;
+        let error = run_course_check(fixture).result.unwrap_err();
+        assert_eq!(
+            error,
+            WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChangedWithReason(
+                AuthStep::WebClassRedirect,
+                ProtocolReason::RedirectWouldReplayPost,
+            ))
+        );
+
+        let mut fixture = secured_flow(false);
+        fixture.exchanges[2][0].status = 303;
+        fixture.exchanges[2][1].status = status;
+        fixture.exchanges[2][1]
+            .response_headers
+            .push(("Location", "/webclass/login.php".to_owned()));
+        assert!(run_course_check(fixture).result.is_ok());
+    }
+}
+
+#[test]
+fn course_only_stops_an_allowed_path_redirect_loop_before_an_extra_get() {
+    let mut fixture = secured_flow(false);
+    fixture.exchanges[2].truncate(1);
+    for _ in 0..MAX_REDIRECTS {
+        fixture.exchanges[2].push(
+            Exchange::redirect("GET", "/webclass/after-sso", "/webclass/after-sso")
+                .cookie("wc_test", "synthetic-cookie"),
+        );
+    }
+    let check = run_course_check(fixture);
+    assert_eq!(check.requests.webclass.get, 10);
+    assert_eq!(check.requests.courses_get, 0);
+    assert_eq!(
+        check.result.unwrap_err(),
+        WebClassCourseListError::Authentication(HoseiAuthError::RedirectLimit(
+            AuthStep::WebClassRedirect
+        ))
+    );
 }
 fn moodle_response(status: u16) -> Exchange {
     Exchange::new(
@@ -1003,4 +1140,63 @@ fn secured_course_and_import_batch_limits_reject_before_source_writes() {
         );
         finish_all(servers);
     }
+}
+
+#[test]
+fn transport_rejects_methods_and_hoppii_limits_before_sending() {
+    let fixture = FullFlow::new(false);
+    let [hoppii, _, _] = fixture.listeners;
+    let portal = endpoint(&fixture.endpoints.hoppii, USER_PAGE);
+    let acs = endpoint(&fixture.endpoints.hoppii, "/saml/acs");
+    let mut exchanges = vec![Exchange::new("GET", USER_PAGE, 200, ""); 34];
+    exchanges.push(Exchange::new("POST", "/saml/acs", 200, ""));
+    let server = script(hoppii, exchanges);
+    let client = Client::builder()
+        .no_proxy()
+        .user_agent(USER_AGENT)
+        .timeout(TIMEOUT)
+        .build()
+        .unwrap();
+    let mut transport = Transport::desktop(client.clone());
+    let meter = CourseRequestMeter::default();
+    transport.restrict_course_check(CourseCheck::new(&fixture.endpoints, true, meter.clone()));
+    assert_eq!(
+        transport
+            .send(client.request(Method::PATCH, portal.clone()))
+            .unwrap_err(),
+        NetworkError::Policy
+    );
+    assert_eq!(
+        transport.send(transport.post(portal.clone())).unwrap_err(),
+        NetworkError::Policy
+    );
+    for _ in 0..34 {
+        assert_eq!(
+            transport
+                .send(transport.get(portal.clone()))
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    assert_eq!(
+        transport.send(transport.get(portal)).unwrap_err(),
+        NetworkError::ResourceLimit
+    );
+    assert_eq!(
+        transport
+            .send(transport.post(acs.clone()))
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        transport.send(transport.post(acs)).unwrap_err(),
+        NetworkError::ResourceLimit
+    );
+    finish(server);
+    assert_eq!(
+        meter.lock().unwrap().hoppii,
+        WebClassMethodCounts { get: 34, post: 1 }
+    );
 }

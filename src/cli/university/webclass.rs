@@ -1,30 +1,57 @@
+use std::path::Path;
+
 use assignment_manager::{
+    notion::normalize_data_source_id,
     observation::ObservationValidationError,
     secured_sync::SecuredSyncClients,
-    sync::{AcquiredWebClassCourses, WebClassCourseListError, login_and_acquire_webclass_courses},
+    sync::{WebClassCourseCheck, WebClassCourseListError, login_and_acquire_webclass_courses},
     university_network::NetworkPolicy,
-    webclass_auth::HoseiAuthError,
+    webclass_auth::{HoseiAuthError, ProtocolReason},
     webclass_http::WebClassHttpError,
 };
+use serde::Deserialize;
 use serde_json::error::Category;
 
-use crate::cli::{CliError, Config, CredentialStatus, credentials};
+use crate::cli::{CliError, Config, ConfigError, CredentialStatus, config, credentials};
 
 use super::finish;
 
 #[cfg(windows)]
 mod review;
 
-pub(in crate::cli) fn check(config: &Config, review_local: bool) -> Result<u8, CliError> {
-    if review_local && !can_review() {
-        return Ok(finish(false));
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CourseCheckConfig {
+    credential_namespace: String,
+}
+
+fn credential_namespace(bytes: &[u8]) -> Result<String, CliError> {
+    if let Ok(config) = serde_json::from_slice::<CourseCheckConfig>(bytes) {
+        return normalize_data_source_id(&config.credential_namespace)
+            .ok_or(CliError::Config(ConfigError::Invalid));
     }
+    let config = Config::parse(bytes)?;
     if !config.webclass {
         return Err(CliError::Credential(CredentialStatus::Disabled));
     }
+    Ok(config.target_id()?)
+}
+
+pub(in crate::cli) fn check_local(path: &Path) -> Result<u8, CliError> {
+    let target = credential_namespace(&config::read_bytes(path)?)?;
+    credentials::check_webclass_entry(&target).map_err(CliError::Credential)?;
+    println!("webclass configuration=ready credential_entry=present network=disabled");
+    Ok(finish(true))
+}
+
+pub(in crate::cli) fn check(path: &Path, review_local: bool) -> Result<u8, CliError> {
+    if review_local && !can_review() {
+        return Ok(finish(false));
+    }
+    let target = credential_namespace(&config::read_bytes(path)?)?;
     let mut clients = SecuredSyncClients::new(NetworkPolicy::default());
     clients.begin_run();
-    let acquired = credentials::with_webclass_credentials(&config.target_id()?, |credentials| {
+    let acquired = credentials::with_webclass_credentials(&target, |credentials| {
         login_and_acquire_webclass_courses(&clients.authenticator(), credentials)
     })
     .map_err(CliError::Credential)?;
@@ -42,7 +69,7 @@ pub(in crate::cli) fn fixture(review_local: bool) -> u8 {
     if review_local && !can_review() {
         return finish(false);
     }
-    let university = SyntheticUniversity::start(Scenario::BothSuccess);
+    let university = SyntheticUniversity::start(Scenario::WebClassCourses);
     let mut clients = SecuredSyncClients::new(university.policy());
     clients.begin_run();
     let acquired = login_and_acquire_webclass_courses(
@@ -53,11 +80,25 @@ pub(in crate::cli) fn fixture(review_local: bool) -> u8 {
     report(acquired, review_local)
 }
 
-fn report(
-    acquired: Result<AcquiredWebClassCourses, WebClassCourseListError>,
-    review_local: bool,
-) -> u8 {
-    let courses = match acquired {
+fn report(check: WebClassCourseCheck, review_local: bool) -> u8 {
+    let r = check.requests;
+    println!(
+        "webclass requests hoppii_get={} hoppii_post={} idp_get={} idp_post={} lms_get={} lms_post={} courses_get={} total={}",
+        r.hoppii.get,
+        r.hoppii.post,
+        r.idp.get,
+        r.idp.post,
+        r.webclass.get,
+        r.webclass.post,
+        r.courses_get,
+        u16::from(r.hoppii.get)
+            + u16::from(r.hoppii.post)
+            + u16::from(r.idp.get)
+            + u16::from(r.idp.post)
+            + u16::from(r.webclass.get)
+            + u16::from(r.webclass.post)
+    );
+    let courses = match check.result {
         Ok(courses) if courses.records().is_empty() => {
             println!("webclass courses=0 validation=empty");
             return finish(false);
@@ -99,6 +140,14 @@ fn can_review() -> bool {
 
 fn diagnostic(error: WebClassCourseListError) -> &'static str {
     match error {
+        WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChangedWithReason(
+            _,
+            ProtocolReason::RequestNotAllowed,
+        )) => "authentication_request_blocked",
+        WebClassCourseListError::Authentication(HoseiAuthError::ConsentRequired) => {
+            "consent_required"
+        }
+        WebClassCourseListError::Authentication(HoseiAuthError::RequestLimit) => "request_limit",
         WebClassCourseListError::Authentication(
             HoseiAuthError::ProtocolChanged(_)
             | HoseiAuthError::ProtocolChangedWithReason(_, _)

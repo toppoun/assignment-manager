@@ -113,6 +113,30 @@ ULA、link/site-local、multicast、metadata等は候補外。IANA special-purpo
 検証するものではない。hosting環境のprivate/metadata egress firewallを別途設ける。
 OS getaddrinfoに委譲したlookupは待機を5秒で終了するが、OS内の処理そのものをcancelする保証はない。
 
+## WebClass授業一覧専用CLI
+
+`university-check webclass --courses-only` の実取得には、既存のTLS検証と3ホストの
+HTTPS 443制限に加えて、一覧専用の送信直前の検査を適用する。
+
+| ホスト | 許可する本番パスとメソッド | GET / POST 上限 |
+|---|---|---:|
+| `hoppii2025.hosei.ac.jp` | GET `/portal/u001/index.php`、`/portal/index.php`、`/portal/login/login.php`、`/portal/sso/Parm.php`。最後のパスには既存の固定クエリだけを許可する | 34 / 1 |
+| `idp.hosei.ac.jp` | POST `/openam/json/authenticate`。XUI URLは既存のパーサーで読み取るだけ | 3 / 5 |
+| `lms2025.hosei.ac.jp` | POST `/webclass/singlesignon.php`。GET `/webclass/login.php`、`/webclass/`。認証後の取得処理からだけ GET `/webclass/ip_mods.php/plugin/score_summary_table/courses` を1回許可 | 11 / 1 |
+
+IdPの初回SSO・認証後の戻り先、およびHOPPIIのACSの本番パスはローカル資料で
+特定できていない。合成HTTPSの固定パスは本番で許可せず、未確認の本番パスは
+リクエスト送信前に拒否する。実取得前に、認証情報やクエリ値を除いた経路を確認する必要がある。
+
+同意要求は `consent_required` で停止する。同意APIへのPOSTは行わない。
+許可済みのPOSTと、301/302/303後のGETは別の要求として検査する。
+POSTに続く307/308は停止し、GETからの307/308はGETとして同じ検査を通す。
+リダイレクトは連鎖ごとに最大10回で、課題の `contents` は許可対象外とする。
+
+ホスト・メソッド別のカウンターはHTTPクライアントへの送信直前に加算し、上限到達後は
+カウントを増やさず拒否する。TLSや接続で失敗した送信試行も上限に含まれる。
+集計値は応答の有無を問わず表示する。認証値、URL、クエリ、レスポンス本文は出力しない。
+
 ## TLS / proxy / redirects / timeouts
 
 URLをIPへ置換しない。reqwest/rustlsの標準certificate chain/hostname verificationとSNIを維持。

@@ -104,6 +104,11 @@ pub(super) fn with_webclass_credentials<T>(
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
+pub(super) fn check_webclass_entry(_: &str) -> Result<(), CredentialStatus> {
+    Err(CredentialStatus::Unavailable)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn notion_client(
     _: &str,
 ) -> Result<assignment_manager::notion::NotionClient, CredentialStatus> {
@@ -111,7 +116,9 @@ pub(super) fn notion_client(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub(super) use native::{lookup, moodle_url, notion_client, register, with_webclass_credentials};
+pub(super) use native::{
+    check_webclass_entry, lookup, moodle_url, notion_client, register, with_webclass_credentials,
+};
 
 #[cfg(windows)]
 pub(super) use native::trial_client;
@@ -210,6 +217,15 @@ mod native {
             &pair.university_id,
             &pair.password,
         )))
+    }
+
+    pub(in crate::cli) fn check_webclass_entry(target: &str) -> Result<(), CredentialStatus> {
+        #[cfg(target_os = "macos")]
+        let _no_ui = super::macos::suppress_interaction_if(true)?;
+        entry(&service_name(target), Kind::WebClass.code())?
+            .get_attributes()
+            .map(|_| ())
+            .map_err(read_error)
     }
 
     fn trial_item(

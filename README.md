@@ -75,18 +75,25 @@ ID・名称・年度・学期・曜日・時限・英語名が表示されます
 表示し、`0` や空欄の意味を推定しません。空の一覧は `validation=empty` と終了コード
 `1` で区別します。取得結果やレシートは保存しません。
 
-実環境での初回試験は、現行の通信先と認証フロー、必要時の同意操作を確認し、その
-通信範囲が別途承認された後に行います。既存設定の `webclass` が有効で、対応する
-CLI用WebClass資格情報がOSのストアに登録済みであることが前提です。
+本番用コマンドは設定と登録済みのCLI用WebClass資格情報を使います。試験専用の設定には
+`credential_namespace` だけを指定でき、既存のWebClass資格情報が属する名前空間を参照します。
+設定と資格情報項目の有無は、通信を行わずに確認できます。
+
+```powershell
+cargo run --locked --offline -- --config PATH university-check webclass --courses-only --check-local
+```
+
+初回の実環境試験には、未確認のIdP遷移先とHOPPIIのSAML受け入れパスの確認と、
+通信開始の別途承認が必要です。現時点の許可リストでは未知のパスに送信する前に停止します。
 
 ```powershell
 cargo run --locked --offline -- --config PATH university-check webclass --courses-only --allow-university-read --review-local
 ```
 
-実環境用の指定では、既存SSOの認証POSTと授業一覧のGET 1回が発生します。課題取得、
-Moodle、Notionへの接続はありません。未知の通信先・認証画面、認証失敗、空・不完全な
-応答、形式変更、件数上限超過があれば停止し、一覧に見当たらない授業を履修対象外と
-判断する前に大学画面と照合してください。
+一覧専用経路は、同意要求で追加の同意リクエストを送る前に停止します。認証中の遷移も
+ホスト・パス・メソッド別に検査し、通信件数は固定の分類で表示します。授業一覧GETは
+最大1回で、課題用APIへの通信は許可していません。
+[一覧専用の通信制限](docs/WEB-NETWORK-SECURITY.md#webclass授業一覧専用cli)を参照してください。
 
 ### macOSでのビルドとローカル検証
 
