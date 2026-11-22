@@ -36,11 +36,16 @@ pub enum TrialRole {
 
 /// A validated, explicitly selected pair of trial data sources.
 pub struct TrialTarget {
+    verification: VerificationTarget,
+    write_bot: String,
+}
+
+/// A separately selected pair of verification data sources and its reader bot.
+pub struct VerificationTarget {
     notion: NotionTarget,
     assignments: String,
     courses: String,
     read_bot: String,
-    write_bot: String,
 }
 
 impl TrialTarget {
@@ -50,8 +55,44 @@ impl TrialTarget {
         read_bot: &str,
         write_bot: &str,
     ) -> Result<Self, NotionError> {
+        let courses = notion.courses_data_source_id.clone();
+        let verification = VerificationTarget::new(notion, selected, &courses, read_bot)?;
+        let write_bot = uuid(write_bot).ok_or(NotionError::Configuration)?;
+        if verification.read_bot == write_bot {
+            return Err(NotionError::Configuration);
+        }
+        Ok(Self {
+            verification,
+            write_bot,
+        })
+    }
+
+    pub fn assignment_id(&self) -> &str {
+        self.verification.assignment_id()
+    }
+
+    pub fn bot_id(&self, role: TrialRole) -> &str {
+        match role {
+            TrialRole::Read => &self.verification.read_bot,
+            TrialRole::Write => &self.write_bot,
+        }
+    }
+
+    pub(super) fn retrieve_schema(&self, client: &NotionClient) -> Result<Schema, NotionError> {
+        self.verification.retrieve_schema(client)
+    }
+}
+
+impl VerificationTarget {
+    pub fn new(
+        notion: NotionTarget,
+        selected_assignments: &str,
+        selected_courses: &str,
+        read_bot: &str,
+    ) -> Result<Self, NotionError> {
         let (assignments, courses) = notion.ids()?;
-        if uuid(selected).as_ref() != Some(&assignments)
+        if uuid(selected_assignments).as_ref() != Some(&assignments)
+            || uuid(selected_courses).as_ref() != Some(&courses)
             || PRODUCTION_DATA_SOURCES.contains(&assignments.as_str())
             || PRODUCTION_DATA_SOURCES.contains(&courses.as_str())
         {
@@ -61,16 +102,11 @@ impl TrialTarget {
             return Err(NotionError::Configuration);
         }
         let read_bot = uuid(read_bot).ok_or(NotionError::Configuration)?;
-        let write_bot = uuid(write_bot).ok_or(NotionError::Configuration)?;
-        if read_bot == write_bot {
-            return Err(NotionError::Configuration);
-        }
         Ok(Self {
             notion,
             assignments,
             courses,
             read_bot,
-            write_bot,
         })
     }
 
@@ -78,11 +114,8 @@ impl TrialTarget {
         &self.assignments
     }
 
-    pub fn bot_id(&self, role: TrialRole) -> &str {
-        match role {
-            TrialRole::Read => &self.read_bot,
-            TrialRole::Write => &self.write_bot,
-        }
+    pub(super) fn verify_reader(&self, client: &NotionClient) -> Result<(), NotionError> {
+        client.verify_bot(&self.read_bot)
     }
 
     pub(super) fn retrieve_schema(&self, client: &NotionClient) -> Result<Schema, NotionError> {
@@ -117,13 +150,17 @@ impl NotionClient {
         target: &TrialTarget,
         role: TrialRole,
     ) -> Result<(), NotionError> {
+        self.verify_bot(target.bot_id(role))
+    }
+
+    fn verify_bot(&self, expected: &str) -> Result<(), NotionError> {
         let user: Value = self.read(|| self.request(Method::GET, "/v1/users/me", &[]))?;
         let owner = &user["bot"]["owner"];
         if user["object"] != "user"
             || user["type"] != "bot"
             || owner["type"] != "workspace"
             || owner["workspace"] != true
-            || object_id(&user, "id").as_deref() != Some(target.bot_id(role))
+            || object_id(&user, "id").as_deref() != Some(expected)
         {
             return Err(NotionError::CredentialMismatch);
         }

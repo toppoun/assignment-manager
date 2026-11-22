@@ -23,7 +23,7 @@ pub use plan::{
     NotionSnapshot, PlanAction, PlannedAssignment, plan_sync,
 };
 pub use reader::{DryRunCounts, DryRunReport};
-pub use trial::{TrialAssignment, TrialRole, TrialTarget};
+pub use trial::{TrialAssignment, TrialRole, TrialTarget, VerificationTarget};
 pub use wire::{NotionPropertyIds, NotionTarget, PreparedWrite};
 
 use std::{

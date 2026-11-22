@@ -2,11 +2,14 @@ use assignment_manager::{
     moodle_http::{MoodleExportKind, MoodleFeed},
     notion::{DryRunReport, SyncInput, fixture, state::StateSummary},
     secured_sync::SecuredSyncClients,
-    sync::{WebClassCredentialProvider, acquire_moodle, acquire_webclass_with_reauth},
+    sync::{
+        MoodleAcquisition, WebClassCredentialProvider, acquire_moodle, acquire_webclass_with_reauth,
+    },
     webclass_auth::{
         HoseiCredentials,
         synthetic::{
-            MOODLE_URL, Scenario, SyntheticUniversity, UNIVERSITY_ID, UNIVERSITY_PASSWORD,
+            MOODLE_SCOPE, MOODLE_URL, Scenario, SyntheticUniversity, UNIVERSITY_ID,
+            UNIVERSITY_PASSWORD,
         },
     },
 };
@@ -106,16 +109,7 @@ pub(super) fn acquire(scenario: Scenario) -> Result<Acquired, CliError> {
     let university = SyntheticUniversity::start(scenario);
     let mut clients = SecuredSyncClients::new(university.policy());
     clients.begin_run();
-    let feed = MoodleFeed::new(
-        "default.course-related",
-        MoodleExportKind::CourseRelated,
-        MOODLE_URL,
-    )
-    .map_err(|_| CliError::FixtureFailed)?;
-    let moodle = clients
-        .moodle()
-        .ok()
-        .and_then(|client| acquire_moodle(&client, &feed).ok());
+    let moodle = fixture_moodle(&clients).ok();
     let moodle_status = if moodle.is_some() { Success } else { Failed };
     let authenticator = clients.authenticator();
     let webclass = authenticator.login(credentials()).ok().map(|mut session| {
@@ -141,6 +135,21 @@ pub(super) fn acquire(scenario: Scenario) -> Result<Acquired, CliError> {
         moodle: moodle_status,
         webclass: webclass_status,
     })
+}
+
+pub(super) fn moodle_only(scenario: Scenario) -> Result<SyncInput, CliError> {
+    let university = SyntheticUniversity::start(scenario);
+    let mut clients = SecuredSyncClients::new(university.policy());
+    clients.begin_run();
+    let moodle = fixture_moodle(&clients)?;
+    SyncInput::from_acquisitions(Some(&moodle), None).map_err(|_| CliError::FixtureFailed)
+}
+
+fn fixture_moodle(clients: &SecuredSyncClients) -> Result<MoodleAcquisition, CliError> {
+    let feed = MoodleFeed::new(MOODLE_SCOPE, MoodleExportKind::CourseRelated, MOODLE_URL)
+        .map_err(|_| CliError::FixtureFailed)?;
+    let client = clients.moodle().map_err(|_| CliError::FixtureFailed)?;
+    acquire_moodle(&client, &feed).map_err(|_| CliError::FixtureFailed)
 }
 
 #[cfg(test)]

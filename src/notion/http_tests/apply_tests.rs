@@ -1,3 +1,6 @@
+#[cfg(feature = "synthetic-https-fixture")]
+mod moodle;
+
 use std::path::Path;
 
 use rusqlite::Connection;

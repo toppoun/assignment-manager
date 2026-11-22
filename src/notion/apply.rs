@@ -11,7 +11,7 @@ use super::http_tests::trial_tests::recovery_tests::pause_create_at;
 use super::{
     AssignmentPatch, CourseMapping, DryRunCounts, DryRunReport, NotionAssignment, NotionClient,
     NotionError, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, TrialAssignment,
-    TrialRole, TrialTarget,
+    TrialRole, TrialTarget, VerificationTarget,
     state::{BindingStatus, StateError, StateStore, StateSummary, TargetLock},
     wire::{Schema, checked_page_id},
 };
@@ -139,6 +139,22 @@ enum WriteOutcome {
 }
 
 impl NotionClient {
+    /// Compute the same reconciled plan used before apply, using an in-memory
+    /// state snapshot. Counts cover the current input, including blocked rows.
+    pub fn preview_verification(
+        &self,
+        target: &VerificationTarget,
+        input: &SyncInput,
+        mappings: &[CourseMapping],
+        state: StateSummary,
+    ) -> Result<DryRunCounts, NotionError> {
+        target.verify_reader(self)?;
+        let plan = self.prepare_apply(input, target.retrieve_schema(self)?, mappings, state)?;
+        Ok(plan
+            .deltas
+            .counts_where(|key| input.assignments().contains_key(key)))
+    }
+
     pub fn preview_trial(
         &self,
         trial: &TrialTarget,

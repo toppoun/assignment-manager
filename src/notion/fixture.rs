@@ -14,9 +14,15 @@ use std::{
 
 use serde_json::{Value, json};
 
+use crate::{
+    import::{ExternalRecordKey, OriginKind},
+    webclass_auth::synthetic::MOODLE_SCOPE,
+};
+
 pub use super::apply::{ApplyError, ApplyReport};
 use super::{
-    NOTION_VERSION, NotionClient, NotionError, NotionPropertyIds, NotionTarget, SyncInput,
+    CourseMapping, NOTION_VERSION, NotionClient, NotionError, NotionPropertyIds, NotionTarget,
+    SyncInput, VerificationTarget,
     state::{StateError, StateStore, TargetLock},
 };
 
@@ -24,6 +30,11 @@ const ASSIGNMENTS: &str = "00000000-0000-4000-8000-000000000101";
 const ASSIGNMENTS_DB: &str = "00000000-0000-4000-8000-000000000102";
 const COURSES: &str = "00000000-0000-4000-8000-000000000103";
 const COURSES_DB: &str = "00000000-0000-4000-8000-000000000104";
+const READER: &str = "00000000-0000-4000-8000-000000000105";
+const MOODLE_COURSES: [(&str, &str); 2] = [
+    ("照合用の授業", "00000000-0000-4000-8000-000000000106"),
+    ("別の合成授業", "00000000-0000-4000-8000-000000000107"),
+];
 const TOKEN: &str = "fixture-notion-token";
 const LIMIT: u64 = 16_384;
 
@@ -40,6 +51,21 @@ pub fn target() -> NotionTarget {
             source: "source".into(),
         },
     }
+}
+
+pub fn verification_target() -> VerificationTarget {
+    VerificationTarget::new(target(), ASSIGNMENTS, COURSES, READER).expect("fixed fixture IDs")
+}
+
+pub fn moodle_mappings() -> [CourseMapping; 2] {
+    MOODLE_COURSES.map(|(course, page)| CourseMapping {
+        course_key: ExternalRecordKey {
+            origin: OriginKind::Moodle,
+            scope: MOODLE_SCOPE.into(),
+            id: course.into(),
+        },
+        page_id: page.into(),
+    })
 }
 
 pub struct FixtureServer {
@@ -253,6 +279,23 @@ fn handle(mut stream: TcpStream, pages: &mut Vec<Value>, writable: bool) -> std:
 
     let (status, body) = if !auth || !version {
         (401, json!({"code":"unauthorized"}))
+    } else if method == "GET" && path == "/v1/users/me" {
+        (
+            200,
+            json!({"object":"user","id":READER,"type":"bot","bot":{"owner":{
+                "type":"workspace","workspace":true
+            }}}),
+        )
+    } else if let Some(id) = path
+        .strip_prefix("/v1/pages/")
+        .filter(|id| method == "GET" && MOODLE_COURSES.iter().any(|(_, page)| id == page))
+    {
+        (
+            200,
+            json!({"object":"page","id":id,"in_trash":false,"parent":{
+                "type":"data_source_id","data_source_id":COURSES,"database_id":COURSES_DB
+            }}),
+        )
     } else if method == "GET" && path.strip_prefix("/v1/data_sources/") == Some(ASSIGNMENTS) {
         (
             200,

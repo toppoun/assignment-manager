@@ -2,6 +2,8 @@ mod config;
 mod credentials;
 #[cfg(feature = "synthetic-https-fixture")]
 mod fixture_run;
+#[cfg(feature = "synthetic-https-fixture")]
+mod moodle_plan;
 #[cfg(windows)]
 mod moodle_review;
 #[cfg(test)]
@@ -28,7 +30,7 @@ use credentials::{CredentialStatus, Kind};
 
 const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 #[cfg(feature = "synthetic-https-fixture")]
-const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)";
+const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)\nMoodle plan: sync moodle --dry-run --fixture\nNotion verification preview: --config PATH sync moodle --dry-run --fixture --allow-notion-read --target ASSIGNMENTS_ID --courses COURSES_ID --reader BOT_ID";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -40,6 +42,12 @@ enum Command {
     Sync(bool),
     NotionCheck,
     NotionFixturePreview,
+    MoodleFixturePlan,
+    MoodleNotionPlan {
+        assignments: String,
+        courses: String,
+        reader: String,
+    },
     FixtureApply,
     UniversityMoodle {
         require_windows_vpn: bool,
@@ -65,6 +73,8 @@ impl Command {
                 Self::NotionFixturePreview
                     | Self::UniversityFixture
                     | Self::UniversityReviewFixture
+                    | Self::MoodleFixturePlan
+                    | Self::MoodleNotionPlan { .. }
             )
     }
 }
@@ -95,6 +105,26 @@ impl Arguments {
             ["status", "--fixture"] => Command::Status(true),
             ["sync", "--dry-run"] => Command::Sync(false),
             ["sync", "--dry-run", "--fixture"] => Command::Sync(true),
+            ["sync", "moodle", "--dry-run", "--fixture"] if config.is_none() => {
+                Command::MoodleFixturePlan
+            }
+            [
+                "sync",
+                "moodle",
+                "--dry-run",
+                "--fixture",
+                "--allow-notion-read",
+                "--target",
+                assignments,
+                "--courses",
+                courses,
+                "--reader",
+                reader,
+            ] if config.is_some() => Command::MoodleNotionPlan {
+                assignments: (*assignments).into(),
+                courses: (*courses).into(),
+                reader: (*reader).into(),
+            },
             ["fixture-apply"] => Command::FixtureApply,
             [
                 "university-check",
@@ -154,6 +184,12 @@ enum CliError {
     TrialRequiresTerminal,
     #[cfg(feature = "synthetic-https-fixture")]
     FixtureFailed,
+    #[cfg(feature = "synthetic-https-fixture")]
+    MoodlePlanAcquisition,
+    #[cfg(feature = "synthetic-https-fixture")]
+    MoodlePlanEmpty,
+    #[cfg(feature = "synthetic-https-fixture")]
+    MoodlePlanNotion(NotionError),
     Receipt,
 }
 
@@ -182,6 +218,12 @@ impl CliError {
             Self::TrialRequiresTerminal => "trial_requires_terminal",
             #[cfg(feature = "synthetic-https-fixture")]
             Self::FixtureFailed => "fixture_failed",
+            #[cfg(feature = "synthetic-https-fixture")]
+            Self::MoodlePlanAcquisition => "moodle_acquisition_failed",
+            #[cfg(feature = "synthetic-https-fixture")]
+            Self::MoodlePlanEmpty => "moodle_no_candidates",
+            #[cfg(feature = "synthetic-https-fixture")]
+            Self::MoodlePlanNotion(error) => notion_diagnosis(*error),
             Self::Receipt => "receipt_unavailable",
         }
     }
@@ -570,6 +612,19 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
     // Fail before accessing local state when this is an ordinary binary.
     if args.command.needs_fixture_build() && !cfg!(feature = "synthetic-https-fixture") {
         return Err(CliError::FixtureUnavailable);
+    }
+    #[cfg(feature = "synthetic-https-fixture")]
+    match &args.command {
+        Command::MoodleFixturePlan => return moodle_plan::mock(),
+        Command::MoodleNotionPlan {
+            assignments,
+            courses,
+            reader,
+        } => {
+            let path = args.config.as_deref().ok_or(CliError::Usage)?;
+            return moodle_plan::notion(path, assignments, courses, reader);
+        }
+        _ => {}
     }
     if let Command::NotionTrial(id, command) = args.command {
         return trial::execute(&id, command, args.config);

@@ -18,6 +18,7 @@ include!("webclass_auth_fixture.rs");
 
 pub const MOODLE_URL: &str =
     "https://moodle.synthetic.invalid/calendar/export_execute.php?token=synthetic-secret";
+pub const MOODLE_SCOPE: &str = "default.course-related";
 pub const UNIVERSITY_ID: &str = STUDENT;
 pub const UNIVERSITY_PASSWORD: &str = PASSWORD;
 const ICS: &str = include_str!("../fixtures/moodle/calendar_basic.ics");

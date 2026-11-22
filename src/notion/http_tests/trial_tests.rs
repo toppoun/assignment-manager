@@ -6,7 +6,7 @@ use crate::notion::{
 
 pub(in crate::notion) mod recovery_tests;
 
-const READ_BOT: &str = "00000000-0000-4000-8000-000000000011";
+pub(super) const READ_BOT: &str = "00000000-0000-4000-8000-000000000011";
 const WRITE_BOT: &str = "00000000-0000-4000-8000-000000000012";
 
 fn trial() -> TrialTarget {
@@ -21,7 +21,7 @@ fn assignment() -> TrialAssignment {
     }
 }
 
-fn bot(id: &str) -> Exchange {
+pub(super) fn bot(id: &str) -> Exchange {
     Exchange::json(
         "GET",
         "/v1/users/me",
@@ -40,7 +40,7 @@ fn trial_schema() -> Value {
     schema
 }
 
-fn snapshot(rows: Vec<Value>) -> Vec<Exchange> {
+pub(super) fn snapshot(rows: Vec<Value>) -> Vec<Exchange> {
     let mut script = schema_exchanges(trial_schema());
     script.push(query(rows, None));
     script
@@ -72,6 +72,37 @@ fn rejects_both_production_ids_in_either_role_and_requires_explicit_selection() 
     assert!(TrialTarget::new(target(), "", READ_BOT, WRITE_BOT).is_err());
     assert!(TrialTarget::new(target(), C, READ_BOT, WRITE_BOT).is_err());
     assert!(TrialTarget::new(target(), A, READ_BOT, READ_BOT).is_err());
+}
+
+#[test]
+fn verification_rejects_either_production_source_and_a_mismatched_reader() {
+    for id in PRODUCTION_DATA_SOURCES {
+        let mut config = target();
+        config.assignments_data_source_id = id.into();
+        assert_eq!(
+            VerificationTarget::new(config, id, C, READ_BOT).err(),
+            Some(NotionError::MethodDisabled)
+        );
+        let mut config = target();
+        config.courses_data_source_id = id.into();
+        assert_eq!(
+            VerificationTarget::new(config, A, id, READ_BOT).err(),
+            Some(NotionError::MethodDisabled)
+        );
+    }
+    assert!(VerificationTarget::new(target(), A, A, READ_BOT).is_err());
+    let verification = VerificationTarget::new(target(), A, C, READ_BOT).unwrap();
+    let (client, server) = mock(vec![bot(WRITE_BOT)]);
+    assert_eq!(
+        client.preview_verification(
+            &verification,
+            &input(vec![candidate("a", "Synthetic")]),
+            &[],
+            Default::default()
+        ),
+        Err(NotionError::CredentialMismatch)
+    );
+    server.join().unwrap();
 }
 
 #[test]

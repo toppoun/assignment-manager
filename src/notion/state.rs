@@ -163,6 +163,7 @@ impl BindingStatus {
     }
 }
 
+#[derive(Default)]
 pub struct StateSummary {
     pub(super) bindings: HashMap<SyncKey, Binding>,
     pub pending: usize,

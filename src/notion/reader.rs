@@ -84,8 +84,12 @@ impl DryRunReport {
     }
 
     pub fn counts(&self) -> DryRunCounts {
+        self.counts_where(|_| true)
+    }
+
+    pub(super) fn counts_where(&self, include: impl Fn(&SyncKey) -> bool) -> DryRunCounts {
         let mut counts = DryRunCounts::default();
-        for entry in &self.plan {
+        for entry in self.plan.iter().filter(|entry| include(&entry.key)) {
             counts.course_relation_mismatch += usize::from(entry.course_relation_mismatch);
             *match entry.action {
                 PlanAction::Create { .. } => &mut counts.create,

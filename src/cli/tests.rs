@@ -48,6 +48,55 @@ fn parses_only_explicit_dry_run_and_named_credential_commands() {
 }
 
 #[test]
+fn moodle_preview_requires_explicit_fixture_and_complete_notion_selection() {
+    assert_eq!(
+        parse(&["sync", "moodle", "--dry-run", "--fixture"])
+            .unwrap()
+            .command,
+        Command::MoodleFixturePlan
+    );
+    let real = [
+        "--config",
+        "verification.json",
+        "sync",
+        "moodle",
+        "--dry-run",
+        "--fixture",
+        "--allow-notion-read",
+        "--target",
+        "assignments",
+        "--courses",
+        "courses",
+        "--reader",
+        "bot",
+    ];
+    assert!(matches!(
+        parse(&real).unwrap().command,
+        Command::MoodleNotionPlan { .. }
+    ));
+    for invalid in [
+        &real[2..],
+        &real[..real.len() - 2],
+        &["sync", "moodle", "--dry-run"],
+        &["sync", "moodle", "--fixture", "--allow-university-read"],
+        &[
+            "sync",
+            "moodle",
+            "--dry-run",
+            "--fixture",
+            "--allow-notion-write",
+        ],
+    ] {
+        assert_eq!(parse(invalid), Err(CliError::Usage));
+    }
+    #[cfg(not(feature = "synthetic-https-fixture"))]
+    assert_eq!(
+        execute(parse(&real).unwrap()),
+        Err(CliError::FixtureUnavailable)
+    );
+}
+
+#[test]
 fn accepts_only_explicit_notion_read_and_a_legacy_config() {
     assert_eq!(
         parse(&["notion-check", "--allow-notion-read"])

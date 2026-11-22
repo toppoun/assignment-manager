@@ -46,6 +46,20 @@ fn stderr(output: &Output) -> &str {
     std::str::from_utf8(&output.stderr).unwrap()
 }
 
+#[cfg(feature = "synthetic-https-fixture")]
+#[test]
+fn moodle_fixture_plan_only_prints_counts_and_creates_no_local_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = call(&temp, &["sync", "moodle", "--dry-run", "--fixture"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output).trim_end(),
+        "result=success moodle=fixture candidates=3 create=3 update=0 unchanged=0 errors=0 conflict=0 deferred=0 course_relation_mismatch=0"
+    );
+    assert_eq!(stderr(&output), "");
+    assert!(!local_root(&temp).exists());
+}
+
 fn config(temp: &tempfile::TempDir) {
     let root = local_root(temp);
     fs::create_dir_all(&root).unwrap();
