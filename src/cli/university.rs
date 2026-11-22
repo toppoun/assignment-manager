@@ -1,7 +1,7 @@
 use assignment_manager::{
     moodle_http::{MoodleExportKind, MoodleFeed},
     secured_sync::SecuredSyncClients,
-    sync::{MoodleSyncError, acquire_moodle_with_diagnostic},
+    sync::{MoodleAcquisition, MoodleSyncError, acquire_moodle_with_diagnostic},
 };
 
 use super::{CliError, Config, CredentialStatus, credentials};
@@ -10,7 +10,13 @@ pub(super) fn moodle(
     config: &Config,
     config_dir: &std::path::Path,
     require_windows_vpn: bool,
+    review_local: bool,
 ) -> Result<u8, CliError> {
+    #[cfg(not(windows))]
+    if review_local {
+        println!("review diagnostic=review_windows_required");
+        return Ok(finish(false));
+    }
     let source = config
         .moodle
         .as_ref()
@@ -47,6 +53,20 @@ pub(super) fn moodle(
             return Ok(crl_failure("tls_revocation_unconfirmed"));
         }
     }
+    #[cfg(windows)]
+    if review_local {
+        match super::moodle_review::confirm_fetch() {
+            Ok(true) => (),
+            Ok(false) => {
+                println!("review result=cancelled");
+                return Ok(finish(false));
+            }
+            Err(()) => {
+                println!("review diagnostic=review_window_unavailable");
+                return Ok(finish(false));
+            }
+        }
+    }
     let prepare = || {
         let url = credentials::moodle_url(&config.target_id()?).map_err(CliError::Credential)?;
         policy
@@ -60,8 +80,13 @@ pub(super) fn moodle(
         print_source("moodle", 0, Some("setup"));
     })?;
     clients.begin_run();
-    let success = check_moodle(&clients, &feed);
-    Ok(finish(success))
+    let acquired = acquire_moodle_for_check(&clients, &feed);
+    drop((clients, feed));
+    #[cfg(windows)]
+    if review_local {
+        return Ok(finish(acquired.is_some_and(super::moodle_review::review)));
+    }
+    Ok(finish(acquired.is_some()))
 }
 
 fn crl_failure(diagnostic: &'static str) -> u8 {
@@ -70,18 +95,24 @@ fn crl_failure(diagnostic: &'static str) -> u8 {
     finish(false)
 }
 
-fn check_moodle(clients: &SecuredSyncClients, feed: &MoodleFeed) -> bool {
+fn acquire_moodle_for_check(
+    clients: &SecuredSyncClients,
+    feed: &MoodleFeed,
+) -> Option<MoodleAcquisition> {
     let Ok(client) = clients.moodle() else {
         print_source("moodle", 0, Some("fetch"));
         println!("moodle diagnostic=client_initialization");
-        return false;
+        return None;
     };
     match acquire_moodle_with_diagnostic(&client, feed) {
-        Ok(acquired) => print_source(
-            "moodle",
-            acquired.assignments().batch().as_slice().len(),
-            None,
-        ),
+        Ok(acquired) => {
+            print_source(
+                "moodle",
+                acquired.assignments().batch().as_slice().len(),
+                None,
+            );
+            Some(acquired)
+        }
         Err(error) => {
             let stage = match error.kind {
                 MoodleSyncError::Fetch => "fetch",
@@ -96,7 +127,7 @@ fn check_moodle(clients: &SecuredSyncClients, feed: &MoodleFeed) -> bool {
             } else {
                 println!("moodle diagnostic={code}");
             }
-            false
+            None
         }
     }
 }
@@ -134,7 +165,7 @@ pub(super) fn fixture(scenario: assignment_manager::webclass_auth::synthetic::Sc
         MOODLE_URL,
     )
     .expect("fixed synthetic feed");
-    let moodle_ok = check_moodle(&clients, &feed);
+    let moodle_ok = acquire_moodle_for_check(&clients, &feed).is_some();
     let webclass_ok = match clients
         .authenticator()
         .login(HoseiCredentials::new(UNIVERSITY_ID, UNIVERSITY_PASSWORD))
@@ -161,6 +192,30 @@ pub(super) fn fixture(scenario: assignment_manager::webclass_auth::synthetic::Sc
         Err(_) => print_source("webclass", 0, Some("authentication")),
     };
     finish(moodle_ok && webclass_ok)
+}
+
+#[cfg(all(windows, feature = "synthetic-https-fixture"))]
+pub(super) fn review_fixture() -> u8 {
+    use assignment_manager::webclass_auth::synthetic::{MOODLE_URL, Scenario, SyntheticUniversity};
+
+    let university = SyntheticUniversity::start(Scenario::MoodleReview);
+    let mut clients = SecuredSyncClients::new(university.policy());
+    clients.begin_run();
+    let feed = MoodleFeed::new(
+        "default.course-related",
+        MoodleExportKind::CourseRelated,
+        MOODLE_URL,
+    )
+    .expect("fixed synthetic feed");
+    let acquired = acquire_moodle_for_check(&clients, &feed);
+    drop((clients, feed, university));
+    finish(acquired.is_some_and(super::moodle_review::review))
+}
+
+#[cfg(all(not(windows), feature = "synthetic-https-fixture"))]
+pub(super) fn review_fixture() -> u8 {
+    println!("review diagnostic=review_windows_required");
+    finish(false)
 }
 
 #[cfg(all(test, feature = "synthetic-https-fixture"))]

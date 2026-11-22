@@ -216,9 +216,23 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
     for args in [
         &["university-check", "moodle"][..],
         &["university-check", "moodle", "--require-windows-vpn"],
+        &["university-check", "moodle", "--review-local"],
+        &[
+            "university-check",
+            "moodle",
+            "--allow-university-read",
+            "--review-local",
+        ],
         &["university-check", "webclass", "--allow-university-read"],
         &["university-check", "--fixture", "--allow-university-read"],
         &["--config", "unused.json", "university-check", "--fixture"],
+        &[
+            "--config",
+            "unused.json",
+            "university-check",
+            "--fixture",
+            "--review-local",
+        ],
     ] {
         let output = call(&temp, args);
         assert_eq!(output.status.code(), Some(2));
@@ -259,6 +273,7 @@ fn university_moodle_stops_before_credentials_without_crl_evidence() {
                 "moodle",
                 "--allow-university-read",
                 "--require-windows-vpn",
+                "--review-local",
             ],
         )
     };

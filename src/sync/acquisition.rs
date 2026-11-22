@@ -11,7 +11,7 @@ use crate::{
     import::{
         AssignmentCandidateBatch, DEFAULT_COURSE_SOURCE_SCOPE, ExternalRecordKey, OriginKind,
     },
-    moodle::{map_events, parse_calendar, single_course_category},
+    moodle::{MoodleEventKind, classify_event, map_events, parse_calendar, single_course_category},
     moodle_http::{MoodleClient, MoodleDiagnostic, MoodleFeed},
     observation::{
         AssignmentObservation, ObservationValidationError, SyncScope, WebClassCourseListObservation,
@@ -86,6 +86,7 @@ impl fmt::Debug for AcquiredAssignments {
 pub struct MoodleAcquisition {
     pub(crate) assignments: AcquiredAssignments,
     pub(crate) courses: HashMap<ExternalRecordKey, SourceCourse>,
+    pub(crate) event_kinds: HashMap<ExternalRecordKey, MoodleEventKind>,
 }
 
 impl fmt::Debug for MoodleAcquisition {
@@ -104,6 +105,10 @@ impl MoodleAcquisition {
 
     pub fn course_for(&self, assignment: &ExternalRecordKey) -> Option<&SourceCourse> {
         self.courses.get(assignment)
+    }
+
+    pub fn event_kind_for(&self, assignment: &ExternalRecordKey) -> Option<MoodleEventKind> {
+        self.event_kinds.get(assignment).copied()
     }
 }
 
@@ -144,13 +149,18 @@ pub fn acquire_moodle_with_diagnostic(
     feed: &MoodleFeed,
 ) -> Result<MoodleAcquisition, MoodleAcquisitionError> {
     let mut courses = HashMap::new();
-    let assignments = visit_moodle(client, feed, |key, course| {
-        courses.insert(key, course);
+    let mut event_kinds = HashMap::new();
+    let assignments = visit_moodle(client, feed, |key, kind, course| {
+        if let Some(course) = course {
+            courses.insert(key.clone(), course);
+        }
+        event_kinds.insert(key, kind);
         Ok(())
     })?;
     Ok(MoodleAcquisition {
         assignments,
         courses,
+        event_kinds,
     })
 }
 
@@ -159,7 +169,11 @@ pub fn acquire_moodle_with_diagnostic(
 pub(super) fn visit_moodle(
     client: &MoodleClient,
     feed: &MoodleFeed,
-    mut visit_course: impl FnMut(ExternalRecordKey, SourceCourse) -> Result<(), MoodleSyncError>,
+    mut visit_candidate: impl FnMut(
+        ExternalRecordKey,
+        MoodleEventKind,
+        Option<SourceCourse>,
+    ) -> Result<(), MoodleSyncError>,
 ) -> Result<AcquiredAssignments, MoodleAcquisitionError> {
     let raw = client
         .fetch_calendar_with_diagnostic(feed)
@@ -181,7 +195,12 @@ pub(super) fn visit_moodle(
         SyncScope::MoodleFeed(feed.scope().to_owned()),
         events.iter().map(|event| key_for(&event.uid)).collect(),
     )
-    .map_err(|_| validation)?;
+    .map_err(|error| match error {
+        ObservationValidationError::DuplicateIdentity => {
+            acquired_response_error(MoodleSyncError::Validation, "moodle_uid_duplicate")
+        }
+        _ => validation,
+    })?;
     let batch = AssignmentCandidateBatch::try_new(map_events(&events, feed.scope()))
         .map_err(|_| validation)?;
     let assignments = AcquiredAssignments::try_new(batch, observation).map_err(|_| validation)?;
@@ -199,16 +218,12 @@ pub(super) fn visit_moodle(
         if !candidate_keys.contains(&key) {
             continue;
         }
-        if let Some(category) = single_course_category(event, feed) {
-            visit_course(
-                key,
-                SourceCourse {
-                    external_key: key_for(category),
-                    name: category.to_owned(),
-                },
-            )
+        let course = single_course_category(event, feed).map(|category| SourceCourse {
+            external_key: key_for(category),
+            name: category.to_owned(),
+        });
+        visit_candidate(key, classify_event(event), course)
             .map_err(|kind| acquired_response_error(kind, "course_processing"))?;
-        }
     }
     client
         .check_sync_records(assignments.batch().as_slice().len())

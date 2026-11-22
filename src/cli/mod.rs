@@ -2,6 +2,8 @@ mod config;
 mod credentials;
 #[cfg(feature = "synthetic-https-fixture")]
 mod fixture_run;
+#[cfg(windows)]
+mod moodle_review;
 #[cfg(test)]
 mod tests;
 mod trial;
@@ -24,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
-const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn]>\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture, sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 #[cfg(feature = "synthetic-https-fixture")]
 const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)";
 
@@ -39,8 +41,12 @@ enum Command {
     NotionCheck,
     NotionFixturePreview,
     FixtureApply,
-    UniversityMoodle { require_windows_vpn: bool },
+    UniversityMoodle {
+        require_windows_vpn: bool,
+        review_local: bool,
+    },
     UniversityFixture,
+    UniversityReviewFixture,
     NotionTrial(String, trial::Command),
 }
 
@@ -53,7 +59,13 @@ impl Command {
     }
 
     fn needs_fixture_build(&self) -> bool {
-        self.uses_fixture() || matches!(self, Self::NotionFixturePreview | Self::UniversityFixture)
+        self.uses_fixture()
+            || matches!(
+                self,
+                Self::NotionFixturePreview
+                    | Self::UniversityFixture
+                    | Self::UniversityReviewFixture
+            )
     }
 }
 
@@ -89,12 +101,18 @@ impl Arguments {
                 "moodle",
                 "--allow-university-read",
                 rest @ ..,
-            ] if rest.is_empty() || rest == ["--require-windows-vpn"] => {
+            ] if matches!(
+                rest,
+                [] | ["--require-windows-vpn"] | ["--require-windows-vpn", "--review-local"]
+            ) =>
+            {
                 Command::UniversityMoodle {
                     require_windows_vpn: !rest.is_empty(),
+                    review_local: rest.len() == 2,
                 }
             }
             ["university-check", "--fixture"] => Command::UniversityFixture,
+            ["university-check", "--fixture", "--review-local"] => Command::UniversityReviewFixture,
             ["sync", "--dry-run", "--fixture", "--allow-notion-read"] => {
                 Command::NotionFixturePreview
             }
@@ -107,7 +125,13 @@ impl Arguments {
             }
             _ => return Err(CliError::Usage),
         };
-        if config.is_some() && (command.uses_fixture() || command == Command::UniversityFixture) {
+        if config.is_some()
+            && (command.uses_fixture()
+                || matches!(
+                    command,
+                    Command::UniversityFixture | Command::UniversityReviewFixture
+                ))
+        {
             return Err(CliError::Usage);
         }
         Ok(Self { command, config })
@@ -555,8 +579,13 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         use assignment_manager::webclass_auth::synthetic::Scenario;
         return Ok(university::fixture(Scenario::BothSuccess));
     }
+    #[cfg(feature = "synthetic-https-fixture")]
+    if args.command == Command::UniversityReviewFixture {
+        return Ok(university::review_fixture());
+    }
     if let Command::UniversityMoodle {
         require_windows_vpn,
+        review_local,
     } = args.command
     {
         let path = match args.config {
@@ -564,7 +593,12 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             None => config::root()?.join("config.json"),
         };
         let directory = path.parent().unwrap_or(Path::new("."));
-        return university::moodle(&Config::read(&path)?, directory, require_windows_vpn);
+        return university::moodle(
+            &Config::read(&path)?,
+            directory,
+            require_windows_vpn,
+            review_local,
+        );
     }
     let root = config::root()?;
     if args.command.uses_fixture() {

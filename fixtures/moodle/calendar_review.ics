@@ -1,0 +1,22 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Synthetic//Moodle Review Fixture//EN
+BEGIN:VEVENT
+UID:review-submit@example.invalid
+SUMMARY:照合用の活動の提出期限
+CATEGORIES:照合用の授業
+DTSTART:20261123T150000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:review-close@example.invalid
+SUMMARY:照合用の活動の受験可能期間の終了
+CATEGORIES:照合用の授業
+DTSTART:20261124T020000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:review-other@example.invalid
+SUMMARY:照合用の活動の提出期限
+CATEGORIES:別の合成授業
+DTSTART:20261124T030000Z
+END:VEVENT
+END:VCALENDAR

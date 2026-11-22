@@ -434,6 +434,37 @@ fn tls_policy(peer: SocketAddr, lookup: Arc<dyn Resolve>) -> NetworkPolicy {
     policy.test.root = Some(reqwest::Certificate::from_der(CA).unwrap());
     policy
 }
+
+#[test]
+fn moodle_reacquisition_keeps_sync_keys_for_the_same_uids() {
+    use crate::notion::SyncInput;
+
+    let first = include_str!("../fixtures/moodle/calendar_review.ics");
+    let second = first
+        .replace("照合用の活動", "変更後の合成活動")
+        .replace("20261123T150000Z", "20261125T150000Z")
+        .replace("照合用の授業", "変更後の合成授業");
+    let acquire = |ics: &str| {
+        let (peer, server) = tls_server(response(
+            ics.as_bytes(),
+            &format!("Content-Length: {}\r\n", ics.len()),
+        ));
+        let lookup = Arc::new(FakeLookup::new(vec![vec![peer]]));
+        let client = MoodleClient::for_web(tls_policy(peer, lookup.clone())).unwrap();
+        let acquired = acquire_moodle_with_diagnostic(&client, &feed(URL)).unwrap();
+        let (request, listener) = server.join().unwrap();
+        assert!(request.unwrap().starts_with("GET "));
+        assert_no_connection(&listener);
+        assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
+        SyncInput::from_acquisitions(Some(&acquired), None).unwrap()
+    };
+
+    let first = acquire(first);
+    let second = acquire(&second);
+    assert_eq!(first.assignments().len(), 3);
+    assert!(first.assignments().keys().eq(second.assignments().keys()));
+    assert_ne!(first.assignments(), second.assignments());
+}
 fn assert_no_connection(listener: &TcpListener) {
     listener.set_nonblocking(true).unwrap();
     assert_eq!(
@@ -682,7 +713,7 @@ fn moodle_diagnostics_distinguish_http_status_body_and_ics_failures() {
                 &format!("Content-Length: {}\r\n", duplicate_events.len()),
             ),
             Validation,
-            "candidate_validation",
+            "moodle_uid_duplicate",
             Some(200),
         ),
     ];

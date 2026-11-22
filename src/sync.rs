@@ -66,7 +66,8 @@ pub fn sync_moodle_once(
     store: &mut SqliteStore,
 ) -> Result<AssignmentImportSummary, MoodleSyncError> {
     let mut resolutions = HashMap::new();
-    let assignments = visit_moodle(client, feed, |assignment_key, course| {
+    let assignments = visit_moodle(client, feed, |assignment_key, _, course| {
+        let Some(course) = course else { return Ok(()) };
         let key = course.external_key;
         let course_id = match store
             .find_moodle_course_id(&key.scope, &key.id)

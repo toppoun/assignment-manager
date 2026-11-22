@@ -60,6 +60,7 @@ fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition {
     MoodleAcquisition {
         assignments: validated(SyncScope::MoodleFeed(FEED.into()), candidates),
         courses: HashMap::new(),
+        event_kinds: HashMap::new(),
     }
 }
 

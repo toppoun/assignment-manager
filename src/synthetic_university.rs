@@ -21,6 +21,7 @@ pub const MOODLE_URL: &str =
 pub const UNIVERSITY_ID: &str = STUDENT;
 pub const UNIVERSITY_PASSWORD: &str = PASSWORD;
 const ICS: &str = include_str!("../fixtures/moodle/calendar_basic.ics");
+const REVIEW_ICS: &str = include_str!("../fixtures/moodle/calendar_review.ics");
 const COURSE_DATA: &str = include_str!("../fixtures/webclass/courses_basic.json");
 const CONTENT_DATA: &str = include_str!("../fixtures/webclass/contents_basic.json");
 const CONTENTS: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
@@ -30,6 +31,7 @@ pub enum Scenario {
     #[default]
     BothSuccess,
     MoodleFailure,
+    MoodleReview,
     WebClassFailure,
     BothFailure,
     AuthExpiredOnce,
@@ -240,6 +242,8 @@ fn serve(
                 };
                 let body = if matches!(scenario, Scenario::BodyLimit) {
                     "x".repeat(8 * 1024 * 1024 + 1)
+                } else if matches!(scenario, Scenario::MoodleReview) {
+                    REVIEW_ICS.into()
                 } else {
                     ICS.into()
                 };
