@@ -20,6 +20,7 @@ fn trial() -> CourseCreationTrial {
 fn page(id: &str, name: &str) -> Value {
     json!({
         "object":"page", "id":id, "in_trash":false,
+        "last_edited_time":"2026-01-01T00:00:00.000Z",
         "parent":{"type":"data_source_id", "database_id":C_DB, "data_source_id":COURSE_SOURCE},
         "properties":{"授業名":{"id":"title", "type":"title",
             "title":[{"type":"text", "text":{"content":name}}]}},
@@ -97,6 +98,8 @@ fn course_trial_creates_exact_titles_only_and_reads_back_six_distinct_mappings()
         rows.push(page(PAGE_IDS[index], CATEGORIES[index]));
     }
     script.extend(inspection(&trial, TrialRole::Read, &rows));
+    rows[0]["last_edited_time"] = json!("2026-01-02T00:00:00.000Z");
+    script.extend(inspection(&trial, TrialRole::Read, &rows));
     let (client, server) = mock(script);
     assert_eq!(trial.create(&client, &journal, || true), Ok(true));
     let snapshot = trial.inspect(&client, TrialRole::Read).unwrap();
@@ -108,6 +111,11 @@ fn course_trial_creates_exact_titles_only_and_reads_back_six_distinct_mappings()
         assert_eq!(mapping.course_key.scope, "default.course-related");
         assert_eq!(mapping.page_id, PAGE_IDS[index]);
     }
+    let changed = trial.inspect(&client, TrialRole::Read).unwrap();
+    assert_eq!(
+        trial.verified_mappings(&changed, &journal).err(),
+        Some(CourseTrialError::PlanChanged),
+    );
     server.join().unwrap();
 }
 
@@ -184,7 +192,9 @@ fn course_trial_cancels_cleanly_and_rejects_changes_after_confirmation() {
         trial.create(&client, &journal, || true),
         Err(CourseTrialError::PlanChanged)
     );
-    assert_eq!(std::fs::read(&journal).unwrap(), Vec::<u8>::new());
+    let journal_text = std::fs::read_to_string(&journal).unwrap();
+    assert!(journal_text.starts_with("baseline "));
+    assert_eq!(journal_text.lines().count(), 1);
     server.join().unwrap();
 }
 
@@ -208,8 +218,11 @@ fn course_trial_uses_read_only_recovery_after_partial_success_or_lost_response()
         trial.create(&client, &journal, || true),
         Err(CourseTrialError::ResultUnconfirmed(NotionError::Transport)),
     );
+    let journal_text = std::fs::read_to_string(&journal).unwrap();
+    let (baseline, advances) = journal_text.split_once('\n').unwrap();
+    assert!(baseline.starts_with("baseline "));
     assert_eq!(
-        std::fs::read_to_string(&journal).unwrap(),
+        advances,
         format!("attempt 1\nconfirmed 1 {}\nattempt 2\n", PAGE_IDS[0]),
     );
     assert_eq!(
@@ -258,12 +271,16 @@ fn course_trial_refuses_duplicate_titles_wrong_membership_or_changed_confirmed_p
     let (client, server) = mock(inspection(&trial, TrialRole::Read, &rows));
     let directory = tempfile::tempdir().unwrap();
     let journal = directory.path().join("journal");
+    let snapshot = trial.inspect(&client, TrialRole::Read).unwrap();
     std::fs::write(
         &journal,
-        format!("attempt 1\nconfirmed 1 {}\n", PAGE_IDS[1]),
+        format!(
+            "baseline {}\nattempt 1\nconfirmed 1 {}\n",
+            snapshot.baseline_revision(),
+            PAGE_IDS[1]
+        ),
     )
     .unwrap();
-    let snapshot = trial.inspect(&client, TrialRole::Read).unwrap();
     assert_eq!(
         trial.verified_mappings(&snapshot, &journal).err(),
         Some(CourseTrialError::PlanChanged),

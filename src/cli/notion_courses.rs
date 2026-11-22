@@ -92,10 +92,20 @@ pub(super) fn execute(path: &Path, action: Action) -> Result<u8, CliError> {
         };
     }
 
-    let client =
-        credentials::notion_client(trial.target().assignment_id()).map_err(CliError::Credential)?;
+    let (client, role) = if action == Action::Preview {
+        (
+            credentials::trial_client(trial.target(), TrialRole::Write),
+            TrialRole::Write,
+        )
+    } else {
+        (
+            credentials::notion_client(trial.target().assignment_id()),
+            TrialRole::Read,
+        )
+    };
+    let client = client.map_err(CliError::Credential)?;
     let snapshot = trial
-        .inspect(&client, TrialRole::Read)
+        .inspect(&client, role)
         .map_err(CliError::MoodlePlanNotion)?;
     let found: Vec<_> = snapshot.existing_ordinals().collect();
     let missing = approved - found.len();
@@ -103,7 +113,8 @@ pub(super) fn execute(path: &Path, action: Action) -> Result<u8, CliError> {
     if action == Action::Preview {
         let can_create = found.is_empty() && !started;
         println!(
-            "phase=preview approved={approved} existing_exact={} missing={missing} attempt_journal_present={started} can_create={can_create} notion_writes=0",
+            "phase=preview writer_id=verified schema=verified complete=true total={} approved={approved} existing_exact={} missing={missing} attempt_journal_present={started} can_create={can_create} notion_writes=0",
+            snapshot.total_courses(),
             found.len(),
         );
         return Ok(if can_create { 0 } else { 3 });
@@ -137,7 +148,8 @@ pub(super) fn execute(path: &Path, action: Action) -> Result<u8, CliError> {
         .persist_noclobber(ready)
         .map_err(|_| CliError::Receipt)?;
     println!(
-        "result=success mappings_prepared={} live_configuration_changed=false",
+        "result=success total={} baseline_unchanged=true mappings_prepared={} live_configuration_changed=false",
+        snapshot.total_courses(),
         mappings.len()
     );
     Ok(0)

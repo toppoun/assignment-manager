@@ -1,11 +1,12 @@
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     fs::OpenOptions,
     io::{Read, Write},
     path::Path,
 };
 
-use aws_lc_rs::digest::{SHA256, digest};
+use aws_lc_rs::digest::{Context, SHA256, digest};
 use reqwest::Method;
 use serde_json::{Value, json};
 
@@ -35,16 +36,28 @@ pub struct CourseCreationTrial {
 #[derive(PartialEq, Eq)]
 pub struct CourseSnapshot {
     database: String,
-    baseline_titles: [String; MOODLE_TRIAL_COURSES.len()],
+    baseline_pages: [[u8; 32]; MOODLE_TRIAL_COURSES.len()],
     pages: [Option<String>; COURSE_COUNT],
 }
 
 impl CourseSnapshot {
+    pub fn total_courses(&self) -> usize {
+        MOODLE_TRIAL_COURSES.len() + self.existing_ordinals().count()
+    }
+
     pub fn existing_ordinals(&self) -> impl Iterator<Item = usize> + '_ {
         self.pages
             .iter()
             .enumerate()
             .filter_map(|(index, id)| id.as_ref().map(|_| index + 1))
+    }
+
+    pub(super) fn baseline_revision(&self) -> String {
+        let mut revision = String::with_capacity(64);
+        for byte in digest(&SHA256, self.baseline_pages.as_flattened()).as_ref() {
+            write!(&mut revision, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        revision
     }
 }
 
@@ -141,6 +154,10 @@ impl CourseCreationTrial {
                 _ => CourseTrialError::Journal,
             })?;
 
+        record(
+            &mut journal,
+            format_args!("baseline {}", expected.baseline_revision()),
+        )?;
         for (index, title) in self.categories.iter().enumerate() {
             if self.read_snapshot(client, &expected.database)? != expected {
                 return Err(CourseTrialError::PlanChanged);
@@ -174,7 +191,7 @@ impl CourseCreationTrial {
         snapshot: &CourseSnapshot,
         journal_path: &Path,
     ) -> Result<Vec<CourseMapping>, CourseTrialError> {
-        let confirmed = confirmed_pages(journal_path)?;
+        let confirmed = confirmed_pages(journal_path, &snapshot.baseline_revision())?;
         let mut mappings = Vec::with_capacity(COURSE_COUNT);
         for ((title, observed), confirmed_id) in
             self.categories.iter().zip(&snapshot.pages).zip(confirmed)
@@ -220,7 +237,7 @@ impl CourseCreationTrial {
             .ok_or(NotionError::InvalidResponse)?;
         let mut snapshot = CourseSnapshot {
             database: database.into(),
-            baseline_titles: Default::default(),
+            baseline_pages: Default::default(),
             pages: Default::default(),
         };
         let mut seen = HashSet::new();
@@ -233,7 +250,15 @@ impl CourseCreationTrial {
                 if self.categories.contains(&title) {
                     return Err(NotionError::Conflict);
                 }
-                snapshot.baseline_titles[index] = title;
+                let timestamp = row["last_edited_time"]
+                    .as_str()
+                    .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+                    .ok_or(NotionError::InvalidResponse)?;
+                let mut page_revision = Context::new(&SHA256);
+                page_revision.update(timestamp.as_bytes());
+                page_revision.update(&[0]);
+                page_revision.update(title.as_bytes());
+                snapshot.baseline_pages[index].copy_from_slice(page_revision.finish().as_ref());
                 continue;
             }
             let index = self
@@ -273,7 +298,10 @@ fn record(
         .map_err(|_| CourseTrialError::Journal)
 }
 
-fn confirmed_pages(path: &Path) -> Result<[Option<String>; COURSE_COUNT], CourseTrialError> {
+fn confirmed_pages(
+    path: &Path,
+    baseline: &str,
+) -> Result<[Option<String>; COURSE_COUNT], CourseTrialError> {
     let mut contents = String::new();
     std::fs::File::open(path)
         .and_then(|file| file.take(4097).read_to_string(&mut contents))
@@ -283,6 +311,13 @@ fn confirmed_pages(path: &Path) -> Result<[Option<String>; COURSE_COUNT], Course
     }
     let mut confirmed = std::array::from_fn(|_| None);
     let mut lines = contents.lines();
+    let initial = lines
+        .next()
+        .and_then(|line| line.strip_prefix("baseline "))
+        .ok_or(CourseTrialError::Journal)?;
+    if initial != baseline {
+        return Err(CourseTrialError::PlanChanged);
+    }
     for (index, page) in confirmed.iter_mut().enumerate() {
         let Some(attempt) = lines.next() else { break };
         let ordinal = index + 1;
