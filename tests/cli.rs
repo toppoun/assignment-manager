@@ -243,6 +243,12 @@ fn the_default_binary_refuses_fixture_network_and_apply() {
         &["sync", "--dry-run", "--fixture"][..],
         &["fixture-apply"],
         &["university-check", "--fixture"],
+        &[
+            "university-check",
+            "webclass",
+            "--courses-only",
+            "--fixture",
+        ],
     ] {
         let output = call(&temp, args);
         assert_eq!(output.status.code(), Some(2));
@@ -265,6 +271,22 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
             "--review-local",
         ],
         &["university-check", "webclass", "--allow-university-read"],
+        &["university-check", "webclass", "--courses-only"],
+        &[
+            "university-check",
+            "webclass",
+            "--courses-only",
+            "--fixture",
+            "--allow-university-read",
+        ],
+        &[
+            "--config",
+            "unused.json",
+            "university-check",
+            "webclass",
+            "--courses-only",
+            "--fixture",
+        ],
         &["university-check", "--fixture", "--allow-university-read"],
         &["--config", "unused.json", "university-check", "--fixture"],
         &[
@@ -289,7 +311,46 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stdout(&output).contains("moodle acquired=0 failures=1 error=setup"));
     assert!(stderr(&output).contains("source_disabled"));
+    let path = local_root(&temp).join("config.json");
+    let mut disabled: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    disabled["webclass"] = serde_json::Value::Bool(false);
+    fs::write(path, disabled.to_string()).unwrap();
+    let output = call(
+        &temp,
+        &[
+            "university-check",
+            "webclass",
+            "--courses-only",
+            "--allow-university-read",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("source_disabled"));
     assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+#[test]
+fn webclass_course_check_reports_only_counts_without_creating_local_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = call(
+        &temp,
+        &[
+            "university-check",
+            "webclass",
+            "--courses-only",
+            "--fixture",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).lines().collect::<Vec<_>>(),
+        ["webclass courses=3 validation=passed", "result=success"]
+    );
+    assert!(stderr(&output).is_empty());
+    assert!(!local_root(&temp).exists());
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
 #[cfg(windows)]

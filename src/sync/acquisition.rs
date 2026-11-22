@@ -16,8 +16,11 @@ use crate::{
     observation::{
         AssignmentObservation, ObservationValidationError, SyncScope, WebClassCourseListObservation,
     },
-    webclass::{WebClassMapError, map_contents_for_group, parse_contents, parse_courses},
-    webclass_auth::HoseiAuthenticator,
+    webclass::{
+        WebClassCourse, WebClassMapError, WebClassParseError, map_contents_for_group,
+        parse_contents, parse_courses,
+    },
+    webclass_auth::{HoseiAuthError, HoseiAuthenticator, HoseiCredentials},
     webclass_http::{WebClassClient, WebClassHttpError},
 };
 
@@ -236,13 +239,48 @@ pub(super) fn visit_moodle(
 #[derive(Debug)]
 pub struct AcquiredWebClassCourses {
     pub(crate) courses: Vec<SourceCourse>,
+    records: Vec<WebClassCourse>,
     pub(crate) observation: WebClassCourseListObservation,
     pub(crate) observed_at: DateTime<Utc>,
 }
 
 impl AcquiredWebClassCourses {
+    pub(crate) fn from_records(
+        records: Vec<WebClassCourse>,
+    ) -> Result<Self, ObservationValidationError> {
+        let observation = WebClassCourseListObservation::try_new(
+            records
+                .iter()
+                .map(|course| course.group_id.clone())
+                .collect(),
+        )?;
+        let courses = records
+            .iter()
+            .map(|course| SourceCourse {
+                external_key: ExternalRecordKey {
+                    origin: OriginKind::WebClass,
+                    scope: DEFAULT_COURSE_SOURCE_SCOPE.to_owned(),
+                    id: course.group_id.clone(),
+                },
+                name: course.group_name.clone(),
+            })
+            .collect();
+        Ok(Self {
+            courses,
+            records,
+            observation,
+            observed_at: Utc::now(),
+        })
+    }
+
     pub fn courses(&self) -> &[SourceCourse] {
         &self.courses
+    }
+
+    /// Validated, source-native values. In particular, timetable values and
+    /// children have not been interpreted.
+    pub fn records(&self) -> &[WebClassCourse] {
+        &self.records
     }
 
     pub fn observation(&self) -> &WebClassCourseListObservation {
@@ -252,6 +290,58 @@ impl AcquiredWebClassCourses {
     pub fn observed_at(&self) -> DateTime<Utc> {
         self.observed_at
     }
+}
+
+/// Redacted diagnostics for a list-only WebClass acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebClassCourseListError {
+    Authentication(HoseiAuthError),
+    Fetch(WebClassHttpError),
+    Parse(WebClassParseError),
+    Limit,
+    Validation(ObservationValidationError),
+}
+
+impl From<HoseiAuthError> for WebClassCourseListError {
+    fn from(error: HoseiAuthError) -> Self {
+        Self::Authentication(error)
+    }
+}
+
+impl From<WebClassCourseListError> for WebClassSyncError {
+    fn from(error: WebClassCourseListError) -> Self {
+        match error {
+            WebClassCourseListError::Authentication(_) => Self::Fetch,
+            WebClassCourseListError::Fetch(error) => webclass_fetch_error(error),
+            WebClassCourseListError::Parse(_) => Self::Parse,
+            WebClassCourseListError::Limit | WebClassCourseListError::Validation(_) => {
+                Self::CourseValidation
+            }
+        }
+    }
+}
+
+impl fmt::Display for WebClassCourseListError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authentication(error) => error.fmt(f),
+            Self::Fetch(error) => error.fmt(f),
+            Self::Parse(error) => error.fmt(f),
+            Self::Limit => f.write_str("WebClass course list exceeded acquisition limits"),
+            Self::Validation(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for WebClassCourseListError {}
+
+/// Use the new session's course-list GET for both authentication verification
+/// and acquisition. Does not fetch contents, persist state or retry a failed login.
+pub fn login_and_acquire_webclass_courses(
+    authenticator: &HoseiAuthenticator,
+    credentials: HoseiCredentials<'_>,
+) -> Result<AcquiredWebClassCourses, WebClassCourseListError> {
+    authenticator.login_with_course_check(credentials, |client| acquire_webclass_courses(&client))
 }
 
 /// One pass over the course list in response order. On failure, earlier groups
@@ -357,35 +447,15 @@ pub(super) enum WebClassEvent<'a> {
 
 pub(super) fn acquire_webclass_courses(
     client: &WebClassClient,
-) -> Result<AcquiredWebClassCourses, WebClassSyncError> {
-    let raw = client.fetch_courses_json().map_err(webclass_fetch_error)?;
-    let courses = parse_courses(&raw).map_err(|_| WebClassSyncError::Parse)?;
+) -> Result<AcquiredWebClassCourses, WebClassCourseListError> {
+    let raw = client
+        .fetch_courses_json()
+        .map_err(WebClassCourseListError::Fetch)?;
+    let records = parse_courses(&raw).map_err(WebClassCourseListError::Parse)?;
     client
-        .check_sync_courses(courses.len())
-        .map_err(|_| WebClassSyncError::CourseValidation)?;
-    let observation = WebClassCourseListObservation::try_new(
-        courses
-            .iter()
-            .map(|course| course.group_id.clone())
-            .collect(),
-    )
-    .map_err(|_| WebClassSyncError::CourseValidation)?;
-    let observed_at = Utc::now();
-    Ok(AcquiredWebClassCourses {
-        courses: courses
-            .into_iter()
-            .map(|course| SourceCourse {
-                external_key: ExternalRecordKey {
-                    origin: OriginKind::WebClass,
-                    scope: DEFAULT_COURSE_SOURCE_SCOPE.to_owned(),
-                    id: course.group_id,
-                },
-                name: course.group_name,
-            })
-            .collect(),
-        observation,
-        observed_at,
-    })
+        .check_sync_courses(records.len())
+        .map_err(|_| WebClassCourseListError::Limit)?;
+    AcquiredWebClassCourses::from_records(records).map_err(WebClassCourseListError::Validation)
 }
 
 pub(super) fn visit_webclass_groups(
@@ -412,7 +482,7 @@ pub fn acquire_webclass_once(client: &WebClassClient) -> WebClassAcquisitionAtte
             return WebClassAcquisitionAttempt {
                 course_list: None,
                 groups: Vec::new(),
-                result: Err(error),
+                result: Err(error.into()),
             };
         }
     };

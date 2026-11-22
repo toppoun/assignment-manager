@@ -18,6 +18,8 @@ mod notion_courses;
 mod tests;
 mod trial;
 mod university;
+#[cfg(windows)]
+mod windows_dialog;
 
 use std::{
     fs::File,
@@ -36,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
-const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nWebClass: university-check webclass --courses-only --allow-university-read [--review-local]\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], university-check webclass --courses-only --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 #[cfg(feature = "synthetic-https-fixture")]
 const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)\nMoodle plan: sync moodle --dry-run --fixture\nNotion verification preview: --config PATH sync moodle --dry-run --fixture --allow-notion-read --target ASSIGNMENTS_ID --courses COURSES_ID --reader BOT_ID";
 
@@ -81,6 +83,10 @@ enum Command {
         require_windows_vpn: bool,
         review_local: bool,
     },
+    UniversityWebClass {
+        fixture: bool,
+        review_local: bool,
+    },
     UniversityFixture,
     UniversityReviewFixture,
     NotionTrial(String, trial::Command),
@@ -101,6 +107,7 @@ impl Command {
                 Self::NotionFixturePreview
                     | Self::UniversityFixture
                     | Self::UniversityReviewFixture
+                    | Self::UniversityWebClass { fixture: true, .. }
                     | Self::MoodleFixturePlan
                     | Self::MoodleNotionPlan { .. }
             )
@@ -229,6 +236,16 @@ impl Arguments {
             }
             ["university-check", "--fixture"] => Command::UniversityFixture,
             ["university-check", "--fixture", "--review-local"] => Command::UniversityReviewFixture,
+            [
+                "university-check",
+                "webclass",
+                "--courses-only",
+                mode @ ("--allow-university-read" | "--fixture"),
+                rest @ ..,
+            ] if matches!(rest, [] | ["--review-local"]) => Command::UniversityWebClass {
+                fixture: *mode == "--fixture",
+                review_local: !rest.is_empty(),
+            },
             ["sync", "--dry-run", "--fixture", "--allow-notion-read"] => {
                 Command::NotionFixturePreview
             }
@@ -245,7 +262,9 @@ impl Arguments {
             && (command.uses_fixture()
                 || matches!(
                     command,
-                    Command::UniversityFixture | Command::UniversityReviewFixture
+                    Command::UniversityFixture
+                        | Command::UniversityReviewFixture
+                        | Command::UniversityWebClass { fixture: true, .. }
                 ))
         {
             return Err(CliError::Usage);
@@ -795,6 +814,22 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             require_windows_vpn,
             review_local,
         );
+    }
+    if let Command::UniversityWebClass {
+        fixture,
+        review_local,
+    } = args.command
+    {
+        #[cfg(feature = "synthetic-https-fixture")]
+        if fixture {
+            return Ok(university::webclass::fixture(review_local));
+        }
+        let _ = fixture; // Fixture commands are rejected above in a normal build.
+        let path = match args.config {
+            Some(path) => path,
+            None => config::root()?.join("config.json"),
+        };
+        return university::webclass::check(&Config::read(&path)?, review_local);
     }
     let root = config::root()?;
     if args.command.uses_fixture() {

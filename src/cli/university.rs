@@ -7,6 +7,8 @@ use assignment_manager::{
 
 use super::{CliError, Config, CredentialStatus, config::Moodle, credentials};
 
+pub(super) mod webclass;
+
 pub(super) fn moodle(
     config: &Config,
     config_dir: &std::path::Path,

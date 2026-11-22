@@ -6,12 +6,12 @@ use crate::{
     import::{AssignmentCandidate, ExternalRecordKey, OriginKind},
     moodle_http::{MoodleExportKind, MoodleFeed},
     notion::{self, DeferredReason, NotionSnapshot, PlanAction, SyncInput},
-    observation::SyncScope,
+    observation::{ObservationValidationError, SyncScope},
     persistence::SqliteStore,
     secured_sync::SecuredSyncClients,
     sync::{
-        self, MoodleSyncError, SourceCourse, WebClassCredentialProvider, WebClassReauthSyncError,
-        WebClassSyncError,
+        self, AcquiredWebClassCourses, MoodleSyncError, SourceCourse, WebClassCourseListError,
+        WebClassCredentialProvider, WebClassReauthSyncError, WebClassSyncError,
     },
     university_network::NetworkError,
 };
@@ -184,6 +184,169 @@ fn finish_all(servers: Vec<JoinHandle<TcpListener>>) {
     for server in servers {
         finish(server);
     }
+}
+
+fn acquire_only_courses(
+    response: Exchange,
+) -> Result<AcquiredWebClassCourses, WebClassCourseListError> {
+    let mut fixture = flow();
+    // The only allowed API request is the course GET at the end of login.
+    *fixture.exchanges[2].last_mut().unwrap() = response.cookie("wc_test", "synthetic-cookie");
+    let (mut clients, servers, _) = start(fixture, vec![]);
+    clients.begin_run();
+    let result = sync::login_and_acquire_webclass_courses(
+        &clients.authenticator(),
+        HoseiCredentials::new(STUDENT, PASSWORD),
+    );
+    finish_all(servers);
+    result
+}
+
+#[test]
+fn course_only_login_uses_one_get_and_preserves_metadata_with_reordered_rows() {
+    let original = include_str!("../fixtures/webclass/courses_edge_cases.json");
+    let mut rows: Vec<Value> = serde_json::from_str(original).unwrap();
+    rows[1]["group_name_en"] = Value::String("Two-period seminar".to_owned());
+    // Keep unknown source values as-is, including an empty day.
+    rows[1]["day_of_week"] = Value::String(String::new());
+    let acquire = |rows: &[Value]| {
+        acquire_only_courses(
+            Exchange::new("GET", COURSES, 200, &serde_json::to_string(rows).unwrap())
+                .json_response(),
+        )
+        .unwrap()
+    };
+    let list = acquire(&rows);
+    rows.reverse();
+    let reordered = acquire(&rows);
+    assert_eq!(list.records().len(), 3);
+    assert_eq!(list.records()[0].group_id, "fixture-course-004");
+    assert_eq!(reordered.records()[0].group_id, "fixture-course-006");
+    for (record, course) in list.records().iter().zip(list.courses()) {
+        assert_eq!(course.external_key.id, record.group_id);
+        assert_eq!(course.name, record.group_name);
+        assert_eq!(
+            reordered
+                .records()
+                .iter()
+                .find(|row| row.group_id == record.group_id),
+            Some(record)
+        );
+        assert!(
+            reordered
+                .courses()
+                .iter()
+                .any(|row| row.external_key == course.external_key)
+        );
+    }
+    let course = &list.records()[1];
+    assert_eq!(course.group_name, "複数時限演習");
+    assert_eq!(course.year, 2026);
+    assert_eq!(course.semester, "2");
+    assert_eq!(course.day_of_week, "");
+    assert_eq!(course.class_order, "1");
+    assert_eq!(course.group_name_en.as_deref(), Some("Two-period seminar"));
+    assert!(course.children.starts_with("a:1:"));
+    assert_eq!(list.records()[0].day_of_week, "0");
+    assert_eq!(list.records()[0].group_name_en, None);
+    let debug = format!("{list:?}");
+    assert!(!debug.contains(&course.group_id));
+    assert!(!debug.contains(&course.group_name));
+}
+
+#[test]
+fn course_only_login_detects_empty_invalid_or_incomplete_lists_without_retry() {
+    use crate::webclass_http::WebClassHttpError;
+    use WebClassCourseListError::{Fetch, Limit, Parse, Validation};
+    use serde_json::error::Category;
+
+    let get = |status, body: &str| Exchange::new("GET", COURSES, status, body).json_response();
+    assert!(
+        acquire_only_courses(get(200, "[]"))
+            .unwrap()
+            .records()
+            .is_empty()
+    );
+    for (response, expected) in [
+        (get(206, "[]"), Fetch(WebClassHttpError::IncompleteResponse)),
+        (
+            get(200, "[]").response_header("Content-Range", "items 0-1/3"),
+            Fetch(WebClassHttpError::IncompleteResponse),
+        ),
+        (
+            get(200, "[]").response_header("Link", "</fixture-next>; rel=next"),
+            Fetch(WebClassHttpError::IncompleteResponse),
+        ),
+        (
+            Exchange::redirect("GET", COURSES, "/webclass/login.php"),
+            Fetch(WebClassHttpError::AuthExpired),
+        ),
+        (
+            Exchange::new("GET", COURSES, 200, "<html>Unexpected page</html>"),
+            Fetch(WebClassHttpError::UnexpectedResponse),
+        ),
+    ] {
+        assert_eq!(acquire_only_courses(response).unwrap_err(), expected);
+    }
+    for (body, category) in [
+        ("[!", Category::Syntax),
+        ("[", Category::Eof),
+        (r#"{"courses":[]}"#, Category::Data),
+        (r#"[{"group_id":"fixture-course-001"}]"#, Category::Data),
+        (
+            r#"[["g","Course",2026,"2","1","4","",null]]"#,
+            Category::Data,
+        ),
+    ] {
+        assert!(matches!(
+            acquire_only_courses(get(200, body)),
+            Err(Parse(error)) if error.category == category
+        ));
+    }
+
+    let mut rows: Vec<Value> = serde_json::from_str(COURSE_DATA).unwrap();
+    rows[1]["group_id"] = rows[0]["group_id"].clone();
+    assert_eq!(
+        acquire_only_courses(get(200, &serde_json::to_string(&rows).unwrap())).unwrap_err(),
+        Validation(ObservationValidationError::DuplicateIdentity)
+    );
+    rows[1]["group_id"] = Value::String(" \t ".to_owned());
+    assert_eq!(
+        acquire_only_courses(get(200, &serde_json::to_string(&rows).unwrap())).unwrap_err(),
+        Validation(ObservationValidationError::EmptyIdentity)
+    );
+    let mut rows = vec![rows.remove(0); crate::university_network::MAX_COURSES + 1];
+    for (index, row) in rows.iter_mut().enumerate() {
+        row["group_id"] = Value::String(format!("fixture-course-{index}"));
+    }
+    assert_eq!(
+        acquire_only_courses(get(200, &serde_json::to_string(&rows).unwrap())).unwrap_err(),
+        Limit
+    );
+}
+
+#[test]
+fn course_only_login_stops_at_rejected_authentication_without_calling_the_api() {
+    let mut fixture = flow();
+    fixture.exchanges[0].truncate(1);
+    fixture.exchanges[1].truncate(3);
+    fixture.exchanges[1][2].status = 401;
+    fixture.exchanges[2].clear();
+    let (mut clients, servers, _) = start(fixture, vec![]);
+    clients.begin_run();
+    let error = sync::login_and_acquire_webclass_courses(
+        &clients.authenticator(),
+        HoseiCredentials::new(STUDENT, PASSWORD),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        WebClassCourseListError::Authentication(HoseiAuthError::HttpStatus(
+            AuthStep::OpenAmCredentials,
+            StatusCode::UNAUTHORIZED,
+        ))
+    );
+    finish_all(servers);
 }
 fn moodle_response(status: u16) -> Exchange {
     Exchange::new(

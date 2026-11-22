@@ -215,21 +215,31 @@ impl HoseiAuthenticator {
         &self,
         credentials: HoseiCredentials<'_>,
     ) -> Result<WebClassClient, HoseiAuthError> {
+        self.login_with_course_check(credentials, Self::verify_courses)
+    }
+
+    /// The caller verifies the new session with its courses request. Keep this
+    /// internal so an unverified client cannot be returned through the public API.
+    pub(crate) fn login_with_course_check<T, E: From<HoseiAuthError>>(
+        &self,
+        credentials: HoseiCredentials<'_>,
+        check: impl FnOnce(WebClassClient) -> Result<T, E>,
+    ) -> Result<T, E> {
         #[cfg(feature = "synthetic-https-fixture")]
         if self.policy.as_ref().is_some_and(|p| p.synthetic.is_some())
             && (credentials.university_id != synthetic::UNIVERSITY_ID
                 || credentials.password != synthetic::UNIVERSITY_PASSWORD)
         {
-            return Err(HoseiAuthError::ClientInitialization);
+            return Err(HoseiAuthError::ClientInitialization.into());
         }
         #[cfg(any(test, feature = "synthetic-https-fixture"))]
         if let Some(endpoints) = &self.test_endpoints {
-            return self.login_with_endpoints(credentials, endpoints);
+            return check(self.connect_webclass(credentials, endpoints)?);
         }
-        self.login_with_endpoints(credentials, &AuthEndpoints::production())
+        check(self.connect_webclass(credentials, &AuthEndpoints::production())?)
     }
 
-    fn login_with_endpoints(
+    fn connect_webclass(
         &self,
         credentials: HoseiCredentials<'_>,
         endpoints: &AuthEndpoints,
@@ -264,6 +274,10 @@ impl HoseiAuthenticator {
             client.set_test_origin(endpoints.webclass.clone());
             client
         };
+        Ok(client)
+    }
+
+    fn verify_courses(client: WebClassClient) -> Result<WebClassClient, HoseiAuthError> {
         let body = client.fetch_courses_json().map_err(|error| match error {
             WebClassHttpError::Timeout => HoseiAuthError::Timeout(AuthStep::ApiVerification),
             WebClassHttpError::Request => HoseiAuthError::Request(AuthStep::ApiVerification),

@@ -27,6 +27,7 @@ pub enum WebClassHttpError {
     HttpStatus(StatusCode),
     BodyRead,
     BodyDecode,
+    IncompleteResponse,
     UnexpectedResponse,
 }
 
@@ -39,6 +40,7 @@ impl fmt::Display for WebClassHttpError {
             Self::HttpStatus(status) => write!(f, "WebClass API returned HTTP {status}"),
             Self::BodyRead => write!(f, "could not read WebClass API response"),
             Self::BodyDecode => write!(f, "WebClass API response is not UTF-8"),
+            Self::IncompleteResponse => write!(f, "incomplete WebClass API response"),
             Self::UnexpectedResponse => write!(f, "unexpected WebClass API response"),
         }
     }
@@ -149,10 +151,13 @@ impl WebClassClient {
         }
         // Only a complete array per request is supported. A link or range may
         // describe data outside it, so fail without following the link.
-        if status != StatusCode::OK
+        if status == StatusCode::PARTIAL_CONTENT
             || response.headers().contains_key(CONTENT_RANGE)
             || response.headers().contains_key(LINK)
         {
+            return Err(WebClassHttpError::IncompleteResponse);
+        }
+        if status != StatusCode::OK {
             return Err(WebClassHttpError::UnexpectedResponse);
         }
 
@@ -655,6 +660,7 @@ mod tests {
             WebClassHttpError::HttpStatus(StatusCode::INTERNAL_SERVER_ERROR),
             WebClassHttpError::BodyRead,
             WebClassHttpError::BodyDecode,
+            WebClassHttpError::IncompleteResponse,
             WebClassHttpError::UnexpectedResponse,
         ] {
             assert_secret_free(error);

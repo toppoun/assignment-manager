@@ -60,6 +60,34 @@ cargo run --locked --offline --features synthetic-https-fixture -- university-ch
 Moodleの実データ読み取り手順、WebClassの認証上の制約、両OSの検証条件は
 [Notion同期 Phase 4A](docs/NOTION-SYNC-PHASE-4A.md)を参照してください。
 
+### WebClassの授業一覧だけを確認する
+
+固定ループバックの合成HTTPSで、認証から授業一覧の検証まで確認できます。
+Windowsで値を確認する場合は末尾に `--review-local` を付けます。
+
+```powershell
+cargo run --locked --offline --features synthetic-https-fixture -- university-check webclass --courses-only --fixture
+cargo run --locked --offline --features synthetic-https-fixture -- university-check webclass --courses-only --fixture --review-local
+```
+
+通常の出力は件数と検証結果です。Windowsの読み取り専用画面には、選択した授業の
+ID・名称・年度・学期・曜日・時限・英語名が表示されます。曜日・時限は取得値を
+表示し、`0` や空欄の意味を推定しません。空の一覧は `validation=empty` と終了コード
+`1` で区別します。取得結果やレシートは保存しません。
+
+実環境での初回試験は、現行の通信先と認証フロー、必要時の同意操作を確認し、その
+通信範囲が別途承認された後に行います。既存設定の `webclass` が有効で、対応する
+CLI用WebClass資格情報がOSのストアに登録済みであることが前提です。
+
+```powershell
+cargo run --locked --offline -- --config PATH university-check webclass --courses-only --allow-university-read --review-local
+```
+
+実環境用の指定では、既存SSOの認証POSTと授業一覧のGET 1回が発生します。課題取得、
+Moodle、Notionへの接続はありません。未知の通信先・認証画面、認証失敗、空・不完全な
+応答、形式変更、件数上限超過があれば停止し、一覧に見当たらない授業を履修対象外と
+判断する前に大学画面と照合してください。
+
 ### macOSでのビルドとローカル検証
 
 Xcode Command Line ToolsとRustを入れ、初回は `cargo fetch --locked --target "$(rustc --print host-tuple)"` で依存関係を取得します。

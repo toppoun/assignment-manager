@@ -1,14 +1,13 @@
-use chrono::Utc;
-
 use super::*;
 use crate::{
     domain::SubmissionTarget,
     import::AssignmentCandidateBatch,
-    observation::{AssignmentObservation, WebClassCourseListObservation},
+    observation::AssignmentObservation,
     sync::{
         AcquiredAssignments, AcquiredWebClassCourses, SourceCourse, WebClassAcquisitionAttempt,
         WebClassReauthSyncError, WebClassSyncError,
     },
+    webclass::WebClassCourse,
 };
 
 const FEED: &str = "default.course-related";
@@ -104,20 +103,24 @@ fn attempt(
     result: Result<(), WebClassSyncError>,
 ) -> WebClassAcquisitionAttempt {
     WebClassAcquisitionAttempt {
-        course_list: Some(AcquiredWebClassCourses {
-            courses: course_ids
-                .iter()
-                .map(|id| SourceCourse {
-                    external_key: external(OriginKind::WebClass, DEFAULT_COURSE_SOURCE_SCOPE, id),
-                    name: "Synthetic course".into(),
-                })
-                .collect(),
-            observation: WebClassCourseListObservation::try_new(
-                course_ids.iter().map(|id| (*id).into()).collect(),
+        course_list: Some(
+            AcquiredWebClassCourses::from_records(
+                course_ids
+                    .iter()
+                    .map(|id| WebClassCourse {
+                        group_id: (*id).into(),
+                        group_name: "Synthetic course".into(),
+                        year: 2026,
+                        semester: "2".into(),
+                        day_of_week: "0".into(),
+                        class_order: "0".into(),
+                        children: String::new(),
+                        group_name_en: None,
+                    })
+                    .collect(),
             )
             .unwrap(),
-            observed_at: Utc::now(),
-        }),
+        ),
         groups,
         result,
     }

@@ -13,7 +13,7 @@ use crate::import::{
 };
 
 /// WebClass course data. These external fields are not application course IDs or schedule entries.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct WebClassCourse {
     pub group_id: String,
     pub group_name: String,
@@ -25,6 +25,12 @@ pub struct WebClassCourse {
     pub children: String,
     /// The fixtures contain both null and an empty string.
     pub group_name_en: Option<String>,
+}
+
+impl fmt::Debug for WebClassCourse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebClassCourse").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -79,7 +85,14 @@ impl Error for WebClassParseError {}
 
 /// Unknown fields are ignored, while malformed JSON and missing required fields fail parsing.
 pub fn parse_courses(json: &str) -> Result<Vec<WebClassCourse>, WebClassParseError> {
-    serde_json::from_str(json).map_err(WebClassParseError::from)
+    #[derive(Deserialize)]
+    struct CourseObject {
+        #[serde(flatten)]
+        course: WebClassCourse,
+    }
+
+    let rows: Vec<CourseObject> = serde_json::from_str(json)?;
+    Ok(rows.into_iter().map(|row| row.course).collect())
 }
 
 /// Unknown contents kinds are retained so classification can make an explicit decision.

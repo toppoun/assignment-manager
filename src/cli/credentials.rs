@@ -1,4 +1,5 @@
 use super::config::Config;
+use assignment_manager::webclass_auth::HoseiCredentials;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -95,6 +96,14 @@ pub(super) fn moodle_url(_: &str) -> Result<zeroize::Zeroizing<String>, Credenti
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
+pub(super) fn with_webclass_credentials<T>(
+    _: &str,
+    _: impl FnOnce(HoseiCredentials<'_>) -> T,
+) -> Result<T, CredentialStatus> {
+    Err(CredentialStatus::Unavailable)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn notion_client(
     _: &str,
 ) -> Result<assignment_manager::notion::NotionClient, CredentialStatus> {
@@ -102,7 +111,7 @@ pub(super) fn notion_client(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub(super) use native::{lookup, moodle_url, notion_client, register};
+pub(super) use native::{lookup, moodle_url, notion_client, register, with_webclass_credentials};
 
 #[cfg(windows)]
 pub(super) use native::trial_client;
@@ -122,7 +131,7 @@ mod native {
     use serde::{Deserialize, Deserializer};
     use zeroize::Zeroizing;
 
-    use super::{Config, CredentialStatus, Kind};
+    use super::{Config, CredentialStatus, HoseiCredentials, Kind};
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -131,6 +140,17 @@ mod native {
         university_id: Zeroizing<String>,
         #[serde(deserialize_with = "secret")]
         password: Zeroizing<String>,
+    }
+
+    impl Pair {
+        fn decode(bytes: &[u8]) -> Result<Self, CredentialStatus> {
+            let pair: Self =
+                serde_json::from_slice(bytes).map_err(|_| CredentialStatus::Invalid)?;
+            if pair.university_id.trim().is_empty() || pair.password.trim().is_empty() {
+                return Err(CredentialStatus::Invalid);
+            }
+            Ok(pair)
+        }
     }
 
     fn secret<'de, D: Deserializer<'de>>(de: D) -> Result<Zeroizing<String>, D::Error> {
@@ -177,6 +197,19 @@ mod native {
         let bytes = read_secret(&service_name(target), Kind::Moodle.code())?;
         let url = std::str::from_utf8(&bytes).map_err(|_| CredentialStatus::Invalid)?;
         Ok(Zeroizing::new(url.to_owned()))
+    }
+
+    pub(in crate::cli) fn with_webclass_credentials<T>(
+        target: &str,
+        use_credentials: impl FnOnce(HoseiCredentials<'_>) -> T,
+    ) -> Result<T, CredentialStatus> {
+        let bytes = read_secret(&service_name(target), Kind::WebClass.code())?;
+        let pair = Pair::decode(&bytes)?;
+        drop(bytes);
+        Ok(use_credentials(HoseiCredentials::new(
+            &pair.university_id,
+            &pair.password,
+        )))
     }
 
     fn trial_item(
@@ -288,9 +321,7 @@ mod native {
                 .zip(std::str::from_utf8(bytes).ok())
                 .is_some_and(|(policy, url)| policy.validate_moodle_url(url).is_ok()),
             Kind::Notion => !bytes.is_empty() && bytes.iter().all(u8::is_ascii_graphic),
-            Kind::WebClass => serde_json::from_slice::<Pair>(bytes).is_ok_and(|pair| {
-                !pair.university_id.trim().is_empty() && !pair.password.trim().is_empty()
-            }),
+            Kind::WebClass => Pair::decode(bytes).is_ok(),
         }
     }
 
