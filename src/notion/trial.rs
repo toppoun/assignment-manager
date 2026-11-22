@@ -21,6 +21,14 @@ pub(super) const PRODUCTION_DATA_SOURCES: [&str; 2] = [
     "41d85934-7e84-815d-bab8-000b9dbad959",
 ];
 
+const MOODLE_VERIFICATION_ASSIGNMENTS: &str = "41e85934-7e84-817e-b1d2-000b68726503";
+const MOODLE_VERIFICATION_COURSES: &str = "41e85934-7e84-81df-902b-000bbece9bf7";
+const MOODLE_VERIFICATION_READER: &str = "41e85934-7e84-81d8-9891-00275cb3050f";
+pub(super) const MOODLE_TRIAL_COURSES: [(&str, &str); 2] = [
+    ("照合用の授業", "41e85934-7e84-81c4-8ae6-ec4fcaea84d0"),
+    ("別の合成授業", "41e85934-7e84-8172-93b3-f4885b1efc7b"),
+];
+
 pub(super) const MANAGED_PROPERTIES: [(&str, &str, &str); 4] = [
     ("status", "状態", "status"),
     ("priority", "優先度", "select"),
@@ -57,20 +65,11 @@ pub struct MoodleCreateTarget {
 #[cfg(feature = "synthetic-https-fixture")]
 impl MoodleCreateTarget {
     pub fn new(notion: NotionTarget, writer: &str) -> Result<Self, NotionError> {
-        const ASSIGNMENTS: &str = "41e85934-7e84-817e-b1d2-000b68726503";
-        const COURSES: &str = "41e85934-7e84-81df-902b-000bbece9bf7";
-        const READER: &str = "41e85934-7e84-81d8-9891-00275cb3050f";
-        let (_, courses) = notion.ids()?;
-        if courses != COURSES {
-            return Err(NotionError::MethodDisabled);
-        }
-        let trial = TrialTarget::new(notion, ASSIGNMENTS, READER, writer)?;
+        let verification = VerificationTarget::moodle_integration(notion)?;
+        let trial = TrialTarget::from_verification(verification, writer)?;
         Ok(Self {
             trial,
-            course_pages: [
-                ("照合用の授業", "41e85934-7e84-81c4-8ae6-ec4fcaea84d0"),
-                ("別の合成授業", "41e85934-7e84-8172-93b3-f4885b1efc7b"),
-            ],
+            course_pages: MOODLE_TRIAL_COURSES,
         })
     }
 
@@ -102,6 +101,13 @@ impl TrialTarget {
     ) -> Result<Self, NotionError> {
         let courses = notion.courses_data_source_id.clone();
         let verification = VerificationTarget::new(notion, selected, &courses, read_bot)?;
+        Self::from_verification(verification, write_bot)
+    }
+
+    fn from_verification(
+        verification: VerificationTarget,
+        write_bot: &str,
+    ) -> Result<Self, NotionError> {
         let write_bot = uuid(write_bot).ok_or(NotionError::Configuration)?;
         if verification.read_bot == write_bot {
             return Err(NotionError::Configuration);
@@ -129,6 +135,15 @@ impl TrialTarget {
 }
 
 impl VerificationTarget {
+    pub fn moodle_integration(notion: NotionTarget) -> Result<Self, NotionError> {
+        Self::new(
+            notion,
+            MOODLE_VERIFICATION_ASSIGNMENTS,
+            MOODLE_VERIFICATION_COURSES,
+            MOODLE_VERIFICATION_READER,
+        )
+    }
+
     pub fn new(
         notion: NotionTarget,
         selected_assignments: &str,

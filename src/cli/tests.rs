@@ -5,6 +5,52 @@ fn parse(words: &[&str]) -> Result<Arguments, CliError> {
     Arguments::parse(&words.iter().map(|word| (*word).into()).collect::<Vec<_>>())
 }
 
+#[cfg(windows)]
+#[test]
+fn integration_cli_requires_explicit_dual_read_permissions_and_network_route() {
+    let base = [
+        "--config",
+        "live-notion.json",
+        "sync",
+        "moodle",
+        "--dry-run",
+        "--moodle-config",
+        "moodle.json",
+    ];
+    for (route, vpn) in [("--require-windows-vpn", true), ("--on-campus", false)] {
+        let args = parse(
+            &[
+                base.as_slice(),
+                &["--allow-university-read", route, "--allow-notion-read"],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            args.command,
+            Command::MoodleIntegration {
+                moodle_config: PathBuf::from("moodle.json"),
+                require_windows_vpn: vpn
+            }
+        );
+    }
+    for tail in [
+        &["--require-windows-vpn", "--allow-notion-read"][..],
+        &["--allow-university-read", "--allow-notion-read"],
+        &["--allow-university-read", "--require-windows-vpn"],
+        &[
+            "--allow-university-read",
+            "--require-windows-vpn",
+            "--allow-notion-write",
+        ],
+    ] {
+        assert_eq!(
+            parse(&[base.as_slice(), tail].concat()),
+            Err(CliError::Usage)
+        );
+    }
+}
+
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
 #[test]
 fn moodle_create_trial_cli_requires_a_single_uid_and_has_no_bulk_mode() {

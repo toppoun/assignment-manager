@@ -1,4 +1,6 @@
 mod apply_tests;
+#[cfg(feature = "synthetic-https-fixture")]
+mod moodle_integration;
 pub(super) mod trial_tests;
 
 use std::{

@@ -1,0 +1,28 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Synthetic//Moodle Integration Fixture//EN
+BEGIN:VEVENT
+UID:integration-new@example.invalid
+SUMMARY:統合試験の新規活動の提出期限
+CATEGORIES:統合試験 A
+DTSTART:20261123T150000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:integration-title@example.invalid
+SUMMARY:統合試験の名称更新の提出期限
+CATEGORIES:統合試験 A
+DTSTART:20261124T150000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:integration-due@example.invalid
+SUMMARY:統合試験の期限更新の提出期限
+CATEGORIES:統合試験 B
+DTSTART:20261125T150000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:integration-match@example.invalid
+SUMMARY:統合試験の一致活動の受験可能期間の終了
+CATEGORIES:統合試験 B
+DTSTART:20261126T150000Z
+END:VEVENT
+END:VCALENDAR

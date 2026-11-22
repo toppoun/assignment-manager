@@ -2,6 +2,8 @@ mod config;
 mod credentials;
 #[cfg(feature = "synthetic-https-fixture")]
 mod fixture_run;
+#[cfg(windows)]
+mod moodle_integration;
 #[cfg(feature = "synthetic-https-fixture")]
 mod moodle_plan;
 #[cfg(windows)]
@@ -49,6 +51,11 @@ enum Command {
         assignments: String,
         courses: String,
         reader: String,
+    },
+    #[cfg(windows)]
+    MoodleIntegration {
+        moodle_config: PathBuf,
+        require_windows_vpn: bool,
     },
     #[cfg(all(windows, feature = "synthetic-https-fixture"))]
     MoodleCreateTrial {
@@ -112,6 +119,22 @@ impl Arguments {
             ["status", "--fixture"] => Command::Status(true),
             ["sync", "--dry-run"] => Command::Sync(false),
             ["sync", "--dry-run", "--fixture"] => Command::Sync(true),
+            #[cfg(windows)]
+            [
+                "sync",
+                "moodle",
+                "--dry-run",
+                "--moodle-config",
+                path,
+                "--allow-university-read",
+                route @ ("--require-windows-vpn" | "--on-campus"),
+                "--allow-notion-read",
+            ] if config.is_some() && !path.is_empty() && !path.starts_with("--") => {
+                Command::MoodleIntegration {
+                    moodle_config: PathBuf::from(path),
+                    require_windows_vpn: *route == "--require-windows-vpn",
+                }
+            }
             ["sync", "moodle", "--dry-run", "--fixture"] if config.is_none() => {
                 Command::MoodleFixturePlan
             }
@@ -202,7 +225,7 @@ enum CliError {
     MoodlePlanAcquisition,
     #[cfg(feature = "synthetic-https-fixture")]
     MoodlePlanEmpty,
-    #[cfg(feature = "synthetic-https-fixture")]
+    #[cfg(any(windows, feature = "synthetic-https-fixture"))]
     MoodlePlanNotion(NotionError),
     Receipt,
 }
@@ -238,7 +261,7 @@ impl CliError {
             Self::MoodlePlanAcquisition => "moodle_acquisition_failed",
             #[cfg(feature = "synthetic-https-fixture")]
             Self::MoodlePlanEmpty => "moodle_no_candidates",
-            #[cfg(feature = "synthetic-https-fixture")]
+            #[cfg(any(windows, feature = "synthetic-https-fixture"))]
             Self::MoodlePlanNotion(error) => notion_diagnosis(*error),
             Self::Receipt => "receipt_unavailable",
         }
@@ -486,6 +509,7 @@ fn notion_diagnosis(error: NotionError) -> &'static str {
         NotionError::Forbidden => "forbidden",
         NotionError::NotFound => "not_found_or_not_shared",
         NotionError::SchemaMismatch => "schema_mismatch",
+        NotionError::CourseMappingOutsideTarget => "course_mapping_outside_verification",
         NotionError::Timeout => "timeout",
         NotionError::RateLimited => "rate_limited",
         NotionError::Overloaded => "overloaded",
@@ -621,6 +645,10 @@ fn run_fixture(_: Command, _: PathBuf) -> Result<u8, CliError> {
 fn execute(args: Arguments) -> Result<u8, CliError> {
     if args.command == Command::Help {
         println!("{USAGE}");
+        #[cfg(windows)]
+        println!(
+            "Moodle integration: --config NOTION_CONFIG sync moodle --dry-run --moodle-config MOODLE_CONFIG --allow-university-read [--require-windows-vpn | --on-campus] --allow-notion-read"
+        );
         #[cfg(feature = "synthetic-https-fixture")]
         println!("{APPLY_USAGE}");
         #[cfg(all(windows, feature = "synthetic-https-fixture"))]
@@ -628,6 +656,15 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             "Windows verification: --config PATH notion-moodle-trial --writer BOT_ID [doctor | init-state | credentials set write | --dry-run --uid UID | --allow-notion-write --uid UID | --dry-run-update --uid UID | --allow-notion-update --uid UID | reconcile --uid UID]"
         );
         return Ok(0);
+    }
+    #[cfg(windows)]
+    if let Command::MoodleIntegration {
+        moodle_config,
+        require_windows_vpn,
+    } = &args.command
+    {
+        let notion_path = args.config.as_deref().ok_or(CliError::Usage)?;
+        return moodle_integration::execute(notion_path, moodle_config, *require_windows_vpn);
     }
     // Fail before accessing local state when this is an ordinary binary.
     if args.command.needs_fixture_build() && !cfg!(feature = "synthetic-https-fixture") {

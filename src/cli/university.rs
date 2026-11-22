@@ -2,9 +2,10 @@ use assignment_manager::{
     moodle_http::{MoodleExportKind, MoodleFeed},
     secured_sync::SecuredSyncClients,
     sync::{MoodleAcquisition, MoodleSyncError, acquire_moodle_with_diagnostic},
+    university_network::NetworkPolicy,
 };
 
-use super::{CliError, Config, CredentialStatus, credentials};
+use super::{CliError, Config, CredentialStatus, config::Moodle, credentials};
 
 pub(super) fn moodle(
     config: &Config,
@@ -24,35 +25,9 @@ pub(super) fn moodle(
         .inspect_err(|_| {
             print_source("moodle", 0, Some("setup"));
         })?;
-    let policy = source.policy()?;
-    #[cfg(windows)]
-    let policy = {
-        let Some(files) = source.windows_crl.as_ref() else {
-            return Ok(crl_failure("tls_revocation_unconfirmed"));
-        };
-        match policy.with_moodle_windows_crl(
-            &config_dir.join(&files.leaf_certificate),
-            &config_dir.join(&files.issuer_certificate),
-            &config_dir.join(&files.crl),
-        ) {
-            Ok(policy) if require_windows_vpn => match policy.with_moodle_windows_vpn() {
-                Ok(policy) => policy,
-                Err(_) => return Ok(crl_failure("vpn_route_unconfirmed")),
-            },
-            Ok(policy) => policy,
-            Err(error) => return Ok(crl_failure(error.diagnostic())),
-        }
+    let Some(policy) = secured_moodle_policy(source, config_dir, require_windows_vpn)? else {
+        return Ok(finish(false));
     };
-    #[cfg(not(windows))]
-    {
-        let _ = config_dir;
-        if require_windows_vpn {
-            return Ok(crl_failure("vpn_route_unconfirmed"));
-        }
-        if source.windows_crl.is_some() {
-            return Ok(crl_failure("tls_revocation_unconfirmed"));
-        }
-    }
     #[cfg(windows)]
     if review_local {
         match super::moodle_review::confirm_fetch() {
@@ -67,18 +42,7 @@ pub(super) fn moodle(
             }
         }
     }
-    let prepare = || {
-        let url = credentials::moodle_url(&config.target_id()?).map_err(CliError::Credential)?;
-        policy
-            .validate_moodle_url(&url)
-            .map_err(|_| CliError::Credential(CredentialStatus::Invalid))?;
-        let feed = MoodleFeed::new(&source.scope, MoodleExportKind::CourseRelated, &url)
-            .map_err(|_| CliError::Credential(CredentialStatus::Invalid))?;
-        Ok((SecuredSyncClients::new(policy), feed))
-    };
-    let (mut clients, feed) = prepare().inspect_err(|_: &CliError| {
-        print_source("moodle", 0, Some("setup"));
-    })?;
+    let (mut clients, feed) = prepare_moodle_request(config, source, policy)?;
     clients.begin_run();
     let acquired = acquire_moodle_for_check(&clients, &feed);
     drop((clients, feed));
@@ -89,13 +53,69 @@ pub(super) fn moodle(
     Ok(finish(acquired.is_some()))
 }
 
-fn crl_failure(diagnostic: &'static str) -> u8 {
-    print_source("moodle", 0, Some("fetch"));
-    println!("moodle diagnostic={diagnostic}");
-    finish(false)
+pub(super) fn secured_moodle_policy(
+    source: &Moodle,
+    config_dir: &std::path::Path,
+    require_windows_vpn: bool,
+) -> Result<Option<NetworkPolicy>, CliError> {
+    let policy = source.policy()?;
+    #[cfg(windows)]
+    let policy = {
+        let Some(files) = source.windows_crl.as_ref() else {
+            return Ok(policy_failure("tls_revocation_unconfirmed"));
+        };
+        match policy.with_moodle_windows_crl(
+            &config_dir.join(&files.leaf_certificate),
+            &config_dir.join(&files.issuer_certificate),
+            &config_dir.join(&files.crl),
+        ) {
+            Ok(policy) if require_windows_vpn => match policy.with_moodle_windows_vpn() {
+                Ok(policy) => policy,
+                Err(_) => return Ok(policy_failure("vpn_route_unconfirmed")),
+            },
+            Ok(policy) => policy,
+            Err(error) => return Ok(policy_failure(error.diagnostic())),
+        }
+    };
+    #[cfg(not(windows))]
+    {
+        let _ = config_dir;
+        if require_windows_vpn {
+            return Ok(policy_failure("vpn_route_unconfirmed"));
+        }
+        if source.windows_crl.is_some() {
+            return Ok(policy_failure("tls_revocation_unconfirmed"));
+        }
+    }
+    Ok(Some(policy))
 }
 
-fn acquire_moodle_for_check(
+pub(super) fn prepare_moodle_request(
+    config: &Config,
+    source: &Moodle,
+    policy: NetworkPolicy,
+) -> Result<(SecuredSyncClients, MoodleFeed), CliError> {
+    let prepare = || {
+        let url = credentials::moodle_url(&config.target_id()?).map_err(CliError::Credential)?;
+        policy
+            .validate_moodle_url(&url)
+            .map_err(|_| CliError::Credential(CredentialStatus::Invalid))?;
+        let feed = MoodleFeed::new(&source.scope, MoodleExportKind::CourseRelated, &url)
+            .map_err(|_| CliError::Credential(CredentialStatus::Invalid))?;
+        Ok((SecuredSyncClients::new(policy), feed))
+    };
+    prepare().inspect_err(|_: &CliError| {
+        print_source("moodle", 0, Some("setup"));
+    })
+}
+
+fn policy_failure(diagnostic: &'static str) -> Option<NetworkPolicy> {
+    print_source("moodle", 0, Some("fetch"));
+    println!("moodle diagnostic={diagnostic}");
+    None
+}
+
+pub(super) fn acquire_moodle_for_check(
     clients: &SecuredSyncClients,
     feed: &MoodleFeed,
 ) -> Option<MoodleAcquisition> {

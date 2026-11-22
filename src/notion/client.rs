@@ -45,6 +45,7 @@ pub enum NotionError {
     InvalidResponse,
     IncompleteSnapshot,
     SchemaMismatch,
+    CourseMappingOutsideTarget,
     UnsupportedProperty,
     InvalidWrite,
     MethodDisabled,

@@ -87,6 +87,10 @@ impl DryRunReport {
         self.counts_where(|_| true)
     }
 
+    pub fn counts_for(&self, input: &SyncInput) -> DryRunCounts {
+        self.counts_where(|key| input.assignments().contains_key(key))
+    }
+
     pub(super) fn counts_where(&self, include: impl Fn(&SyncKey) -> bool) -> DryRunCounts {
         let mut counts = DryRunCounts::default();
         for entry in self.plan.iter().filter(|entry| include(&entry.key)) {
@@ -190,6 +194,23 @@ impl NotionClient {
         rows: &[NotionAssignment],
         mappings: &[CourseMapping],
     ) -> Result<DryRunReport, NotionError> {
+        self.plan_from_rows_with_course_check(input, schema, rows, mappings, |id| {
+            let page = self.retrieve_page(id, &[])?;
+            if checked_page_id(&page, &schema.courses_id, &schema.courses_database)? != id {
+                return Err(NotionError::InvalidResponse);
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn plan_from_rows_with_course_check(
+        &self,
+        input: &SyncInput,
+        schema: &Schema,
+        rows: &[NotionAssignment],
+        mappings: &[CourseMapping],
+        verify_course: impl Fn(&str) -> Result<(), NotionError>,
+    ) -> Result<DryRunReport, NotionError> {
         if mappings.iter().any(|mapping| !mapping.has_valid_page_id()) {
             return Err(NotionError::Configuration);
         }
@@ -203,10 +224,7 @@ impl NotionClient {
                 _ => None,
             };
             if let Some(id) = relation.filter(|id| verified.insert(*id)) {
-                let page = self.retrieve_page(id, &[])?;
-                if checked_page_id(&page, &schema.courses_id, &schema.courses_database)? != id {
-                    return Err(NotionError::InvalidResponse);
-                }
+                verify_course(id)?;
             }
             if let Some(request) = schema.prepare(entry)? {
                 requests.push(request);
@@ -248,6 +266,34 @@ impl NotionClient {
         key: Option<&SyncKey>,
     ) -> Result<Vec<NotionAssignment>, NotionError> {
         self.query_assignment_pages(schema, key, |_, row| Ok(row))
+    }
+
+    pub(super) fn query_course_page_ids(
+        &self,
+        schema: &Schema,
+    ) -> Result<HashSet<String>, NotionError> {
+        let path = format!("/v1/data_sources/{}/query", schema.courses_id);
+        let mut seen = HashSet::new();
+        paginate(
+            |cursor| {
+                let mut body = json!({"page_size":100, "result_type":"page"});
+                if let Some(cursor) = cursor {
+                    body["start_cursor"] = json!(cursor);
+                }
+                self.read(|| {
+                    self.request(Method::POST, &path, &property_filters(&["title"]))
+                        .json(&body)
+                })
+            },
+            |page| {
+                let id = checked_page_id(page, &schema.courses_id, &schema.courses_database)?;
+                if !seen.insert(id) {
+                    return Err(NotionError::IncompleteSnapshot);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(seen)
     }
 
     pub(super) fn query_assignment_pages<T>(

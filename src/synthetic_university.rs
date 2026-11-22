@@ -25,6 +25,7 @@ pub const UNIVERSITY_PASSWORD: &str = PASSWORD;
 const ICS: &str = include_str!("../fixtures/moodle/calendar_basic.ics");
 const REVIEW_ICS: &str = include_str!("../fixtures/moodle/calendar_review.ics");
 const TRIAL_UPDATE_ICS: &str = include_str!("../fixtures/moodle/calendar_trial_update.ics");
+const INTEGRATION_ICS: &str = include_str!("../fixtures/moodle/calendar_integration.ics");
 const COURSE_DATA: &str = include_str!("../fixtures/webclass/courses_basic.json");
 const CONTENT_DATA: &str = include_str!("../fixtures/webclass/contents_basic.json");
 const CONTENTS: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
@@ -36,6 +37,9 @@ pub enum Scenario {
     MoodleFailure,
     MoodleReview,
     MoodleTrialUpdate,
+    MoodleIntegration,
+    MoodleEmpty,
+    MoodleDuplicate,
     WebClassFailure,
     BothFailure,
     AuthExpiredOnce,
@@ -248,6 +252,14 @@ fn serve(
                     Scenario::BodyLimit => "x".repeat(8 * 1024 * 1024 + 1),
                     Scenario::MoodleReview => REVIEW_ICS.into(),
                     Scenario::MoodleTrialUpdate => TRIAL_UPDATE_ICS.into(),
+                    Scenario::MoodleIntegration => INTEGRATION_ICS.into(),
+                    Scenario::MoodleEmpty => {
+                        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n".into()
+                    }
+                    Scenario::MoodleDuplicate => INTEGRATION_ICS.replace(
+                        "UID:integration-title@example.invalid",
+                        "UID:integration-new@example.invalid",
+                    ),
                     _ => ICS.into(),
                 };
                 Exchange::new(

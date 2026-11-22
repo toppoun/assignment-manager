@@ -10,6 +10,10 @@ use serde_json::Value;
 mod moodle_create;
 #[cfg(feature = "synthetic-https-fixture")]
 pub use moodle_create::MoodleCreatePreview;
+mod moodle_integration;
+pub use moodle_integration::{
+    MOODLE_INTEGRATION_SCOPE, MoodlePreviewCoverage, MoodlePreviewMappings,
+};
 #[cfg(feature = "synthetic-https-fixture")]
 mod moodle_update;
 #[cfg(feature = "synthetic-https-fixture")]
@@ -175,9 +179,7 @@ impl NotionClient {
     ) -> Result<DryRunCounts, NotionError> {
         target.verify_reader(self)?;
         let plan = self.prepare_apply(input, target.retrieve_schema(self)?, mappings, state)?;
-        Ok(plan
-            .deltas
-            .counts_where(|key| input.assignments().contains_key(key)))
+        Ok(plan.deltas.counts_for(input))
     }
 
     pub fn preview_trial(
@@ -258,7 +260,18 @@ impl NotionClient {
         input: &SyncInput,
         schema: Schema,
         mappings: &[CourseMapping],
+        state: StateSummary,
+    ) -> Result<PreparedApply, NotionError> {
+        self.prepare_plan(schema, state, |schema, rows| {
+            self.plan_from_rows(input, schema, rows, mappings)
+        })
+    }
+
+    fn prepare_plan(
+        &self,
+        schema: Schema,
         mut state: StateSummary,
+        build: impl FnOnce(&Schema, &[NotionAssignment]) -> Result<DryRunReport, NotionError>,
     ) -> Result<PreparedApply, NotionError> {
         let mut pages = self.query_assignment_pages(&schema, None, |page, row| {
             Observation::new(&schema, page, row)
@@ -271,7 +284,7 @@ impl NotionClient {
             binding.page_id = Some(page.clone());
         }
         let rows: Vec<_> = pages.iter().map(|page| page.row.clone()).collect();
-        let mut deltas = self.plan_from_rows(input, &schema, &rows, mappings)?;
+        let mut deltas = build(&schema, &rows)?;
         let manual_candidates = deltas.defer_manual_candidates(&rows);
         deltas.defer_unreconciled(&state);
         let planned_keys: HashSet<_> = deltas.plan().iter().map(|entry| &entry.key).collect();
