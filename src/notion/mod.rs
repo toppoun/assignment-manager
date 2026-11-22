@@ -3,6 +3,8 @@
 mod apply;
 mod client;
 #[cfg(feature = "synthetic-https-fixture")]
+mod course_trial;
+#[cfg(feature = "synthetic-https-fixture")]
 pub mod fixture;
 #[cfg(test)]
 mod http_tests;
@@ -20,6 +22,8 @@ pub use apply::{MOODLE_INTEGRATION_SCOPE, MoodlePreviewCoverage, MoodlePreviewMa
 #[cfg(feature = "synthetic-https-fixture")]
 pub use apply::{MoodleCreatePreview, MoodleUpdatePreview};
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
+#[cfg(feature = "synthetic-https-fixture")]
+pub use course_trial::{CourseCreationTrial, CourseSnapshot, CourseTrialError};
 pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus, SnapshotSummary};
 pub use plan::{
     AssignmentPatch, ConflictReason, CourseMapping, DeferredReason, NotionAssignment,

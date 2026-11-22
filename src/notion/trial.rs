@@ -22,7 +22,7 @@ pub(super) const PRODUCTION_DATA_SOURCES: [&str; 2] = [
 ];
 
 const MOODLE_VERIFICATION_ASSIGNMENTS: &str = "41e85934-7e84-817e-b1d2-000b68726503";
-const MOODLE_VERIFICATION_COURSES: &str = "41e85934-7e84-81df-902b-000bbece9bf7";
+pub(super) const MOODLE_VERIFICATION_COURSES: &str = "41e85934-7e84-81df-902b-000bbece9bf7";
 const MOODLE_VERIFICATION_READER: &str = "41e85934-7e84-81d8-9891-00275cb3050f";
 pub(super) const MOODLE_TRIAL_COURSES: [(&str, &str); 2] = [
     ("照合用の授業", "41e85934-7e84-81c4-8ae6-ec4fcaea84d0"),
@@ -104,7 +104,7 @@ impl TrialTarget {
         Self::from_verification(verification, write_bot)
     }
 
-    fn from_verification(
+    pub(super) fn from_verification(
         verification: VerificationTarget,
         write_bot: &str,
     ) -> Result<Self, NotionError> {

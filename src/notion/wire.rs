@@ -419,7 +419,11 @@ pub(super) fn checked_page_id(
     Ok(id)
 }
 
-fn page_property<'a>(page: &'a Value, id: &str, kind: &str) -> Result<&'a Value, NotionError> {
+pub(super) fn page_property<'a>(
+    page: &'a Value,
+    id: &str,
+    kind: &str,
+) -> Result<&'a Value, NotionError> {
     let properties = page["properties"]
         .as_object()
         .ok_or(NotionError::InvalidResponse)?;
@@ -428,7 +432,7 @@ fn page_property<'a>(page: &'a Value, id: &str, kind: &str) -> Result<&'a Value,
         .ok_or(NotionError::InvalidResponse)
 }
 
-fn text(value: &Value) -> Result<String, NotionError> {
+pub(super) fn text(value: &Value) -> Result<String, NotionError> {
     let mut result = String::new();
     for part in value.as_array().ok_or(NotionError::InvalidResponse)? {
         if part["type"] != "text" {
@@ -469,7 +473,7 @@ fn text_item(text: &str) -> Value {
     json!({"type":"text", "text":{"content":text}})
 }
 
-fn title_value(title: &str) -> Result<Value, NotionError> {
+pub(super) fn title_value(title: &str) -> Result<Value, NotionError> {
     // Conservative size unit for supplementary Unicode characters.
     if title.trim().is_empty() || title.encode_utf16().count() > 2_000 {
         return Err(NotionError::InvalidWrite);

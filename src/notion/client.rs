@@ -307,6 +307,32 @@ impl NotionClient {
         Ok(())
     }
 
+    #[cfg(feature = "synthetic-https-fixture")]
+    pub(super) fn create_verification_course(
+        &self,
+        title: &str,
+    ) -> Result<serde_json::Value, NotionError> {
+        use super::{trial::MOODLE_VERIFICATION_COURSES, wire::title_value};
+        use serde_json::json;
+
+        let course_source = MOODLE_VERIFICATION_COURSES;
+        let real_origin = self.base.origin() == Url::parse(BASE).expect("fixed URL").origin();
+        #[cfg(test)]
+        let real_origin = real_origin || self.require_mock_writes().is_ok();
+        if !real_origin || PRODUCTION_DATA_SOURCES.contains(&course_source) {
+            return Err(NotionError::MethodDisabled);
+        }
+        let request = self
+            .request(Method::POST, "/v1/pages", &[])
+            .json(&json!({
+                "parent": { "type": "data_source_id", "data_source_id": course_source },
+                "properties": { "title": title_value(title)? },
+            }))
+            .build()
+            .map_err(|_| NotionError::Configuration)?;
+        self.execute(request).map_err(|failure| failure.error)
+    }
+
     fn send_read<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Failed> {
         let request = request.build().map_err(|_| NotionError::Configuration)?;
         let url = request.url();

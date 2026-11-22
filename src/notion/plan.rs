@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{domain::Deadline, import::ExternalRecordKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::wire::uuid;
 use super::{SyncAssignment, SyncInput, SyncKey, UniversitySource};
@@ -31,7 +31,7 @@ pub enum NotionSnapshot<'a> {
 }
 
 /// An explicit binding for an exact course key. Names are never matched.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CourseMapping {
     pub course_key: ExternalRecordKey,

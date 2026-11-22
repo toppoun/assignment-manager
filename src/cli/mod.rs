@@ -10,6 +10,8 @@ mod moodle_plan;
 mod moodle_review;
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
 mod moodle_trial;
+#[cfg(all(windows, feature = "synthetic-https-fixture"))]
+mod notion_courses;
 #[cfg(test)]
 mod tests;
 mod trial;
@@ -62,6 +64,8 @@ enum Command {
         writer: String,
         action: moodle_trial::Action,
     },
+    #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+    NotionCourses(notion_courses::Action),
     FixtureApply,
     UniversityMoodle {
         require_windows_vpn: bool,
@@ -161,6 +165,10 @@ impl Arguments {
                     writer: (*writer).into(),
                     action: moodle_trial::Action::parse(rest)?,
                 }
+            }
+            #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+            ["notion-moodle-courses", action] if config.is_some() => {
+                Command::NotionCourses(notion_courses::Action::parse(action)?)
             }
             ["fixture-apply"] => Command::FixtureApply,
             [
@@ -655,6 +663,10 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         println!(
             "Windows verification: --config PATH notion-moodle-trial --writer BOT_ID [doctor | init-state | credentials set write | --dry-run --uid UID | --allow-notion-write --uid UID | --dry-run-update --uid UID | --allow-notion-update --uid UID | reconcile --uid UID]"
         );
+        #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+        println!(
+            "Windows verification courses: --config PATH notion-moodle-courses [check-local | --dry-run | --allow-notion-create | --verify]"
+        );
         return Ok(0);
     }
     #[cfg(windows)]
@@ -677,6 +689,11 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         Command::MoodleCreateTrial { writer, action } => {
             let path = args.config.as_deref().ok_or(CliError::Usage)?;
             return moodle_trial::execute(path, writer, action);
+        }
+        #[cfg(windows)]
+        Command::NotionCourses(action) => {
+            let path = args.config.as_deref().ok_or(CliError::Usage)?;
+            return notion_courses::execute(path, *action);
         }
         Command::MoodleNotionPlan {
             assignments,
