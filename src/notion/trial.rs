@@ -48,6 +48,51 @@ pub struct VerificationTarget {
     read_bot: String,
 }
 
+#[cfg(feature = "synthetic-https-fixture")]
+pub struct MoodleCreateTarget {
+    trial: TrialTarget,
+    course_pages: [(&'static str, &'static str); 2],
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+impl MoodleCreateTarget {
+    pub fn new(notion: NotionTarget, writer: &str) -> Result<Self, NotionError> {
+        const ASSIGNMENTS: &str = "41e85934-7e84-817e-b1d2-000b68726503";
+        const COURSES: &str = "41e85934-7e84-81df-902b-000bbece9bf7";
+        const READER: &str = "41e85934-7e84-81d8-9891-00275cb3050f";
+        let (_, courses) = notion.ids()?;
+        if courses != COURSES {
+            return Err(NotionError::MethodDisabled);
+        }
+        let trial = TrialTarget::new(notion, ASSIGNMENTS, READER, writer)?;
+        Ok(Self {
+            trial,
+            course_pages: [
+                ("照合用の授業", "41e85934-7e84-81c4-8ae6-ec4fcaea84d0"),
+                ("別の合成授業", "41e85934-7e84-8172-93b3-f4885b1efc7b"),
+            ],
+        })
+    }
+
+    pub fn trial(&self) -> &TrialTarget {
+        &self.trial
+    }
+
+    pub(super) fn course_page(&self, category: &str) -> Option<&str> {
+        self.course_pages
+            .iter()
+            .find_map(|(name, page)| (*name == category).then_some(*page))
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_mock(trial: TrialTarget, course_page: &'static str) -> Self {
+        Self {
+            trial,
+            course_pages: [("照合用の授業", course_page), ("別の合成授業", course_page)],
+        }
+    }
+}
+
 impl TrialTarget {
     pub fn new(
         notion: NotionTarget,

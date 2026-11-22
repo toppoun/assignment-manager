@@ -5,6 +5,41 @@ fn parse(words: &[&str]) -> Result<Arguments, CliError> {
     Arguments::parse(&words.iter().map(|word| (*word).into()).collect::<Vec<_>>())
 }
 
+#[cfg(all(windows, feature = "synthetic-https-fixture"))]
+#[test]
+fn moodle_create_trial_cli_requires_a_single_uid_and_has_no_bulk_mode() {
+    let base = [
+        "--config",
+        "test.json",
+        "notion-moodle-trial",
+        "--writer",
+        "bot",
+    ];
+    assert_eq!(
+        parse(&[base.as_slice(), &["--allow-notion-write"]].concat()),
+        Err(CliError::Usage)
+    );
+    assert_eq!(
+        parse(
+            &[
+                base.as_slice(),
+                &["--allow-notion-write", "--uid", "a", "--uid", "b"]
+            ]
+            .concat()
+        ),
+        Err(CliError::Usage)
+    );
+    let selected =
+        parse(&[base.as_slice(), &["--allow-notion-write", "--uid", "a"]].concat()).unwrap();
+    assert_eq!(
+        selected.command,
+        Command::MoodleCreateTrial {
+            writer: "bot".into(),
+            action: moodle_trial::Action::Apply("a".into())
+        }
+    );
+}
+
 fn config_json() -> Value {
     json!({
         "notion": {

@@ -7,7 +7,7 @@ use crate::notion::{
 pub(in crate::notion) mod recovery_tests;
 
 pub(super) const READ_BOT: &str = "00000000-0000-4000-8000-000000000011";
-const WRITE_BOT: &str = "00000000-0000-4000-8000-000000000012";
+pub(super) const WRITE_BOT: &str = "00000000-0000-4000-8000-000000000012";
 
 fn trial() -> TrialTarget {
     TrialTarget::new(target(), A, READ_BOT, WRITE_BOT).unwrap()

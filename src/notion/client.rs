@@ -230,11 +230,12 @@ impl NotionClient {
             #[cfg(any(test, feature = "synthetic-https-fixture"))]
             WriteAccess::Mock => self.require_mock_writes()?,
             WriteAccess::Trial(approval) => {
-                let real_origin =
-                    self.base.origin() == Url::parse(BASE).expect("fixed URL").origin();
-                #[cfg(test)]
-                let real_origin = real_origin || self.require_mock_writes().is_ok();
-                if !real_origin || request.target_id != approval.target().assignment_id() {
+                self.require_trial_destination(request, approval.target())?
+            }
+            #[cfg(feature = "synthetic-https-fixture")]
+            WriteAccess::MoodleCreate { approval, key } => {
+                self.require_trial_destination(request, approval.target())?;
+                if request.method() != Method::POST || request.key() != *key {
                     return Err(NotionError::MethodDisabled);
                 }
             }
@@ -263,6 +264,20 @@ impl NotionClient {
             return Err(NotionError::MethodDisabled);
         }
         self.execute(request).map_err(|failure| failure.error)
+    }
+
+    fn require_trial_destination(
+        &self,
+        request: &PreparedWrite,
+        target: &super::TrialTarget,
+    ) -> Result<(), NotionError> {
+        let real_origin = self.base.origin() == Url::parse(BASE).expect("fixed URL").origin();
+        #[cfg(test)]
+        let real_origin = real_origin || self.require_mock_writes().is_ok();
+        if !real_origin || request.target_id != target.assignment_id() {
+            return Err(NotionError::MethodDisabled);
+        }
+        Ok(())
     }
 
     fn send_read<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Failed> {

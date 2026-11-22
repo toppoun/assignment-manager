@@ -129,6 +129,11 @@ mod macos {
                 println!("result=partial issue=plan_changed");
                 Ok(3)
             }
+            #[cfg(feature = "synthetic-https-fixture")]
+            Err(ApplyError::CreateBlocked) => {
+                println!("result=failed error=create_blocked");
+                Ok(3)
+            }
             Err(ApplyError::Notion(error)) => {
                 println!("result=failed notion_error={}", notion_diagnosis(error));
                 Ok(1)

@@ -6,6 +6,11 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+#[cfg(feature = "synthetic-https-fixture")]
+mod moodle_create;
+#[cfg(feature = "synthetic-https-fixture")]
+pub use moodle_create::MoodleCreatePreview;
+
 #[cfg(test)]
 use super::http_tests::trial_tests::recovery_tests::pause_create_at;
 use super::{
@@ -21,6 +26,8 @@ pub enum ApplyError {
     Notion(NotionError),
     State(StateError),
     PlanChanged,
+    #[cfg(feature = "synthetic-https-fixture")]
+    CreateBlocked,
 }
 
 impl From<NotionError> for ApplyError {
@@ -62,6 +69,11 @@ pub(super) enum WriteAccess<'a> {
     #[cfg(any(test, feature = "synthetic-https-fixture"))]
     Mock,
     Trial(ApprovedTrial<'a>),
+    #[cfg(feature = "synthetic-https-fixture")]
+    MoodleCreate {
+        approval: ApprovedTrial<'a>,
+        key: &'a SyncKey,
+    },
 }
 
 pub(super) struct ApprovedTrial<'a>(&'a TrialTarget);
@@ -364,6 +376,17 @@ impl NotionClient {
             }
             _ => return Ok(WriteOutcome::Conflict),
         }
+        self.send_reserved_create(schema, store, request, access)
+    }
+
+    fn send_reserved_create(
+        &self,
+        schema: &Schema,
+        store: &StateStore,
+        request: &PreparedWrite,
+        access: &WriteAccess<'_>,
+    ) -> Result<WriteOutcome, StateError> {
+        let key = request.key();
         if !store.reserve_create(key)? {
             return Ok(WriteOutcome::Deferred(None));
         }
@@ -389,7 +412,11 @@ impl NotionClient {
                 Ok(WriteOutcome::Deferred(Some(NotionError::InvalidResponse)))
             }
             Err(error) => {
-                if explicitly_rejected(error) {
+                let release_intent = explicitly_rejected(error);
+                #[cfg(feature = "synthetic-https-fixture")]
+                let release_intent =
+                    release_intent && !matches!(access, WriteAccess::MoodleCreate { .. });
+                if release_intent {
                     store.release_rejected_create(key)?;
                 } else {
                     store.mark_unknown(key)?;

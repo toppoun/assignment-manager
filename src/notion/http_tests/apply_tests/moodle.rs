@@ -1,5 +1,6 @@
-use super::super::trial_tests::{READ_BOT, bot, snapshot};
+use super::super::trial_tests::{READ_BOT, WRITE_BOT, bot, snapshot};
 use super::*;
+use crate::notion::MoodleCreateTarget;
 
 fn moodle_fixture() -> SyncInput {
     use crate::{
@@ -33,6 +34,236 @@ fn moodle_pages(source: &SyncInput) -> Vec<Value> {
             page
         })
         .collect()
+}
+
+fn create_fixture() -> (MoodleCreateTarget, SyncInput, [CourseMapping; 1], Value) {
+    let trial = TrialTarget::new(target(), A, READ_BOT, WRITE_BOT).unwrap();
+    let all = moodle_fixture();
+    let pages = moodle_pages(&all);
+    let input = all
+        .select_fixture_moodle("review-submit@example.invalid")
+        .unwrap();
+    let (key, assignment) = input.assignments().first_key_value().unwrap();
+    let mut created = pages
+        .into_iter()
+        .find(|page| {
+            page["properties"]["同期キー"]["rich_text"][0]["text"]["content"] == key.as_str()
+        })
+        .unwrap();
+    created["properties"]["授業"]["relation"] = json!([{"id":COURSE}]);
+    let mappings = [CourseMapping {
+        course_key: assignment.course_key.clone().unwrap(),
+        page_id: COURSE.into(),
+    }];
+    (
+        MoodleCreateTarget::for_mock(trial, COURSE),
+        input,
+        mappings,
+        created,
+    )
+}
+
+fn create_snapshot(rows: Vec<Value>) -> Vec<Exchange> {
+    let mut exchanges = snapshot(rows);
+    exchanges.push(get_course());
+    exchanges
+}
+
+#[test]
+fn create_trial_selects_one_fixture_and_never_updates_other_pages() {
+    let (target, input, mappings, created) = create_fixture();
+    let dir = apply_state();
+    let key = input.assignments().first_key_value().unwrap().0.clone();
+    let existing = task(PAGE_D, Some(&super::key("phase3d")), "Prior trial");
+    let assignment = &input.assignments()[&key];
+    let expected_body = json!({
+        "parent":{"type":"data_source_id","data_source_id":A},
+        "properties":{
+            "title":{"title":[text(&assignment.title)]},
+            "due":{"date":created["properties"]["期限"]["date"]},
+            "orig":{"select":{"id":"option-md"}},
+            "sync":{"rich_text":[text(key.as_str())]},
+            "R%3Ael":{"relation":[{"id":COURSE}]}
+        }
+    });
+    let mut script = vec![bot(READ_BOT)];
+    script.extend(create_snapshot(vec![existing.clone()]));
+    script.push(bot(WRITE_BOT));
+    script.extend(create_snapshot(vec![existing.clone()]));
+    script.extend(create_snapshot(vec![existing.clone()]));
+    script.push(exact(key.clone(), vec![]));
+    script.push(
+        Exchange::json("POST", "/v1/pages", created.clone()).check(move |_, body| {
+            assert_eq!(body, &expected_body);
+        }),
+    );
+    script.push(bot(READ_BOT));
+    script.extend(create_snapshot(vec![existing, created]));
+    let (client, server) = mock(script);
+
+    let before = client
+        .preview_moodle_create(&target, &input, &mappings, dir.path())
+        .unwrap();
+    assert!(before.can_create);
+    assert_eq!(before.counts.create, 1);
+    let applied = client
+        .apply_moodle_create(&target, &input, &mappings, dir.path(), || {
+            assert!(matches!(
+                TargetLock::acquire(dir.path()),
+                Err(StateError::Busy)
+            ));
+            true
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.counts.create, 1);
+    assert_eq!(applied.counts.update, 0);
+    assert_eq!(applied.pending, 0);
+
+    let db = dir.path().join("state.sqlite3");
+    let saved = std::fs::read(&db).unwrap();
+    let after = client
+        .preview_moodle_create(&target, &input, &mappings, dir.path())
+        .unwrap();
+    assert_eq!(before.existing_rows + 1, after.existing_rows);
+    assert_eq!(before.other_managed_revision, after.other_managed_revision);
+    assert_eq!(after.counts.create, 0);
+    assert_eq!(after.counts.unchanged, 1);
+    assert!(!after.can_create);
+    assert_eq!(std::fs::read(db).unwrap(), saved);
+    let another = moodle_fixture()
+        .select_fixture_moodle("review-close@example.invalid")
+        .unwrap();
+    assert_eq!(
+        client.apply_moodle_create(&target, &another, &mappings, dir.path(), || true),
+        Err(ApplyError::CreateBlocked)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn create_trial_rejects_bulk_wrong_writer_and_existing_keys_before_approval() {
+    let (target, input, mappings, existing) = create_fixture();
+    let path = apply_state();
+    let state = path.path().join("state.sqlite3");
+    let saved = std::fs::read(&state).unwrap();
+    assert!(
+        moodle_fixture()
+            .select_fixture_moodle("missing@example.invalid")
+            .is_err()
+    );
+    let mut other = existing.clone();
+    other["id"] = json!(PAGE_D);
+    let mut script = vec![bot(READ_BOT), bot(WRITE_BOT)];
+    script.extend(snapshot(vec![existing.clone(), other]));
+    script.push(bot(WRITE_BOT));
+    script.extend(snapshot(vec![existing]));
+    let (client, server) = mock(script);
+    let check = |input: &SyncInput| {
+        client.apply_moodle_create(&target, input, &mappings, path.path(), || {
+            panic!("must not offer approval")
+        })
+    };
+    assert_eq!(check(&moodle_fixture()), Err(ApplyError::CreateBlocked));
+    assert_eq!(
+        check(&input),
+        Err(ApplyError::Notion(NotionError::CredentialMismatch))
+    );
+    assert_eq!(check(&input), Err(ApplyError::CreateBlocked));
+    assert_eq!(check(&input), Err(ApplyError::CreateBlocked));
+    assert_eq!(std::fs::read(state).unwrap(), saved);
+    server.join().unwrap();
+}
+
+#[test]
+fn create_trial_stops_if_the_key_appears_after_approval() {
+    let (target, input, mappings, existing) = create_fixture();
+    let dir = apply_state();
+    let key = input.assignments().first_key_value().unwrap().0.clone();
+    let db = dir.path().join("state.sqlite3");
+    let saved = std::fs::read(&db).unwrap();
+    let mut script = vec![bot(WRITE_BOT)];
+    script.extend(create_snapshot(vec![]));
+    script.push(bot(WRITE_BOT));
+    script.extend(create_snapshot(vec![]));
+    script.extend(create_snapshot(vec![]));
+    script.push(exact(key, vec![existing]));
+    let (client, server) = mock(script);
+    assert_eq!(
+        client.apply_moodle_create(&target, &input, &mappings, dir.path(), || false),
+        Ok(None)
+    );
+    assert_eq!(
+        client.apply_moodle_create(&target, &input, &mappings, dir.path(), || true),
+        Err(ApplyError::PlanChanged)
+    );
+    assert_eq!(std::fs::read(db).unwrap(), saved);
+    server.join().unwrap();
+}
+
+#[test]
+fn create_trial_keeps_an_unknown_write_pending_and_recovers_only_with_a_verified_reader() {
+    let (target, input, mappings, created) = create_fixture();
+    let dir = apply_state();
+    let key = input.assignments().first_key_value().unwrap().0;
+    let mut script = vec![bot(WRITE_BOT)];
+    script.extend(create_snapshot(vec![]));
+    script.extend(create_snapshot(vec![]));
+    script.push(exact(key.clone(), vec![]));
+    script.push(Exchange::error("POST", "/v1/pages", 500, ""));
+    script.push(bot(READ_BOT));
+    script.extend(create_snapshot(vec![]));
+    let mut changed = created.clone();
+    changed["properties"]["タイトル（改名済）"]["title"] = json!([text("Different title")]);
+    script.push(bot(READ_BOT));
+    script.extend(snapshot(vec![changed]));
+    script.push(bot(READ_BOT));
+    script.extend(create_snapshot(vec![created]));
+    let (client, server) = mock(script);
+
+    let report = client
+        .apply_moodle_create(&target, &input, &mappings, dir.path(), || true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.error, Some(NotionError::Server(500)));
+    assert_eq!(report.pending, 1);
+    assert_eq!(
+        client.apply_moodle_create(&target, &input, &mappings, dir.path(), || true),
+        Err(ApplyError::CreateBlocked)
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            client.reconcile_moodle_create(&target, &input, &mappings, dir.path()),
+            Err(ApplyError::CreateBlocked)
+        );
+        assert_eq!(
+            open_state(dir.path()).binding(key).unwrap().unwrap().status,
+            state::BindingStatus::Unknown
+        );
+    }
+    client
+        .reconcile_moodle_create(&target, &input, &mappings, dir.path())
+        .unwrap();
+    assert_eq!(
+        open_state(dir.path()).binding(key).unwrap().unwrap().status,
+        state::BindingStatus::Linked
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn create_trial_requires_the_fixed_verification_pair_and_a_distinct_writer() {
+    let mut verified = target();
+    verified.assignments_data_source_id = "41e85934-7e84-817e-b1d2-000b68726503".into();
+    verified.courses_data_source_id = "41e85934-7e84-81df-902b-000bbece9bf7".into();
+    assert!(MoodleCreateTarget::new(verified, WRITE_BOT).is_ok());
+    let mut wrong = target();
+    wrong.assignments_data_source_id = "41e85934-7e84-817e-b1d2-000b68726503".into();
+    assert!(MoodleCreateTarget::new(wrong, WRITE_BOT).is_err());
+    let mut same = target();
+    same.assignments_data_source_id = "41e85934-7e84-817e-b1d2-000b68726503".into();
+    same.courses_data_source_id = "41e85934-7e84-81df-902b-000bbece9bf7".into();
+    assert!(MoodleCreateTarget::new(same, "41e85934-7e84-81d8-9891-00275cb3050f").is_err());
 }
 
 #[test]

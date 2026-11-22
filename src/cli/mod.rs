@@ -6,6 +6,8 @@ mod fixture_run;
 mod moodle_plan;
 #[cfg(windows)]
 mod moodle_review;
+#[cfg(all(windows, feature = "synthetic-https-fixture"))]
+mod moodle_trial;
 #[cfg(test)]
 mod tests;
 mod trial;
@@ -47,6 +49,11 @@ enum Command {
         assignments: String,
         courses: String,
         reader: String,
+    },
+    #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+    MoodleCreateTrial {
+        writer: String,
+        action: moodle_trial::Action,
     },
     FixtureApply,
     UniversityMoodle {
@@ -125,6 +132,13 @@ impl Arguments {
                 courses: (*courses).into(),
                 reader: (*reader).into(),
             },
+            #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+            ["notion-moodle-trial", "--writer", writer, rest @ ..] if config.is_some() => {
+                Command::MoodleCreateTrial {
+                    writer: (*writer).into(),
+                    action: moodle_trial::Action::parse(rest)?,
+                }
+            }
             ["fixture-apply"] => Command::FixtureApply,
             [
                 "university-check",
@@ -207,6 +221,8 @@ impl CliError {
             Self::Credential(CredentialStatus::Missing) => "credential_missing",
             Self::Credential(CredentialStatus::Invalid) => "credential_invalid",
             Self::Credential(CredentialStatus::Cancelled) => "credential_cancelled",
+            #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+            Self::Credential(CredentialStatus::Existing) => "credential_exists",
             Self::Credential(_) => "credential_unavailable",
             Self::FixtureUnavailable => "fixture_feature_required",
             Self::NetworkDisabled => "network_disabled",
@@ -607,6 +623,10 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         println!("{USAGE}");
         #[cfg(feature = "synthetic-https-fixture")]
         println!("{APPLY_USAGE}");
+        #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+        println!(
+            "Windows verification: --config PATH notion-moodle-trial --writer BOT_ID [doctor | init-state | credentials set write | --dry-run --uid UID | --allow-notion-write --uid UID | reconcile --uid UID]"
+        );
         return Ok(0);
     }
     // Fail before accessing local state when this is an ordinary binary.
@@ -616,6 +636,11 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
     #[cfg(feature = "synthetic-https-fixture")]
     match &args.command {
         Command::MoodleFixturePlan => return moodle_plan::mock(),
+        #[cfg(windows)]
+        Command::MoodleCreateTrial { writer, action } => {
+            let path = args.config.as_deref().ok_or(CliError::Usage)?;
+            return moodle_trial::execute(path, writer, action);
+        }
         Command::MoodleNotionPlan {
             assignments,
             courses,

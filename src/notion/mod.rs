@@ -15,6 +15,8 @@ mod tests;
 mod trial;
 mod wire;
 
+#[cfg(feature = "synthetic-https-fixture")]
+pub use apply::MoodleCreatePreview;
 pub use apply::{ApplyError, ApplyPreview, ApplyReport};
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
 pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus, SnapshotSummary};
@@ -23,6 +25,8 @@ pub use plan::{
     NotionSnapshot, PlanAction, PlannedAssignment, plan_sync,
 };
 pub use reader::{DryRunCounts, DryRunReport};
+#[cfg(feature = "synthetic-https-fixture")]
+pub use trial::MoodleCreateTarget;
 pub use trial::{TrialAssignment, TrialRole, TrialTarget, VerificationTarget};
 pub use wire::{NotionPropertyIds, NotionTarget, PreparedWrite};
 
@@ -211,6 +215,24 @@ impl SyncInput {
 
     pub fn assignments(&self) -> &BTreeMap<SyncKey, SyncAssignment> {
         &self.assignments
+    }
+
+    #[cfg(feature = "synthetic-https-fixture")]
+    pub fn select_fixture_moodle(mut self, uid: &str) -> Result<Self, NotionError> {
+        let key = SyncKey::derive(&ExternalRecordKey {
+            origin: OriginKind::Moodle,
+            scope: crate::webclass_auth::synthetic::MOODLE_SCOPE.into(),
+            id: uid.into(),
+        })
+        .map_err(|_| NotionError::Configuration)?;
+        let assignment = self
+            .assignments
+            .remove(&key)
+            .ok_or(NotionError::Configuration)?;
+        Ok(Self {
+            assignments: BTreeMap::from([(key, assignment)]),
+            earlier_attempt: BTreeSet::new(),
+        })
     }
 
     fn add_webclass(&mut self, webclass: &WebClassAcquisition) -> Result<(), InvalidSourceData> {

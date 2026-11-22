@@ -43,6 +43,8 @@ pub(super) enum CredentialStatus {
     Invalid,
     Unavailable,
     Cancelled,
+    #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+    Existing,
 }
 
 impl CredentialStatus {
@@ -54,6 +56,8 @@ impl CredentialStatus {
             Self::Invalid => "invalid",
             Self::Unavailable => "unavailable",
             Self::Cancelled => "cancelled",
+            #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+            Self::Existing => "exists",
         }
     }
 
@@ -100,6 +104,8 @@ pub(super) fn notion_client(
 #[cfg(any(windows, target_os = "macos"))]
 pub(super) use native::{lookup, moodle_url, notion_client, register};
 
+#[cfg(all(windows, feature = "synthetic-https-fixture"))]
+pub(super) use native::{moodle_trial_writer_present, register_moodle_trial_writer, trial_client};
 #[cfg(target_os = "macos")]
 pub(super) use native::{register_trial, trial_client};
 
@@ -171,7 +177,7 @@ mod native {
         Ok(Zeroizing::new(url.to_owned()))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(windows, feature = "synthetic-https-fixture")))]
     fn trial_item(
         target: &assignment_manager::notion::TrialTarget,
         role: assignment_manager::notion::TrialRole,
@@ -189,13 +195,46 @@ mod native {
         (service, account)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(windows, feature = "synthetic-https-fixture")))]
     pub(in crate::cli) fn trial_client(
         target: &assignment_manager::notion::TrialTarget,
         role: assignment_manager::notion::TrialRole,
     ) -> Result<NotionClient, CredentialStatus> {
         let (service, account) = trial_item(target, role);
         client_from_secret(read_secret(&service, account)?)
+    }
+
+    #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+    pub(in crate::cli) fn moodle_trial_writer_present(
+        target: &assignment_manager::notion::TrialTarget,
+    ) -> Result<bool, CredentialStatus> {
+        let (service, account) = trial_item(target, assignment_manager::notion::TrialRole::Write);
+        match entry(&service, account)?.get_attributes() {
+            Ok(_) => Ok(true),
+            Err(Error::NoEntry) => Ok(false),
+            Err(_) => Err(CredentialStatus::Unavailable),
+        }
+    }
+
+    #[cfg(all(windows, feature = "synthetic-https-fixture"))]
+    pub(in crate::cli) fn register_moodle_trial_writer(
+        target: &assignment_manager::notion::TrialTarget,
+    ) -> Result<(), CredentialStatus> {
+        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            return Err(CredentialStatus::Unavailable);
+        }
+        if moodle_trial_writer_present(target)? {
+            return Err(CredentialStatus::Existing);
+        }
+        let token = prompt("Notion verification writer token (hidden): ")?;
+        client_from_secret(Zeroizing::new(token.as_bytes().to_vec()))?;
+        if moodle_trial_writer_present(target)? {
+            return Err(CredentialStatus::Existing);
+        }
+        let (service, account) = trial_item(target, assignment_manager::notion::TrialRole::Write);
+        entry(&service, account)?
+            .set_secret(token.as_bytes())
+            .map_err(|_| CredentialStatus::Unavailable)
     }
 
     #[cfg(target_os = "macos")]
