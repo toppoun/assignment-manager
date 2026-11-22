@@ -2,7 +2,10 @@ use std::{
     error::Error,
     fmt,
     io::Read,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -69,6 +72,8 @@ pub struct NotionClient {
     retry_base: Duration,
     interval: Duration,
     pacing: Mutex<Pacing>,
+    read_operations: AtomicUsize,
+    read_retries: AtomicUsize,
     #[cfg(any(test, feature = "synthetic-https-fixture"))]
     mock_writes: bool,
 }
@@ -141,6 +146,8 @@ impl NotionClient {
                 next: Instant::now(),
                 cooldown: None,
             }),
+            read_operations: AtomicUsize::new(0),
+            read_retries: AtomicUsize::new(0),
             #[cfg(any(test, feature = "synthetic-https-fixture"))]
             mock_writes: false,
         })
@@ -186,7 +193,11 @@ impl NotionClient {
         &self,
         request: impl Fn() -> RequestBuilder,
     ) -> Result<T, NotionError> {
+        self.read_operations.fetch_add(1, Ordering::Relaxed);
         for attempt in 0..ATTEMPTS {
+            if attempt != 0 {
+                self.read_retries.fetch_add(1, Ordering::Relaxed);
+            }
             match self.send_read(request()) {
                 Ok(result) => return Ok(result),
                 Err(failure) => {
@@ -202,6 +213,14 @@ impl NotionClient {
             }
         }
         unreachable!("bounded retry loop always returns")
+    }
+
+    /// Logical read operations and additional attempts initiated by this client.
+    pub fn read_counts(&self) -> (usize, usize) {
+        (
+            self.read_operations.load(Ordering::Relaxed),
+            self.read_retries.load(Ordering::Relaxed),
+        )
     }
 
     #[cfg(any(test, feature = "synthetic-https-fixture"))]

@@ -11,7 +11,7 @@ use assignment_manager::{
 use super::{
     CliError, Config,
     config::{self, ConfigError},
-    credentials, university,
+    credentials, moodle_review, university,
 };
 
 pub(super) fn execute(
@@ -20,6 +20,10 @@ pub(super) fn execute(
     require_windows_vpn: bool,
 ) -> Result<u8, CliError> {
     let notion_config = Config::read(notion_path)?;
+    if notion_config.course_mappings.is_empty() {
+        println!("result=blocked reason=incomplete_course_mappings errors=1");
+        return Ok(3);
+    }
     let target = VerificationTarget::moodle_integration(notion_config.notion)
         .map_err(CliError::MoodlePlanNotion)?;
     let mappings = MoodlePreviewMappings::new(&notion_config.course_mappings)
@@ -40,24 +44,56 @@ pub(super) fn execute(
         println!("result=failed reason=moodle_setup errors=1");
         return Ok(1);
     };
+    let id = target.assignment_id();
+    let path = config::root()?
+        .join("targets")
+        .join(id)
+        .join("state.sqlite3");
+    let state = StateStore::read(&path, id)?;
+    let client = credentials::notion_client(id).map_err(CliError::Credential)?;
     let (mut clients, feed) = university::prepare_moodle_request(&moodle_config, source, policy)?;
+    println!(
+        "sqlite={} confirmation=required",
+        if state.is_some() {
+            "read_only"
+        } else {
+            "absent"
+        },
+    );
+    match moodle_review::confirm_fetch(
+        require_windows_vpn,
+        "Moodleを取得し、検証用Notion DBとの読み取り専用の差分計画を作成します。",
+    ) {
+        Ok(true) => (),
+        Ok(false) => {
+            println!("result=cancelled reason=moodle_confirmation_declined");
+            return Ok(2);
+        }
+        Err(()) => {
+            println!("result=blocked reason=moodle_confirmation_unavailable errors=1");
+            return Ok(3);
+        }
+    }
     clients.begin_run();
     let acquired = university::acquire_moodle_for_check(&clients, &feed);
     drop((clients, feed));
 
-    plan_acquisition(acquired.as_ref(), &mappings, |input| {
-        let id = target.assignment_id();
-        let path = config::root()?
-            .join("targets")
-            .join(id)
-            .join("state.sqlite3");
-        let state = StateStore::read(&path, id)?.unwrap_or_default();
-        let client = credentials::notion_client(id).map_err(CliError::Credential)?;
-        client
-            .preview_moodle_integration(&target, input, &mappings, state)
+    let result = plan_acquisition(acquired.as_ref(), &mappings, |input| {
+        let preview =
+            client.preview_moodle_integration(&target, input, &mappings, state.unwrap_or_default());
+        if preview.is_ok() {
+            println!(
+                "notion=ready reader=verified schemas=verified course_pages_verified={}",
+                notion_config.course_mappings.len()
+            );
+        }
+        preview
             .map(|report| report.counts_for(input))
             .map_err(CliError::MoodlePlanNotion)
-    })
+    });
+    let (operations, retries) = client.read_counts();
+    println!("notion_read operations={operations} retries={retries}");
+    result
 }
 
 fn plan_acquisition(
@@ -85,10 +121,12 @@ fn plan_acquisition(
         .coverage(&input)
         .map_err(CliError::MoodlePlanNotion)?;
     println!(
-        "moodle=live candidates={} courses={} unmapped_courses={} unmapped_candidates={} unclassified_candidates={} timed_deadlines={} date_only_deadlines={} missing_deadlines={}",
+        "moodle=live candidates={} courses={} mapped_courses={} unmapped_courses={} unused_mappings={} unmapped_candidates={} unclassified_candidates={} timed_deadlines={} date_only_deadlines={} missing_deadlines={}",
         coverage.candidates,
         coverage.courses,
+        coverage.courses - coverage.unmapped_courses,
         coverage.unmapped_courses,
+        coverage.unused_mappings,
         coverage.unmapped_candidates,
         coverage.unclassified_candidates,
         coverage.timed_deadlines,

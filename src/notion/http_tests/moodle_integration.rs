@@ -240,17 +240,34 @@ fn live_moodle_plan_rejects_duplicate_or_trial_only_mappings() {
 #[test]
 fn live_moodle_plan_never_fetches_a_mapped_page_outside_the_verified_courses() {
     let input = input_fixture();
-    let entries = mappings_fixture();
-    let mappings = MoodlePreviewMappings::new(&entries).unwrap();
-    let mut script = vec![bot(READ_BOT)];
-    script.extend(snapshot(vec![]).into_iter().take(2));
-    script.push(course_query(vec![page(COURSE, C, C_DB, json!({}))], None));
-    let (client, server) = mock(script);
-    assert!(matches!(
-        client.preview_moodle_integration(&target_fixture(), &input, &mappings, Default::default()),
-        Err(NotionError::CourseMappingOutsideTarget)
-    ));
-    server.join().unwrap();
+    for unused_mapping in [false, true] {
+        let mut entries = Vec::from(mappings_fixture());
+        let mut pages = vec![page(COURSE, C, C_DB, json!({}))];
+        if unused_mapping {
+            entries.push(mapping("今回未取得の合成授業", MANUAL));
+            pages.push(page(OLD_COURSE, C, C_DB, json!({})));
+        }
+        let mappings = MoodlePreviewMappings::new(&entries).unwrap();
+        assert_eq!(
+            mappings.coverage(&input).unwrap().unused_mappings,
+            usize::from(unused_mapping)
+        );
+        let mut script = vec![bot(READ_BOT)];
+        script.extend(snapshot(vec![]).into_iter().take(2));
+        script.push(course_query(pages, None));
+        let (client, server) = mock(script);
+        assert!(matches!(
+            client.preview_moodle_integration(
+                &target_fixture(),
+                &input,
+                &mappings,
+                Default::default()
+            ),
+            Err(NotionError::CourseMappingOutsideTarget)
+        ));
+        assert_eq!(client.read_counts(), (4, 0));
+        server.join().unwrap();
+    }
 }
 
 #[test]

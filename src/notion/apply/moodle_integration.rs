@@ -22,6 +22,7 @@ pub struct MoodlePreviewCoverage {
     pub candidates: usize,
     pub courses: usize,
     pub unmapped_courses: usize,
+    pub unused_mappings: usize,
     pub unmapped_candidates: usize,
     pub unclassified_candidates: usize,
     pub timed_deadlines: usize,
@@ -88,6 +89,8 @@ impl<'a> MoodlePreviewMappings<'a> {
         }
         coverage.courses = courses.len();
         coverage.unmapped_courses = unmapped.len();
+        coverage.unused_mappings =
+            self.by_course.len() - (coverage.courses - coverage.unmapped_courses);
         Ok(coverage)
     }
 }
@@ -114,12 +117,7 @@ impl NotionClient {
                 Err(NotionError::CourseMappingOutsideTarget)
             }
         };
-        for assignment in input.assignments().values() {
-            let id = assignment
-                .course_key
-                .as_ref()
-                .and_then(|course| mappings.by_course.get(course))
-                .ok_or(NotionError::Configuration)?;
+        for id in mappings.by_course.values() {
             verify_course(id)?;
         }
         let plan = self.prepare_plan(schema, state, |schema, rows| {

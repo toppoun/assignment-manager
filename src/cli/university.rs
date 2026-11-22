@@ -30,7 +30,10 @@ pub(super) fn moodle(
     };
     #[cfg(windows)]
     if review_local {
-        match super::moodle_review::confirm_fetch(require_windows_vpn) {
+        match super::moodle_review::confirm_fetch(
+            require_windows_vpn,
+            "この端末の専用画面で授業カテゴリを表示し、必要に応じて課題を個別照合できます。",
+        ) {
             Ok(true) => (),
             Ok(false) => {
                 println!("review result=cancelled");

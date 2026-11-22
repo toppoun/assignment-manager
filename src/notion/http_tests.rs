@@ -506,6 +506,7 @@ fn http_errors_are_classified_and_reads_have_a_retry_limit() {
         client.retrieve_page(PAGE_A, &[]),
         Err(NotionError::RateLimited)
     );
+    assert_eq!(client.read_counts(), (10, 5));
     server.join().unwrap();
 }
 

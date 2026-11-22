@@ -34,7 +34,10 @@ const SUMMARY: i32 = 104;
 const FINISHED: isize = 1;
 const WINDOW_FAILED: isize = -2;
 
-pub(in crate::cli) fn confirm_fetch(require_windows_vpn: bool) -> Result<bool, ()> {
+pub(in crate::cli) fn confirm_fetch(
+    require_windows_vpn: bool,
+    description: &str,
+) -> Result<bool, ()> {
     if !interactive_station() {
         return Err(());
     }
@@ -46,7 +49,7 @@ pub(in crate::cli) fn confirm_fetch(require_windows_vpn: bool) -> Result<bool, (
     match message(
         null_mut(),
         &format!(
-            "{vpn}この端末の専用画面で授業カテゴリを表示し、必要に応じて課題を個別照合できます。\r\n\
+            "{vpn}{description}\r\n\
              開始する場合は OK を押してください。Moodleの取得は最大1回です。"
         ),
         MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2,
