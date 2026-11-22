@@ -19,10 +19,12 @@ include!("webclass_auth_fixture.rs");
 pub const MOODLE_URL: &str =
     "https://moodle.synthetic.invalid/calendar/export_execute.php?token=synthetic-secret";
 pub const MOODLE_SCOPE: &str = "default.course-related";
+pub const MOODLE_TRIAL_UPDATE_UID: &str = "review-submit@example.invalid";
 pub const UNIVERSITY_ID: &str = STUDENT;
 pub const UNIVERSITY_PASSWORD: &str = PASSWORD;
 const ICS: &str = include_str!("../fixtures/moodle/calendar_basic.ics");
 const REVIEW_ICS: &str = include_str!("../fixtures/moodle/calendar_review.ics");
+const TRIAL_UPDATE_ICS: &str = include_str!("../fixtures/moodle/calendar_trial_update.ics");
 const COURSE_DATA: &str = include_str!("../fixtures/webclass/courses_basic.json");
 const CONTENT_DATA: &str = include_str!("../fixtures/webclass/contents_basic.json");
 const CONTENTS: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
@@ -33,6 +35,7 @@ pub enum Scenario {
     BothSuccess,
     MoodleFailure,
     MoodleReview,
+    MoodleTrialUpdate,
     WebClassFailure,
     BothFailure,
     AuthExpiredOnce,
@@ -241,12 +244,11 @@ fn serve(
                 } else {
                     200
                 };
-                let body = if matches!(scenario, Scenario::BodyLimit) {
-                    "x".repeat(8 * 1024 * 1024 + 1)
-                } else if matches!(scenario, Scenario::MoodleReview) {
-                    REVIEW_ICS.into()
-                } else {
-                    ICS.into()
+                let body = match scenario {
+                    Scenario::BodyLimit => "x".repeat(8 * 1024 * 1024 + 1),
+                    Scenario::MoodleReview => REVIEW_ICS.into(),
+                    Scenario::MoodleTrialUpdate => TRIAL_UPDATE_ICS.into(),
+                    _ => ICS.into(),
                 };
                 Exchange::new(
                     "GET",

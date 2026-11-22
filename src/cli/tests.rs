@@ -40,6 +40,52 @@ fn moodle_create_trial_cli_requires_a_single_uid_and_has_no_bulk_mode() {
     );
 }
 
+#[cfg(all(windows, feature = "synthetic-https-fixture"))]
+#[test]
+fn update_trial_accepts_only_the_dedicated_uid_and_separate_commands() {
+    let base = [
+        "--config",
+        "test.json",
+        "notion-moodle-trial",
+        "--writer",
+        "bot",
+    ];
+    for (flag, action) in [
+        ("--dry-run-update", moodle_trial::Action::PreviewUpdate),
+        ("--allow-notion-update", moodle_trial::Action::ApplyUpdate),
+    ] {
+        let parsed = parse(
+            &[
+                base.as_slice(),
+                &[flag, "--uid", "review-submit@example.invalid"],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::MoodleCreateTrial {
+                writer: "bot".into(),
+                action
+            }
+        );
+        assert_eq!(
+            parse(
+                &[
+                    base.as_slice(),
+                    &[flag, "--uid", "review-close@example.invalid"]
+                ]
+                .concat()
+            ),
+            Err(CliError::Usage)
+        );
+    }
+    assert_eq!(
+        parse(&[base.as_slice(), &["--allow-notion-update"]].concat()),
+        Err(CliError::Usage)
+    );
+}
+
 fn config_json() -> Value {
     json!({
         "notion": {

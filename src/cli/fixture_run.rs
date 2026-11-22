@@ -21,9 +21,9 @@ pub(super) fn apply(directory: &std::path::Path) -> Result<u8, CliError> {
     let reports =
         fixture::exercise_apply(&acquired.input, directory).map_err(|error| match error {
             fixture::ApplyError::State(error) => CliError::State(error),
-            fixture::ApplyError::PlanChanged | fixture::ApplyError::CreateBlocked => {
-                CliError::FixtureFailed
-            }
+            fixture::ApplyError::PlanChanged
+            | fixture::ApplyError::CreateBlocked
+            | fixture::ApplyError::UpdateBlocked => CliError::FixtureFailed,
             fixture::ApplyError::Notion(error) => {
                 println!("notion_error={}", super::notion_diagnosis(error));
                 CliError::FixtureFailed

@@ -1,16 +1,23 @@
 use super::super::trial_tests::{READ_BOT, WRITE_BOT, bot, snapshot};
 use super::*;
 use crate::notion::MoodleCreateTarget;
+use crate::webclass_auth::synthetic::Scenario;
+
+mod update;
 
 fn moodle_fixture() -> SyncInput {
+    acquire_moodle_fixture(Scenario::MoodleReview)
+}
+
+fn acquire_moodle_fixture(scenario: Scenario) -> SyncInput {
     use crate::{
         moodle_http::{MoodleExportKind, MoodleFeed},
         secured_sync::SecuredSyncClients,
         sync::acquire_moodle,
-        webclass_auth::synthetic::{MOODLE_SCOPE, MOODLE_URL, Scenario, SyntheticUniversity},
+        webclass_auth::synthetic::{MOODLE_SCOPE, MOODLE_URL, SyntheticUniversity},
     };
 
-    let university = SyntheticUniversity::start(Scenario::MoodleReview);
+    let university = SyntheticUniversity::start(scenario);
     let mut clients = SecuredSyncClients::new(university.policy());
     clients.begin_run();
     let feed = MoodleFeed::new(MOODLE_SCOPE, MoodleExportKind::CourseRelated, MOODLE_URL).unwrap();

@@ -21,7 +21,7 @@ pub struct MoodleCreatePreview {
     pub can_create: bool,
 }
 
-fn selected<'a>(
+pub(super) fn selected<'a>(
     target: &MoodleCreateTarget,
     input: &'a SyncInput,
     mappings: &'a [CourseMapping],
@@ -71,7 +71,7 @@ fn create_request<'a>(
     Ok(request)
 }
 
-fn other_managed_revision(plan: &PreparedApply, key: &SyncKey) -> String {
+pub(super) fn other_managed_revision(plan: &PreparedApply, key: &SyncKey) -> String {
     let mut digest = Context::new(&SHA256);
     // Pages in the complete snapshot are sorted by page ID.
     for page in &plan.pages {
@@ -225,7 +225,7 @@ impl NotionClient {
         Ok(())
     }
 
-    fn verify_moodle_course(
+    pub(super) fn verify_moodle_course(
         &self,
         schema: &Schema,
         mapping: &CourseMapping,

@@ -10,6 +10,10 @@ use serde_json::Value;
 mod moodle_create;
 #[cfg(feature = "synthetic-https-fixture")]
 pub use moodle_create::MoodleCreatePreview;
+#[cfg(feature = "synthetic-https-fixture")]
+mod moodle_update;
+#[cfg(feature = "synthetic-https-fixture")]
+pub use moodle_update::MoodleUpdatePreview;
 
 #[cfg(test)]
 use super::http_tests::trial_tests::recovery_tests::pause_create_at;
@@ -28,6 +32,8 @@ pub enum ApplyError {
     PlanChanged,
     #[cfg(feature = "synthetic-https-fixture")]
     CreateBlocked,
+    #[cfg(feature = "synthetic-https-fixture")]
+    UpdateBlocked,
 }
 
 impl From<NotionError> for ApplyError {
@@ -73,6 +79,13 @@ pub(super) enum WriteAccess<'a> {
     MoodleCreate {
         approval: ApprovedTrial<'a>,
         key: &'a SyncKey,
+    },
+    #[cfg(feature = "synthetic-https-fixture")]
+    MoodleUpdate {
+        approval: ApprovedTrial<'a>,
+        key: &'a SyncKey,
+        page_id: &'a str,
+        properties: [&'a str; 2],
     },
 }
 
@@ -434,6 +447,17 @@ impl NotionClient {
         request: &PreparedWrite,
         access: &WriteAccess<'_>,
     ) -> WriteOutcome {
+        let intended_values_match = |row: &NotionAssignment, more_relation: bool| {
+            #[cfg(feature = "synthetic-https-fixture")]
+            if matches!(access, WriteAccess::MoodleUpdate { .. })
+                && (more_relation
+                    || row.source != baseline.row.source
+                    || row.course_page_ids != baseline.row.course_page_ids)
+            {
+                return false;
+            }
+            !(more_relation && patch.course_page_id.is_some()) && patch_matches(patch, row)
+        };
         let verify = || -> Result<Observation, NotionError> {
             let page = self.retrieve_page(
                 &baseline.row.page_id,
@@ -456,8 +480,7 @@ impl NotionClient {
                 if let Ok((row, more)) = schema.assignment(&page)
                     && row.page_id == baseline.row.page_id
                     && row.sync_key.as_ref() == Some(request.key())
-                    && !(more && patch.course_page_id.is_some())
-                    && patch_matches(patch, &row)
+                    && intended_values_match(&row, more)
                 {
                     return WriteOutcome::Applied;
                 }
@@ -469,7 +492,7 @@ impl NotionClient {
         // Never repeat this PATCH. If the response was ambiguous, account for the
         // intended values only when another read verifies them on the same page.
         match verify() {
-            Ok(current) if patch_matches(patch, &current.row) => WriteOutcome::Applied,
+            Ok(current) if intended_values_match(&current.row, false) => WriteOutcome::Applied,
             _ => WriteOutcome::Deferred(Some(failure)),
         }
     }

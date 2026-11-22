@@ -15,9 +15,9 @@ mod tests;
 mod trial;
 mod wire;
 
-#[cfg(feature = "synthetic-https-fixture")]
-pub use apply::MoodleCreatePreview;
 pub use apply::{ApplyError, ApplyPreview, ApplyReport};
+#[cfg(feature = "synthetic-https-fixture")]
+pub use apply::{MoodleCreatePreview, MoodleUpdatePreview};
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
 pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus, SnapshotSummary};
 pub use plan::{
@@ -84,6 +84,15 @@ impl SyncKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(feature = "synthetic-https-fixture")]
+    fn fixture_moodle(uid: &str) -> Result<Self, InvalidSourceData> {
+        Self::derive(&ExternalRecordKey {
+            origin: OriginKind::Moodle,
+            scope: crate::webclass_auth::synthetic::MOODLE_SCOPE.into(),
+            id: uid.into(),
+        })
     }
 }
 
@@ -219,12 +228,7 @@ impl SyncInput {
 
     #[cfg(feature = "synthetic-https-fixture")]
     pub fn select_fixture_moodle(mut self, uid: &str) -> Result<Self, NotionError> {
-        let key = SyncKey::derive(&ExternalRecordKey {
-            origin: OriginKind::Moodle,
-            scope: crate::webclass_auth::synthetic::MOODLE_SCOPE.into(),
-            id: uid.into(),
-        })
-        .map_err(|_| NotionError::Configuration)?;
+        let key = SyncKey::fixture_moodle(uid).map_err(|_| NotionError::Configuration)?;
         let assignment = self
             .assignments
             .remove(&key)

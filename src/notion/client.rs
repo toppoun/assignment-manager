@@ -239,6 +239,32 @@ impl NotionClient {
                     return Err(NotionError::MethodDisabled);
                 }
             }
+            #[cfg(feature = "synthetic-https-fixture")]
+            WriteAccess::MoodleUpdate {
+                approval,
+                key,
+                page_id,
+                properties,
+            } => {
+                self.require_trial_destination(request, approval.target())?;
+                let exact_properties = request.body().as_object().is_some_and(|body| {
+                    body.len() == 1
+                        && body
+                            .get("properties")
+                            .and_then(serde_json::Value::as_object)
+                            .is_some_and(|fields| {
+                                fields.len() == properties.len()
+                                    && properties.iter().all(|id| fields.contains_key(*id))
+                            })
+                });
+                if request.method() != Method::PATCH
+                    || request.key() != *key
+                    || request.path().strip_prefix("/v1/pages/") != Some(*page_id)
+                    || !exact_properties
+                {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
         }
         if PRODUCTION_DATA_SOURCES.contains(&request.target_id.as_str())
             || (request.method() == Method::POST

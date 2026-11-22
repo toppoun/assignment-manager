@@ -625,7 +625,7 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         println!("{APPLY_USAGE}");
         #[cfg(all(windows, feature = "synthetic-https-fixture"))]
         println!(
-            "Windows verification: --config PATH notion-moodle-trial --writer BOT_ID [doctor | init-state | credentials set write | --dry-run --uid UID | --allow-notion-write --uid UID | reconcile --uid UID]"
+            "Windows verification: --config PATH notion-moodle-trial --writer BOT_ID [doctor | init-state | credentials set write | --dry-run --uid UID | --allow-notion-write --uid UID | --dry-run-update --uid UID | --allow-notion-update --uid UID | reconcile --uid UID]"
         );
         return Ok(0);
     }

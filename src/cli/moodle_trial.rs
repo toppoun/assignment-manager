@@ -8,7 +8,7 @@ use assignment_manager::{
         ApplyError, MoodleCreateTarget, TrialRole,
         state::{StateStore, TargetLock},
     },
-    webclass_auth::synthetic::Scenario,
+    webclass_auth::synthetic::{MOODLE_TRIAL_UPDATE_UID, Scenario},
 };
 
 use super::{
@@ -22,6 +22,8 @@ pub(super) enum Action {
     RegisterWrite,
     Preview(String),
     Apply(String),
+    PreviewUpdate,
+    ApplyUpdate,
     Reconcile(String),
 }
 
@@ -33,6 +35,8 @@ impl Action {
             ["credentials", "set", "write"] => Self::RegisterWrite,
             ["--dry-run", "--uid", uid] => Self::Preview((*uid).into()),
             ["--allow-notion-write", "--uid", uid] => Self::Apply((*uid).into()),
+            ["--dry-run-update", "--uid", MOODLE_TRIAL_UPDATE_UID] => Self::PreviewUpdate,
+            ["--allow-notion-update", "--uid", MOODLE_TRIAL_UPDATE_UID] => Self::ApplyUpdate,
             ["reconcile", "--uid", uid] => Self::Reconcile((*uid).into()),
             _ => return Err(CliError::Usage),
         })
@@ -40,7 +44,8 @@ impl Action {
 }
 
 pub(super) fn execute(path: &Path, writer: &str, action: &Action) -> Result<u8, CliError> {
-    if matches!(action, Action::Apply(_))
+    let writing = matches!(action, Action::Apply(_) | Action::ApplyUpdate);
+    if writing
         && !(io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal())
     {
         println!("result=failed error=trial_requires_terminal");
@@ -55,7 +60,7 @@ pub(super) fn execute(path: &Path, writer: &str, action: &Action) -> Result<u8, 
         target: id.into(),
         directory: config::root()?.join("moodle-create-trial").join(id),
     };
-    let uid = match action {
+    let (uid, scenario, expected_candidates) = match action {
         Action::Doctor => {
             let present =
                 credentials::moodle_trial_writer_present(trial).map_err(CliError::Credential)?;
@@ -75,16 +80,21 @@ pub(super) fn execute(path: &Path, writer: &str, action: &Action) -> Result<u8, 
             println!("writer_entry=stored");
             return Ok(0);
         }
-        Action::Preview(uid) | Action::Apply(uid) | Action::Reconcile(uid) => uid,
+        Action::Preview(uid) | Action::Apply(uid) | Action::Reconcile(uid) => {
+            (uid.as_str(), Scenario::MoodleReview, 3)
+        }
+        Action::PreviewUpdate | Action::ApplyUpdate => {
+            (MOODLE_TRIAL_UPDATE_UID, Scenario::MoodleTrialUpdate, 1)
+        }
     };
-    let input = fixture_run::moodle_only(Scenario::MoodleReview)?;
-    if input.assignments().len() != 3 {
+    let input = fixture_run::moodle_only(scenario)?;
+    if input.assignments().len() != expected_candidates {
         return Err(CliError::FixtureFailed);
     }
     let input = input
         .select_fixture_moodle(uid)
         .map_err(CliError::MoodlePlanNotion)?;
-    let client = if matches!(action, Action::Apply(_)) {
+    let client = if writing {
         credentials::trial_client(trial, TrialRole::Write)
     } else {
         credentials::notion_client(id)
@@ -112,6 +122,25 @@ pub(super) fn execute(path: &Path, writer: &str, action: &Action) -> Result<u8, 
             }
             if report.counts.create == 1 && report.pending == 0 { 0 } else { 3 }
         }),
+        Action::PreviewUpdate => client.preview_moodle_update(&target, &input, mappings, directory).map(|preview| {
+            let c = preview.counts;
+            println!("phase=dry_run_update selected=1 existing_rows={} create={} update={} unchanged={} conflict={} deferred={} course_relation_mismatch={} can_update={} other_managed_revision={}",
+                preview.existing_rows, c.create, c.update, c.unchanged, c.conflict, c.deferred,
+                c.course_relation_mismatch, preview.can_update, preview.other_managed_revision);
+            if c.unchanged == 1 && c.course_relation_mismatch == 0 || preview.can_update { 0 } else { 3 }
+        }),
+        Action::ApplyUpdate => client.apply_moodle_update(&target, &input, mappings, directory, confirm_update).map(|report| {
+            let Some(report) = report else {
+                println!("result=cancelled");
+                return 2;
+            };
+            println!("phase=apply_update create=0 update={} conflict={} deferred={}",
+                report.counts.update, report.counts.conflict, report.counts.deferred);
+            if let Some(error) = report.error {
+                println!("notion_error={}", notion_diagnosis(error));
+            }
+            if report.counts.update == 1 { 0 } else { 3 }
+        }),
         Action::Reconcile(_) => client.reconcile_moodle_create(&target, &input, mappings, directory).map(|()| {
             println!("phase=reconcile linked=1 notion_writes=0");
             0
@@ -126,6 +155,10 @@ pub(super) fn execute(path: &Path, writer: &str, action: &Action) -> Result<u8, 
             println!("result=failed error=create_blocked");
             Ok(3)
         }
+        Err(ApplyError::UpdateBlocked) => {
+            println!("result=failed error=update_blocked");
+            Ok(3)
+        }
         Err(ApplyError::PlanChanged) => {
             println!("result=failed error=plan_changed");
             Ok(3)
@@ -136,8 +169,20 @@ pub(super) fn execute(path: &Path, writer: &str, action: &Action) -> Result<u8, 
 fn confirm() -> bool {
     println!("phase=plan selected=1 create=1 update=0 relation=verified");
     print!("Type CREATE ONE to create the selected synthetic assignment: ");
+    confirm_literal("CREATE ONE")
+}
+
+fn confirm_update() -> bool {
+    println!("phase=plan_update selected=1 create=0 update=1 fields=title,deadline");
+    print!(
+        "Type UPDATE ONE to update the title and deadline of the selected synthetic assignment: "
+    );
+    confirm_literal("UPDATE ONE")
+}
+
+fn confirm_literal(expected: &str) -> bool {
     let mut answer = String::new();
     io::stdout().flush().is_ok()
         && io::stdin().read_line(&mut answer).is_ok()
-        && answer.trim() == "CREATE ONE"
+        && answer.trim() == expected
 }

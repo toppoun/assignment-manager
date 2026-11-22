@@ -48,26 +48,28 @@ fn stderr(output: &Output) -> &str {
 
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
 #[test]
-fn moodle_create_trial_rejects_redirected_input_before_opening_config_or_state() {
+fn moodle_trial_rejects_redirected_input_before_opening_config_or_state() {
     let temp = tempfile::tempdir().unwrap();
-    let output = call(
-        &temp,
-        &[
-            "--config",
-            "missing-fixture-config.json",
-            "notion-moodle-trial",
-            "--writer",
-            "00000000-0000-4000-8000-000000000012",
-            "--allow-notion-write",
-            "--uid",
-            "review-submit@example.invalid",
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        stdout(&output).trim(),
-        "result=failed error=trial_requires_terminal"
-    );
+    for command in ["--allow-notion-write", "--allow-notion-update"] {
+        let output = call(
+            &temp,
+            &[
+                "--config",
+                "missing-fixture-config.json",
+                "notion-moodle-trial",
+                "--writer",
+                "00000000-0000-4000-8000-000000000012",
+                command,
+                "--uid",
+                "review-submit@example.invalid",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            stdout(&output).trim(),
+            "result=failed error=trial_requires_terminal"
+        );
+    }
     assert!(!local_root(&temp).exists());
 }
 
