@@ -77,7 +77,7 @@ pub(super) fn other_managed_revision(plan: &PreparedApply, key: &SyncKey) -> Str
     for page in &plan.pages {
         if let Some(time) = page
             .edited_at
-            .filter(|_| page.row.sync_key.as_ref() != Some(key))
+            .filter(|_| page.row.sync_key.as_ref().is_some_and(|other| other != key))
         {
             digest.update(page.row.page_id.as_bytes());
             digest.update(time.to_rfc3339().as_bytes());

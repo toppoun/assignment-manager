@@ -57,6 +57,11 @@ pub(super) fn execute(
         Action::Reconcile => credentials::notion_client(id),
     }
     .map_err(CliError::Credential)?;
+    let post_reader = if action == Action::Create {
+        Some(credentials::notion_client(id).map_err(CliError::Credential)?)
+    } else {
+        None
+    };
     let description = match action {
         Action::Create => {
             "Moodleを取得し、検証用Notionへの1件作成の候補を確認します。作成前に別の確認画面が開きます。"
@@ -81,9 +86,10 @@ pub(super) fn execute(
                 &paths.directory,
                 |choices| {
                     println!(
-                        "phase=select candidates={} eligible={}",
+                        "phase=select candidates={} eligible={} existing_rows={}",
                         choices.candidate_count,
-                        choices.eligible.len()
+                        choices.eligible.len(),
+                        choices.existing_rows
                     );
                     match moodle_review::choose_create(choices) {
                         Ok(selection) => selection,
@@ -99,14 +105,37 @@ pub(super) fn execute(
                 },
             );
             match result {
-                Ok(Some(report)) if report.counts.create == 1 => {
+                Ok(Some(created)) if created.report.counts.create == 1 => {
                     println!(
                         "result=success create=1 update=0 held={} pending=0",
                         input.assignments().len() - 1
                     );
-                    Ok(0)
+                    let reader = post_reader
+                        .as_ref()
+                        .expect("create uses the separate read-only bot");
+                    let verification = reader.verify_one_live_moodle(&target, &created);
+                    let (operations, retries) = reader.read_counts();
+                    println!("notion_post_read operations={operations} retries={retries}");
+                    match verification {
+                        Ok((before, after)) => {
+                            println!(
+                                "notion_postcheck=verified before={before} after={after} unique_key=true five_fields=true existing_unchanged=true"
+                            );
+                            Ok(0)
+                        }
+                        Err(error) => {
+                            println!(
+                                "notion_postcheck=failed diagnostic={}",
+                                notion_diagnosis(error)
+                            );
+                            Ok(3)
+                        }
+                    }
                 }
-                Ok(Some(report)) if report.counts.deferred != 0 || report.pending != 0 => {
+                Ok(Some(result))
+                    if result.report.counts.deferred != 0 || result.report.pending != 0 =>
+                {
+                    let report = result.report;
                     println!(
                         "result=unconfirmed update=0 held={} pending={}",
                         input.assignments().len() - 1,

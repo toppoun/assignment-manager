@@ -154,9 +154,10 @@ fn initialize(window: HWND, session: &Session<'_>) -> bool {
         window,
         HEADING,
         &format!(
-            "全候補 {} 件・作成可能 {} 件",
+            "全候補 {} 件・作成可能 {} 件・検証用DBの既存課題 {} 件",
             choices.candidate_count,
-            choices.eligible.len()
+            choices.eligible.len(),
+            choices.existing_rows
         ),
     );
     choices

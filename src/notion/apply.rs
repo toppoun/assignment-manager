@@ -17,7 +17,7 @@ pub use moodle_integration::{
     MOODLE_INTEGRATION_SCOPE, MoodlePreviewCoverage, MoodlePreviewMappings,
 };
 #[cfg(any(windows, test))]
-pub use moodle_live_create::{MoodleLiveCreateChoices, MoodleLiveTarget};
+pub use moodle_live_create::{MoodleLiveCreateChoices, MoodleLiveCreateResult, MoodleLiveTarget};
 #[cfg(feature = "synthetic-https-fixture")]
 mod moodle_update;
 #[cfg(feature = "synthetic-https-fixture")]
@@ -138,17 +138,19 @@ struct Observation {
 
 impl Observation {
     fn new(schema: &Schema, page: &Value, mut row: NotionAssignment) -> Result<Self, NotionError> {
-        let (edited_at, title_content) = if row.sync_key.is_some() {
-            let edited_at = page["last_edited_time"]
-                .as_str()
-                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-                .ok_or(NotionError::InvalidResponse)?
-                .to_utc();
-            (Some(edited_at), Some(schema.title_content(page)?.clone()))
+        let edited_at = page["last_edited_time"]
+            .as_str()
+            .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+            .map(|time| time.to_utc());
+        let title_content = if row.sync_key.is_some() {
+            if edited_at.is_none() {
+                return Err(NotionError::InvalidResponse);
+            }
+            Some(schema.title_content(page)?.clone())
         } else {
             // An unreadable manual row cannot safely rule out a duplicate candidate.
             (row.title, row.deadline) = schema.manual_title_deadline(page)?;
-            (None, None)
+            None
         };
         Ok(Self {
             row,

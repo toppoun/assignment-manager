@@ -133,6 +133,30 @@ fn exact_key(rows: Vec<Value>, key: &SyncKey) -> Exchange {
     })
 }
 
+fn postcheck(
+    target: &MoodleLiveTarget,
+    rows: Vec<Value>,
+    entries: &[CourseMapping],
+    course: &CourseMapping,
+) -> Vec<Exchange> {
+    let mut script = vec![bot(target.trial().bot_id(TrialRole::Read))];
+    script.extend(full_plan(vec![], entries).into_iter().take(2));
+    script.push(Exchange::json(
+        "GET",
+        format!("/v1/pages/{}", course.page_id),
+        page(
+            &course.page_id,
+            COURSES,
+            C_DB,
+            json!({
+                "授業名":{"id":"title","type":"title","title":[text(&course.course_key.id)]}
+            }),
+        ),
+    ));
+    script.push(assignment_rows(rows));
+    script
+}
+
 fn assert_intent(path: &Path, key: &SyncKey, status: BindingStatus, id: Option<&str>) {
     let snapshot = StateStore::read(&path.join("state.sqlite3"), ASSIGNMENTS)
         .unwrap()
@@ -157,10 +181,18 @@ fn live_create_evaluates_twelve_but_posts_only_the_selected_task_and_holds_the_r
     let selected = selected.clone();
     let course = entries[1].page_id.clone();
     let manual = existing(MANUAL, None, "Protected manual task", &course);
+    let older_key = key("older-synthetic");
+    let older = existing(
+        "00000000-0000-4000-8000-000000000021",
+        Some(&older_key),
+        "Previous synthetic task",
+        &course,
+    );
+    let prior = vec![manual, older];
     let created = existing(NEW_PAGE, Some(&selected), title, &course);
     let mut script = vec![bot(target.trial().bot_id(TrialRole::Write))];
-    script.extend(full_plan(vec![manual.clone()], &entries));
-    script.extend(full_plan(vec![manual.clone()], &entries));
+    script.extend(full_plan(prior.clone(), &entries));
+    script.extend(full_plan(prior.clone(), &entries));
     script.push(exact_key(vec![], &selected));
     let expected_key = selected.clone();
     let expected_course = course.clone();
@@ -188,12 +220,18 @@ fn live_create_evaluates_twelve_but_posts_only_the_selected_task_and_holds_the_r
             );
         }),
     );
+    let mut after = prior;
+    after.push(created);
+    script.extend(postcheck(&target, after.clone(), &entries, &entries[1]));
+    let mut changed = after.clone();
+    changed[0]["last_edited_time"] = json!("2026-11-22T04:00:00Z");
+    script.extend(postcheck(&target, changed, &entries, &entries[1]));
     for _ in 0..2 {
         script.push(bot(target.trial().bot_id(TrialRole::Write)));
-        script.extend(full_plan(vec![manual.clone(), created.clone()], &entries));
+        script.extend(full_plan(after.clone(), &entries));
     }
     let (client, server) = mock(script);
-    let report = client
+    let result = client
         .create_one_live_moodle(
             &target,
             &input,
@@ -202,6 +240,7 @@ fn live_create_evaluates_twelve_but_posts_only_the_selected_task_and_holds_the_r
             |choices| {
                 assert_eq!(choices.candidate_count, 12);
                 assert_eq!(choices.eligible.len(), 12);
+                assert_eq!(choices.existing_rows, 2);
                 choices.eligible.iter().position(|row| row.title == title)
             },
             |row, held| {
@@ -211,6 +250,7 @@ fn live_create_evaluates_twelve_but_posts_only_the_selected_task_and_holds_the_r
         )
         .unwrap()
         .unwrap();
+    let report = &result.report;
     assert_eq!(
         (report.counts.create, report.counts.update, report.pending),
         (1, 0, 0)
@@ -220,6 +260,11 @@ fn live_create_evaluates_twelve_but_posts_only_the_selected_task_and_holds_the_r
         &selected,
         BindingStatus::Linked,
         Some(NEW_PAGE),
+    );
+    assert_eq!(client.verify_one_live_moodle(&target, &result), Ok((2, 3)));
+    assert_eq!(
+        client.verify_one_live_moodle(&target, &result),
+        Err(NotionError::Conflict)
     );
 
     assert!(
@@ -251,7 +296,7 @@ fn live_create_evaluates_twelve_but_posts_only_the_selected_task_and_holds_the_r
         )
         .unwrap()
         .unwrap();
-    assert_eq!(report.counts.create, 0);
+    assert_eq!(report.report.counts.create, 0);
     assert_intent(
         directory.path(),
         &selected,
@@ -371,7 +416,7 @@ fn live_create_unknown_response_and_failed_sqlite_confirmation_reconcile_without
         };
         let result = create();
         let pending = if lost_response {
-            let report = result.unwrap().unwrap();
+            let report = result.unwrap().unwrap().report;
             assert_eq!(
                 (report.counts.create, report.pending, report.error),
                 (0, 1, Some(NotionError::Transport))
