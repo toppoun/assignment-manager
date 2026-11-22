@@ -11,9 +11,13 @@ mod moodle_create;
 #[cfg(feature = "synthetic-https-fixture")]
 pub use moodle_create::MoodleCreatePreview;
 mod moodle_integration;
+#[cfg(any(windows, test))]
+mod moodle_live_create;
 pub use moodle_integration::{
     MOODLE_INTEGRATION_SCOPE, MoodlePreviewCoverage, MoodlePreviewMappings,
 };
+#[cfg(any(windows, test))]
+pub use moodle_live_create::{MoodleLiveCreateChoices, MoodleLiveTarget};
 #[cfg(feature = "synthetic-https-fixture")]
 mod moodle_update;
 #[cfg(feature = "synthetic-https-fixture")]
@@ -34,7 +38,6 @@ pub enum ApplyError {
     Notion(NotionError),
     State(StateError),
     PlanChanged,
-    #[cfg(feature = "synthetic-https-fixture")]
     CreateBlocked,
     #[cfg(feature = "synthetic-https-fixture")]
     UpdateBlocked,
@@ -79,7 +82,7 @@ pub(super) enum WriteAccess<'a> {
     #[cfg(any(test, feature = "synthetic-https-fixture"))]
     Mock,
     Trial(ApprovedTrial<'a>),
-    #[cfg(feature = "synthetic-https-fixture")]
+    #[cfg(any(windows, test, feature = "synthetic-https-fixture"))]
     MoodleCreate {
         approval: ApprovedTrial<'a>,
         key: &'a SyncKey,
@@ -439,7 +442,7 @@ impl NotionClient {
             }
             Err(error) => {
                 let release_intent = explicitly_rejected(error);
-                #[cfg(feature = "synthetic-https-fixture")]
+                #[cfg(any(windows, test, feature = "synthetic-https-fixture"))]
                 let release_intent =
                     release_intent && !matches!(access, WriteAccess::MoodleCreate { .. });
                 if release_intent {

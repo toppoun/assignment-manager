@@ -4,6 +4,8 @@ mod credentials;
 mod fixture_run;
 #[cfg(windows)]
 mod moodle_integration;
+#[cfg(windows)]
+mod moodle_live;
 #[cfg(feature = "synthetic-https-fixture")]
 mod moodle_plan;
 #[cfg(windows)]
@@ -58,6 +60,14 @@ enum Command {
     MoodleIntegration {
         moodle_config: PathBuf,
         require_windows_vpn: bool,
+    },
+    #[cfg(windows)]
+    MoodleLiveInit,
+    #[cfg(windows)]
+    MoodleLive {
+        moodle_config: PathBuf,
+        require_windows_vpn: bool,
+        action: moodle_live::Action,
     },
     #[cfg(all(windows, feature = "synthetic-https-fixture"))]
     MoodleCreateTrial {
@@ -121,6 +131,37 @@ impl Arguments {
             ["init-state", "--fixture"] => Command::InitState(true),
             ["status"] => Command::Status(false),
             ["status", "--fixture"] => Command::Status(true),
+            #[cfg(windows)]
+            ["sync", "moodle", "--init-state"] if config.is_some() => Command::MoodleLiveInit,
+            #[cfg(windows)]
+            [
+                "sync",
+                "moodle",
+                mode @ ("--create-one" | "--reconcile-one"),
+                "--moodle-config",
+                path,
+                "--allow-university-read",
+                route @ ("--require-windows-vpn" | "--on-campus"),
+                "--allow-notion-read",
+                rest @ ..,
+            ] if config.is_some()
+                && !path.is_empty()
+                && !path.starts_with("--")
+                && matches!(
+                    (*mode, rest),
+                    ("--create-one", ["--allow-notion-create"]) | ("--reconcile-one", [])
+                ) =>
+            {
+                Command::MoodleLive {
+                    moodle_config: PathBuf::from(path),
+                    require_windows_vpn: *route == "--require-windows-vpn",
+                    action: if *mode == "--create-one" {
+                        moodle_live::Action::Create
+                    } else {
+                        moodle_live::Action::Reconcile
+                    },
+                }
+            }
             ["sync", "--dry-run"] => Command::Sync(false),
             ["sync", "--dry-run", "--fixture"] => Command::Sync(true),
             #[cfg(windows)]
@@ -657,6 +698,12 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         println!(
             "Moodle integration: --config NOTION_CONFIG sync moodle --dry-run --moodle-config MOODLE_CONFIG --allow-university-read [--require-windows-vpn | --on-campus] --allow-notion-read"
         );
+        #[cfg(windows)]
+        println!(
+            "Moodle verification write: --config NOTION_CONFIG sync moodle --init-state\n\
+             --config NOTION_CONFIG sync moodle --create-one --moodle-config MOODLE_CONFIG --allow-university-read [--require-windows-vpn | --on-campus] --allow-notion-read --allow-notion-create\n\
+             --config NOTION_CONFIG sync moodle --reconcile-one --moodle-config MOODLE_CONFIG --allow-university-read [--require-windows-vpn | --on-campus] --allow-notion-read"
+        );
         #[cfg(feature = "synthetic-https-fixture")]
         println!("{APPLY_USAGE}");
         #[cfg(all(windows, feature = "synthetic-https-fixture"))]
@@ -677,6 +724,21 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
     {
         let notion_path = args.config.as_deref().ok_or(CliError::Usage)?;
         return moodle_integration::execute(notion_path, moodle_config, *require_windows_vpn);
+    }
+    #[cfg(windows)]
+    match &args.command {
+        Command::MoodleLiveInit => {
+            return moodle_live::initialize_state(args.config.as_deref().ok_or(CliError::Usage)?);
+        }
+        Command::MoodleLive {
+            moodle_config,
+            require_windows_vpn,
+            action,
+        } => {
+            let notion_path = args.config.as_deref().ok_or(CliError::Usage)?;
+            return moodle_live::execute(notion_path, moodle_config, *require_windows_vpn, *action);
+        }
+        _ => (),
     }
     // Fail before accessing local state when this is an ordinary binary.
     if args.command.needs_fixture_build() && !cfg!(feature = "synthetic-https-fixture") {

@@ -24,6 +24,8 @@ pub(super) const PRODUCTION_DATA_SOURCES: [&str; 2] = [
 const MOODLE_VERIFICATION_ASSIGNMENTS: &str = "41e85934-7e84-817e-b1d2-000b68726503";
 pub(super) const MOODLE_VERIFICATION_COURSES: &str = "41e85934-7e84-81df-902b-000bbece9bf7";
 const MOODLE_VERIFICATION_READER: &str = "41e85934-7e84-81d8-9891-00275cb3050f";
+#[cfg(any(windows, test, feature = "synthetic-https-fixture"))]
+pub(super) const MOODLE_VERIFICATION_WRITER: &str = "41e85934-7e84-81b1-a761-002702fbd8d2";
 pub(super) const MOODLE_TRIAL_COURSES: [(&str, &str); 2] = [
     ("照合用の授業", "41e85934-7e84-81c4-8ae6-ec4fcaea84d0"),
     ("別の合成授業", "41e85934-7e84-8172-93b3-f4885b1efc7b"),

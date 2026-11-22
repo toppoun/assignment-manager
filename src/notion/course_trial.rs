@@ -15,11 +15,12 @@ use crate::import::{ExternalRecordKey, OriginKind};
 use super::{
     CourseMapping, MOODLE_INTEGRATION_SCOPE, MoodlePreviewMappings, NotionClient, NotionError,
     NotionTarget, TrialRole, TrialTarget, VerificationTarget,
-    trial::{MOODLE_TRIAL_COURSES, MOODLE_VERIFICATION_COURSES},
+    trial::{
+        MOODLE_TRIAL_COURSES, MOODLE_VERIFICATION_COURSES, MOODLE_VERIFICATION_WRITER as WRITER,
+    },
     wire::{checked_page_id, data_source_parent, page_property, text, uuid},
 };
 
-const WRITER: &str = "41e85934-7e84-81b1-a761-002702fbd8d2";
 const TITLE: &str = "授業名";
 const COURSE_COUNT: usize = 6;
 // Fingerprint the ordered, exact UTF-8 categories without putting those labels in Git.

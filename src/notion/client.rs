@@ -252,7 +252,7 @@ impl NotionClient {
             WriteAccess::Trial(approval) => {
                 self.require_trial_destination(request, approval.target())?
             }
-            #[cfg(feature = "synthetic-https-fixture")]
+            #[cfg(any(windows, test, feature = "synthetic-https-fixture"))]
             WriteAccess::MoodleCreate { approval, key } => {
                 self.require_trial_destination(request, approval.target())?;
                 if request.method() != Method::POST || request.key() != *key {

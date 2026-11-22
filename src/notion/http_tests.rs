@@ -3,6 +3,7 @@ mod apply_tests;
 mod course_trial;
 #[cfg(feature = "synthetic-https-fixture")]
 mod moodle_integration;
+mod moodle_live_create;
 pub(super) mod trial_tests;
 
 use std::{

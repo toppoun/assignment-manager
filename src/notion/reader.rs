@@ -268,12 +268,13 @@ impl NotionClient {
         self.query_assignment_pages(schema, key, |_, row| Ok(row))
     }
 
-    pub(super) fn query_course_page_ids(
+    pub(super) fn query_course_pages<T>(
         &self,
         schema: &Schema,
-    ) -> Result<HashSet<String>, NotionError> {
+        observe: impl Fn(&str, &Value) -> Result<T, NotionError>,
+    ) -> Result<HashMap<String, T>, NotionError> {
         let path = format!("/v1/data_sources/{}/query", schema.courses_id);
-        let mut seen = HashSet::new();
+        let mut pages = HashMap::new();
         paginate(
             |cursor| {
                 let mut body = json!({"page_size":100, "result_type":"page"});
@@ -287,13 +288,14 @@ impl NotionClient {
             },
             |page| {
                 let id = checked_page_id(page, &schema.courses_id, &schema.courses_database)?;
-                if !seen.insert(id) {
+                let observed = observe(&id, page)?;
+                if pages.insert(id, observed).is_some() {
                     return Err(NotionError::IncompleteSnapshot);
                 }
                 Ok(())
             },
         )?;
-        Ok(seen)
+        Ok(pages)
     }
 
     pub(super) fn query_assignment_pages<T>(

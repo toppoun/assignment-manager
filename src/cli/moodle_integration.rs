@@ -29,21 +29,6 @@ pub(super) fn execute(
     let mappings = MoodlePreviewMappings::new(&notion_config.course_mappings)
         .map_err(CliError::MoodlePlanNotion)?;
 
-    // The feed uses its existing credential namespace, independent of the Notion target.
-    let moodle_config = Config::read(moodle_path)?;
-    let source = moodle_config.moodle.as_ref().ok_or(ConfigError::Invalid)?;
-    if source.host != "cms.cis.k.hosei.ac.jp"
-        || source.path != "/calendar/export_execute.php"
-        || source.scope != MOODLE_INTEGRATION_SCOPE
-    {
-        return Err(ConfigError::Invalid.into());
-    }
-    let directory = moodle_path.parent().unwrap_or(Path::new("."));
-    let Some(policy) = university::secured_moodle_policy(source, directory, require_windows_vpn)?
-    else {
-        println!("result=failed reason=moodle_setup errors=1");
-        return Ok(1);
-    };
     let id = target.assignment_id();
     let path = config::root()?
         .join("targets")
@@ -51,33 +36,22 @@ pub(super) fn execute(
         .join("state.sqlite3");
     let state = StateStore::read(&path, id)?;
     let client = credentials::notion_client(id).map_err(CliError::Credential)?;
-    let (mut clients, feed) = university::prepare_moodle_request(&moodle_config, source, policy)?;
     println!(
         "sqlite={} confirmation=required",
         if state.is_some() {
             "read_only"
         } else {
             "absent"
-        },
+        }
     );
-    match moodle_review::confirm_fetch(
+    let acquired = match acquire_live_moodle(
+        moodle_path,
         require_windows_vpn,
         "Moodleを取得し、検証用Notion DBとの読み取り専用の差分計画を作成します。",
-    ) {
-        Ok(true) => (),
-        Ok(false) => {
-            println!("result=cancelled reason=moodle_confirmation_declined");
-            return Ok(2);
-        }
-        Err(()) => {
-            println!("result=blocked reason=moodle_confirmation_unavailable errors=1");
-            return Ok(3);
-        }
-    }
-    clients.begin_run();
-    let acquired = university::acquire_moodle_for_check(&clients, &feed);
-    drop((clients, feed));
-
+    )? {
+        Acquisition::Fetched(acquired) => acquired,
+        Acquisition::Stopped(code) => return Ok(code),
+    };
     let result = plan_acquisition(acquired.as_ref(), &mappings, |input| {
         let preview =
             client.preview_moodle_integration(&target, input, &mappings, state.unwrap_or_default());
@@ -96,14 +70,80 @@ pub(super) fn execute(
     result
 }
 
-fn plan_acquisition(
+pub(super) enum Acquisition {
+    Fetched(Option<MoodleAcquisition>),
+    Stopped(u8),
+}
+
+pub(super) fn acquire_live_moodle(
+    moodle_path: &Path,
+    require_windows_vpn: bool,
+    description: &str,
+) -> Result<Acquisition, CliError> {
+    // The feed uses its existing credential namespace, independent of the Notion target.
+    let moodle_config = Config::read(moodle_path)?;
+    let source = moodle_config.moodle.as_ref().ok_or(ConfigError::Invalid)?;
+    if source.host != "cms.cis.k.hosei.ac.jp"
+        || source.path != "/calendar/export_execute.php"
+        || source.scope != MOODLE_INTEGRATION_SCOPE
+    {
+        return Err(ConfigError::Invalid.into());
+    }
+    let directory = moodle_path.parent().unwrap_or(Path::new("."));
+    let Some(policy) = university::secured_moodle_policy(source, directory, require_windows_vpn)?
+    else {
+        println!("result=failed reason=moodle_setup errors=1");
+        return Ok(Acquisition::Stopped(1));
+    };
+    let (mut clients, feed) = university::prepare_moodle_request(&moodle_config, source, policy)?;
+    match moodle_review::confirm_fetch(require_windows_vpn, description) {
+        Ok(true) => (),
+        Ok(false) => {
+            println!("result=cancelled reason=moodle_confirmation_declined");
+            return Ok(Acquisition::Stopped(2));
+        }
+        Err(()) => {
+            println!("result=blocked reason=moodle_confirmation_unavailable errors=1");
+            return Ok(Acquisition::Stopped(3));
+        }
+    }
+    clients.begin_run();
+    let acquired = university::acquire_moodle_for_check(&clients, &feed);
+    Ok(Acquisition::Fetched(acquired))
+}
+
+pub(super) fn plan_acquisition(
     acquired: Option<&MoodleAcquisition>,
     mappings: &MoodlePreviewMappings<'_>,
     plan: impl FnOnce(&SyncInput) -> Result<DryRunCounts, CliError>,
 ) -> Result<u8, CliError> {
+    let input = match checked_moodle_input(acquired, mappings)? {
+        Ok(input) => input,
+        Err(code) => return Ok(code),
+    };
+    let counts = plan(&input).inspect_err(|_| println!("phase=notion_preview errors=1"))?;
+    let errors = counts.conflict + counts.deferred;
+    let ready = errors == 0 && counts.course_relation_mismatch == 0;
+    let result = if ready { "success" } else { "blocked" };
+    println!(
+        "result={result} create={} update={} unchanged={} errors={errors} conflict={} deferred={} course_relation_mismatch={}",
+        counts.create,
+        counts.update,
+        counts.unchanged,
+        counts.conflict,
+        counts.deferred,
+        counts.course_relation_mismatch
+    );
+    Ok(if ready { 0 } else { 3 })
+}
+
+pub(super) fn checked_moodle_input(
+    acquired: Option<&MoodleAcquisition>,
+    mappings: &MoodlePreviewMappings<'_>,
+) -> Result<Result<SyncInput, u8>, CliError> {
     let Some(acquired) = acquired else {
         println!("result=failed reason=moodle_acquisition errors=1");
-        return Ok(1);
+        return Ok(Err(1));
     };
     let input = match SyncInput::from_acquisitions(Some(acquired), None) {
         Ok(input) => input,
@@ -114,7 +154,7 @@ fn plan_acquisition(
                 "moodle_invalid_candidates"
             };
             println!("result=failed reason={reason} errors=1");
-            return Ok(1);
+            return Ok(Err(1));
         }
     };
     let coverage = mappings
@@ -142,22 +182,9 @@ fn plan_acquisition(
             "incomplete_course_mappings"
         };
         println!("result=blocked reason={reason} errors=1");
-        return Ok(3);
+        return Ok(Err(3));
     }
-    let counts = plan(&input).inspect_err(|_| println!("phase=notion_preview errors=1"))?;
-    let errors = counts.conflict + counts.deferred;
-    let ready = errors == 0 && counts.course_relation_mismatch == 0;
-    let result = if ready { "success" } else { "blocked" };
-    println!(
-        "result={result} create={} update={} unchanged={} errors={errors} conflict={} deferred={} course_relation_mismatch={}",
-        counts.create,
-        counts.update,
-        counts.unchanged,
-        counts.conflict,
-        counts.deferred,
-        counts.course_relation_mismatch
-    );
-    Ok(if ready { 0 } else { 3 })
+    Ok(Ok(input))
 }
 
 #[cfg(all(test, feature = "synthetic-https-fixture"))]

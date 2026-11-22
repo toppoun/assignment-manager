@@ -5,7 +5,10 @@ use crate::{
     import::{ExternalRecordKey, OriginKind},
     notion::{
         CourseMapping, DryRunReport, NotionClient, NotionError, SyncInput, UniversitySource,
-        VerificationTarget, state::StateSummary, trial::MOODLE_TRIAL_COURSES, wire::uuid,
+        VerificationTarget,
+        state::StateSummary,
+        trial::MOODLE_TRIAL_COURSES,
+        wire::{Schema, page_property, text, uuid},
     },
 };
 
@@ -109,9 +112,35 @@ impl NotionClient {
         }
         target.verify_reader(self)?;
         let schema = target.retrieve_schema(self)?;
-        let course_pages = self.query_course_page_ids(&schema)?;
+        Ok(self
+            .prepare_moodle_plan(schema, input, mappings, state, false)?
+            .deltas)
+    }
+
+    pub(super) fn prepare_moodle_plan(
+        &self,
+        schema: Schema,
+        input: &SyncInput,
+        mappings: &MoodlePreviewMappings<'_>,
+        state: StateSummary,
+        verify_titles: bool,
+    ) -> Result<super::PreparedApply, NotionError> {
+        let expected_titles: HashMap<_, _> = mappings
+            .by_course
+            .iter()
+            .map(|(key, page)| (page.as_str(), key.id.as_str()))
+            .collect();
+        let course_pages = self.query_course_pages(&schema, |id, page| {
+            if verify_titles
+                && let Some(expected) = expected_titles.get(id)
+                && text(page_property(page, "title", "title")?)? != *expected
+            {
+                return Err(NotionError::CourseMappingOutsideTarget);
+            }
+            Ok(())
+        })?;
         let verify_course = |id: &str| {
-            if course_pages.contains(id) {
+            if course_pages.contains_key(id) {
                 Ok(())
             } else {
                 Err(NotionError::CourseMappingOutsideTarget)
@@ -120,7 +149,7 @@ impl NotionClient {
         for id in mappings.by_course.values() {
             verify_course(id)?;
         }
-        let plan = self.prepare_plan(schema, state, |schema, rows| {
+        self.prepare_plan(schema, state, |schema, rows| {
             self.plan_from_rows_with_course_check(
                 input,
                 schema,
@@ -128,7 +157,6 @@ impl NotionClient {
                 mappings.entries,
                 verify_course,
             )
-        })?;
-        Ok(plan.deltas)
+        })
     }
 }

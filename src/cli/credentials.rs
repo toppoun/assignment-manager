@@ -104,8 +104,10 @@ pub(super) fn notion_client(
 #[cfg(any(windows, target_os = "macos"))]
 pub(super) use native::{lookup, moodle_url, notion_client, register};
 
+#[cfg(windows)]
+pub(super) use native::trial_client;
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
-pub(super) use native::{moodle_trial_writer_present, register_moodle_trial_writer, trial_client};
+pub(super) use native::{moodle_trial_writer_present, register_moodle_trial_writer};
 #[cfg(target_os = "macos")]
 pub(super) use native::{register_trial, trial_client};
 
@@ -177,7 +179,6 @@ mod native {
         Ok(Zeroizing::new(url.to_owned()))
     }
 
-    #[cfg(any(target_os = "macos", all(windows, feature = "synthetic-https-fixture")))]
     fn trial_item(
         target: &assignment_manager::notion::TrialTarget,
         role: assignment_manager::notion::TrialRole,
@@ -195,7 +196,6 @@ mod native {
         (service, account)
     }
 
-    #[cfg(any(target_os = "macos", all(windows, feature = "synthetic-https-fixture")))]
     pub(in crate::cli) fn trial_client(
         target: &assignment_manager::notion::TrialTarget,
         role: assignment_manager::notion::TrialRole,

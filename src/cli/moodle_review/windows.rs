@@ -1,6 +1,7 @@
 //! Native dialog controls. Candidate data is passed only to this process's window.
 
 mod categories;
+mod create;
 
 use std::{
     cell::RefCell,
@@ -25,6 +26,7 @@ use windows_sys::{
 use super::{CHOICES, Counts, Review};
 
 pub(super) use categories::show_categories;
+pub(in crate::cli) use create::{approve_create, choose_create};
 
 const CANDIDATES: i32 = 100;
 const DETAILS: i32 = 101;

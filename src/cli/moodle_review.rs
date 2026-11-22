@@ -8,6 +8,7 @@ use assignment_manager::{domain::Deadline, moodle::MoodleEventKind, sync::Moodle
 use chrono::FixedOffset;
 
 pub(super) use windows::confirm_fetch;
+pub(super) use windows::{approve_create, choose_create};
 
 pub(super) fn review(acquired: MoodleAcquisition) -> bool {
     let mut categories = Categories::from_acquisition(&acquired);

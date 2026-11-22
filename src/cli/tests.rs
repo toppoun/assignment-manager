@@ -51,6 +51,49 @@ fn integration_cli_requires_explicit_dual_read_permissions_and_network_route() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn live_moodle_cli_separates_local_init_explicit_single_create_and_read_only_recovery() {
+    let prefix = ["--config", "live.json", "sync", "moodle"];
+    assert_eq!(
+        parse(&[prefix.as_slice(), &["--init-state"]].concat())
+            .unwrap()
+            .command,
+        Command::MoodleLiveInit,
+    );
+    let flags = [
+        "--moodle-config",
+        "moodle.json",
+        "--allow-university-read",
+        "--require-windows-vpn",
+        "--allow-notion-read",
+    ];
+    let create = [prefix.as_slice(), &["--create-one"], flags.as_slice()].concat();
+    assert_eq!(parse(&create), Err(CliError::Usage));
+    let mut approved = create;
+    approved.push("--allow-notion-create");
+    assert_eq!(
+        parse(&approved).unwrap().command,
+        Command::MoodleLive {
+            moodle_config: PathBuf::from("moodle.json"),
+            require_windows_vpn: true,
+            action: moodle_live::Action::Create,
+        },
+    );
+    approved.extend(["--uid", "synthetic@example.invalid"]);
+    assert_eq!(parse(&approved), Err(CliError::Usage));
+    let mut recover = [prefix.as_slice(), &["--reconcile-one"], flags.as_slice()].concat();
+    assert!(matches!(
+        parse(&recover).unwrap().command,
+        Command::MoodleLive {
+            action: moodle_live::Action::Reconcile,
+            ..
+        }
+    ));
+    recover.push("--allow-notion-create");
+    assert_eq!(parse(&recover), Err(CliError::Usage));
+}
+
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
 #[test]
 fn moodle_create_trial_cli_requires_a_single_uid_and_has_no_bulk_mode() {

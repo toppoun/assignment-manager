@@ -21,6 +21,8 @@ pub use apply::{ApplyError, ApplyPreview, ApplyReport};
 pub use apply::{MOODLE_INTEGRATION_SCOPE, MoodlePreviewCoverage, MoodlePreviewMappings};
 #[cfg(feature = "synthetic-https-fixture")]
 pub use apply::{MoodleCreatePreview, MoodleUpdatePreview};
+#[cfg(any(windows, test))]
+pub use apply::{MoodleLiveCreateChoices, MoodleLiveTarget};
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
 #[cfg(feature = "synthetic-https-fixture")]
 pub use course_trial::{CourseCreationTrial, CourseSnapshot, CourseTrialError};
