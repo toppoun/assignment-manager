@@ -1,5 +1,7 @@
 //! Native dialog controls. Candidate data is passed only to this process's window.
 
+mod categories;
+
 use std::{
     cell::RefCell,
     mem::size_of,
@@ -22,6 +24,8 @@ use windows_sys::{
 
 use super::{CHOICES, Counts, Review};
 
+pub(super) use categories::show_categories;
+
 const CANDIDATES: i32 = 100;
 const DETAILS: i32 = 101;
 const CHOICE: i32 = 102;
@@ -30,15 +34,22 @@ const SUMMARY: i32 = 104;
 const FINISHED: isize = 1;
 const WINDOW_FAILED: isize = -2;
 
-pub(in crate::cli) fn confirm_fetch() -> Result<bool, ()> {
+pub(in crate::cli) fn confirm_fetch(require_windows_vpn: bool) -> Result<bool, ()> {
     if !interactive_station() {
         return Err(());
     }
+    let vpn = if require_windows_vpn {
+        "FortiClientで大学公式VPN hosei が接続中であることを確認してください。\r\n"
+    } else {
+        ""
+    };
     match message(
         null_mut(),
-        "取得した授業名と活動名を、この端末の照合画面にだけ表示します。\r\n\
-         画面を確認できる場合は OK を押してください。Moodleの取得は最大1回です。",
-        MB_OKCANCEL | MB_ICONINFORMATION,
+        &format!(
+            "{vpn}この端末の専用画面で授業カテゴリを表示し、必要に応じて課題を個別照合できます。\r\n\
+             開始する場合は OK を押してください。Moodleの取得は最大1回です。"
+        ),
+        MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2,
     ) {
         IDOK => Ok(true),
         IDCANCEL => Ok(false),
@@ -50,6 +61,24 @@ pub(super) fn show(review: &mut Review) -> Result<Option<Counts>, ()> {
     if !interactive_station() {
         return Err(());
     }
+    let instance = unsafe { GetModuleHandleW(null()) };
+    if instance.is_null() {
+        return Err(());
+    }
+    let mut state = RefCell::new(Session {
+        review,
+        finished: None,
+        instance,
+    });
+    let result = open_dialog(instance, "Moodle 課題照合", Some(dialog_proc), &mut state);
+    match result {
+        FINISHED => state.into_inner().finished.map(Some).ok_or(()),
+        0 => Ok(None),
+        _ => Err(()),
+    }
+}
+
+fn open_dialog<T>(instance: HINSTANCE, title: &str, proc: DLGPROC, state: &mut T) -> isize {
     // Windows requires the template buffer to be aligned on a DWORD boundary.
     #[repr(align(4))]
     struct Template([u16; 128]);
@@ -76,36 +105,22 @@ pub(super) fn show(review: &mut Review) -> Result<Option<Counts>, ()> {
     for (slot, value) in template.0.iter_mut().zip(
         header
             .into_iter()
-            .chain("Moodle 課題照合".encode_utf16())
+            .chain(title.encode_utf16())
             .chain([0, 9])
             .chain("Segoe UI".encode_utf16())
             .chain([0]),
     ) {
         *slot = value;
     }
-    let instance = unsafe { GetModuleHandleW(null()) };
-    if instance.is_null() {
-        return Err(());
-    }
-    let mut state = RefCell::new(Session {
-        review,
-        finished: None,
-        instance,
-    });
     // The dialog owns no Rust data. This pointer stays live until its modal loop returns.
-    let result = unsafe {
+    unsafe {
         DialogBoxIndirectParamW(
             instance,
             template.0.as_ptr().cast(),
             null_mut(),
-            Some(dialog_proc),
-            from_mut(&mut state) as isize,
+            proc,
+            from_mut(state) as isize,
         )
-    };
-    match result {
-        FINISHED => state.into_inner().finished.map(Some).ok_or(()),
-        0 => Ok(None),
-        _ => Err(()),
     }
 }
 
@@ -257,7 +272,34 @@ fn initialize(window: HWND, state: &Session<'_>) -> bool {
             [326, 225, 55, 16],
         ),
     ];
-    for (id, class, caption, style, [x, y, width, height]) in controls {
+    if !create_controls(window, state.instance, &controls) {
+        return false;
+    }
+    for (index, row) in state.review.rows.iter().enumerate() {
+        let preview: String = visible_text(&row.activity).chars().take(38).collect();
+        if !add_item(
+            window,
+            CANDIDATES,
+            LB_ADDSTRING,
+            &format!("{:02}  {preview}", index + 1),
+        ) {
+            return false;
+        }
+    }
+    for (_, label) in CHOICES {
+        if !add_item(window, CHOICE, CB_ADDSTRING, label) {
+            return false;
+        }
+    }
+    send(window, CANDIDATES, LB_SETCURSEL, 0, 0);
+    show_selected(window, state.review);
+    true
+}
+
+type Control = (i32, windows_sys::core::PCWSTR, &'static str, u32, [i32; 4]);
+
+fn create_controls(window: HWND, instance: HINSTANCE, controls: &[Control]) -> bool {
+    for &(id, class, caption, style, [x, y, width, height]) in controls {
         let mut rect = RECT {
             left: x,
             top: y,
@@ -280,7 +322,7 @@ fn initialize(window: HWND, state: &Session<'_>) -> bool {
                 rect.bottom - rect.top,
                 window,
                 id as isize as HMENU,
-                state.instance,
+                instance,
                 null(),
             )
         };
@@ -293,24 +335,6 @@ fn initialize(window: HWND, state: &Session<'_>) -> bool {
         }
     }
 
-    for (index, row) in state.review.rows.iter().enumerate() {
-        let preview: String = visible_text(&row.activity).chars().take(38).collect();
-        if !add_item(
-            window,
-            CANDIDATES,
-            LB_ADDSTRING,
-            &format!("{:02}  {preview}", index + 1),
-        ) {
-            return false;
-        }
-    }
-    for (_, label) in CHOICES {
-        if !add_item(window, CHOICE, CB_ADDSTRING, label) {
-            return false;
-        }
-    }
-    send(window, CANDIDATES, LB_SETCURSEL, 0, 0);
-    show_selected(window, state.review);
     true
 }
 

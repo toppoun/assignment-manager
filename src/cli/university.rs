@@ -30,7 +30,7 @@ pub(super) fn moodle(
     };
     #[cfg(windows)]
     if review_local {
-        match super::moodle_review::confirm_fetch() {
+        match super::moodle_review::confirm_fetch(require_windows_vpn) {
             Ok(true) => (),
             Ok(false) => {
                 println!("review result=cancelled");

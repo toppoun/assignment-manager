@@ -2,7 +2,7 @@
 
 mod windows;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use assignment_manager::{domain::Deadline, moodle::MoodleEventKind, sync::MoodleAcquisition};
 use chrono::FixedOffset;
@@ -10,6 +10,19 @@ use chrono::FixedOffset;
 pub(super) use windows::confirm_fetch;
 
 pub(super) fn review(acquired: MoodleAcquisition) -> bool {
+    let mut categories = Categories::from_acquisition(&acquired);
+    categories.print_totals();
+    let action = windows::show_categories(&mut categories);
+    categories.print_mapping_totals();
+    match action {
+        Ok(CategoryAction::Finish) => return true,
+        Ok(CategoryAction::ReviewAssignments) => (),
+        Err(()) => {
+            println!("review diagnostic=category_window_unavailable");
+            return false;
+        }
+    }
+
     let Some(mut review) = Review::from_acquisition(&acquired) else {
         println!("review diagnostic=review_metadata_invalid");
         return false;
@@ -37,6 +50,124 @@ pub(super) fn review(acquired: MoodleAcquisition) -> bool {
             println!("review diagnostic=review_window_unavailable");
             false
         }
+    }
+}
+
+struct Categories {
+    rows: Vec<Category>,
+    unclassified: usize,
+}
+
+struct Category {
+    name: String,
+    candidates: usize,
+    choice: CategoryChoice,
+}
+
+enum CategoryAction {
+    Finish,
+    ReviewAssignments,
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum CategoryChoice {
+    Pending,
+    Existing,
+    NewPage,
+    Ambiguous,
+}
+
+const CATEGORY_CHOICES: [(CategoryChoice, &str); 4] = [
+    (CategoryChoice::Pending, "未確認"),
+    (CategoryChoice::Existing, "正しい検証用授業ページがある"),
+    (CategoryChoice::NewPage, "新しい検証用授業ページが必要"),
+    (CategoryChoice::Ambiguous, "対応が曖昧"),
+];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CategoryCounts {
+    pending: usize,
+    existing: usize,
+    new_pages: usize,
+    ambiguous: usize,
+}
+
+impl Categories {
+    fn from_acquisition(acquired: &MoodleAcquisition) -> Self {
+        Self::from_names(
+            acquired
+                .assignments()
+                .batch()
+                .as_slice()
+                .iter()
+                .map(|item| {
+                    acquired
+                        .course_for(&item.external_key)
+                        .map(|course| course.name.as_str())
+                }),
+        )
+    }
+
+    fn from_names<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> Self {
+        let mut groups = BTreeMap::new();
+        let mut unclassified = 0;
+        for name in names {
+            if let Some(name) = name {
+                *groups.entry(name).or_insert(0) += 1;
+            } else {
+                unclassified += 1;
+            }
+        }
+        let rows = groups
+            .into_iter()
+            .map(|(name, candidates)| Category {
+                name: name.to_owned(),
+                candidates,
+                choice: CategoryChoice::Pending,
+            })
+            .collect();
+        Self { rows, unclassified }
+    }
+
+    fn classified(&self) -> usize {
+        self.rows.iter().map(|row| row.candidates).sum()
+    }
+
+    fn mapping_counts(&self) -> CategoryCounts {
+        let mut counts = CategoryCounts::default();
+        for row in &self.rows {
+            match row.choice {
+                CategoryChoice::Pending => counts.pending += 1,
+                CategoryChoice::Existing => counts.existing += 1,
+                CategoryChoice::NewPage => counts.new_pages += 1,
+                CategoryChoice::Ambiguous => counts.ambiguous += 1,
+            }
+        }
+        counts
+    }
+
+    fn print_totals(&self) {
+        let classified = self.classified();
+        println!(
+            "moodle_categories candidates={} distinct={} classified={classified} unclassified={}",
+            classified + self.unclassified,
+            self.rows.len(),
+            self.unclassified,
+        );
+        // Print the distribution in descending order, independent of the category names.
+        let mut sizes: Vec<_> = self.rows.iter().map(|row| row.candidates).collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        let distribution: Vec<_> = sizes.iter().map(usize::to_string).collect();
+        println!("moodle_category_sizes counts=[{}]", distribution.join(","));
+    }
+
+    fn print_mapping_totals(&self) {
+        let counts = self.mapping_counts();
+        println!(
+            "moodle_category_mapping existing={} new_pages={} ambiguous={} pending={}",
+            counts.existing, counts.new_pages, counts.ambiguous, counts.pending,
+        );
     }
 }
 
@@ -179,6 +310,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn categories_group_exact_values_and_track_mapping_choices_separately() {
+        let mut categories = Categories::from_names([
+            Some("ゼミ"),
+            Some("ゼミ"),
+            Some("ゼミＡ"),
+            Some("ゼミA"),
+            Some("講義"),
+            None,
+        ]);
+        assert_eq!(categories.rows.len(), 4);
+        assert_eq!(categories.classified(), 5);
+        assert_eq!(categories.unclassified, 1);
+        assert_eq!(categories.rows[0].name, "ゼミ");
+        assert_eq!(categories.rows[0].candidates, 2);
+        categories.rows[0].choice = CategoryChoice::Existing;
+        categories.rows[1].choice = CategoryChoice::NewPage;
+        categories.rows[2].choice = CategoryChoice::Ambiguous;
+        assert_eq!(
+            categories.mapping_counts(),
+            CategoryCounts {
+                pending: 1,
+                existing: 1,
+                new_pages: 1,
+                ambiguous: 1,
+            }
+        );
+    }
+
+    #[test]
     fn review_requires_a_choice_for_each_row_and_an_explicit_missing_count() {
         let mut review = Review {
             rows: CHOICES
@@ -231,8 +391,13 @@ mod tests {
         )
         .unwrap();
         let acquired = acquire_moodle_with_diagnostic(&clients.moodle().unwrap(), &feed).unwrap();
+        let categories = Categories::from_acquisition(&acquired);
         let review = Review::from_acquisition(&acquired).unwrap();
         assert_eq!(university.requests(), 1);
+        assert_eq!(categories.rows.len(), 2);
+        assert_eq!(categories.classified(), 3);
+        assert_eq!(categories.unclassified, 0);
+        assert!(categories.rows.iter().any(|row| row.candidates == 2));
         assert_eq!(review.rows.len(), 3);
         assert_eq!(review.repeated_groups, 1);
         assert_eq!(review.rows[0].possible_activity_events, 2);
