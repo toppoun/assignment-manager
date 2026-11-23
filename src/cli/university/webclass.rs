@@ -67,7 +67,7 @@ pub(in crate::cli) fn check_browser_config(explicit: Option<&Path>) -> Result<()
 }
 
 #[cfg(windows)]
-pub(in crate::cli) fn browser(keep_profile: bool) -> u8 {
+pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8 {
     use assignment_manager::webclass_browser::{self, ProfileMode};
 
     if !crate::cli::windows_dialog::interactive_station() {
@@ -82,11 +82,58 @@ pub(in crate::cli) fn browser(keep_profile: bool) -> u8 {
     } else {
         (ProfileMode::Temporary, "temporary")
     };
+    if let Some(course_id) = course_id {
+        let check = webclass_browser::run_for_course(mode, course_id);
+        println!(
+            "webclass browser lms_reached={} courses_get={} contents_get={} profile={profile}",
+            check.lms_reached, check.courses_get, check.contents_get,
+        );
+        report_browser_navigation(check.navigation);
+        return match check.result {
+            Ok(result) => {
+                use assignment_manager::domain::Deadline;
+
+                println!(
+                    "webclass course {}",
+                    serde_json::json!({"group_id": result.course.group_id, "group_name": result.course.group_name})
+                );
+                let jst = chrono::FixedOffset::east_opt(9 * 3600)
+                    .expect("+09:00 is a valid fixed offset");
+                let assignments = result.assignments.batch().as_slice();
+                for assignment in assignments {
+                    let deadline = assignment.deadline.as_ref().map(|deadline| match deadline {
+                        Deadline::DateTime(value) => value.with_timezone(&jst).to_rfc3339(),
+                        Deadline::DateOnly(value) => value.to_string(),
+                    });
+                    println!(
+                        "webclass assignment {}",
+                        serde_json::json!({
+                            "group_id": assignment.external_key.scope,
+                            "contents_id": assignment.external_key.id,
+                            "title": assignment.title,
+                            "deadline": deadline,
+                            "submission_url": assignment.submission_url,
+                        })
+                    );
+                }
+                println!(
+                    "webclass assignments={} validation=passed",
+                    assignments.len()
+                );
+                finish(true)
+            }
+            Err(reason) => {
+                println!("webclass assignments=0 validation=failed diagnostic={reason}");
+                finish(false)
+            }
+        };
+    }
     let check = webclass_browser::run(mode);
     println!(
         "webclass browser lms_reached={} courses_get={} profile={profile}",
         check.lms_reached, check.courses_get
     );
+    report_browser_navigation(check.navigation);
     match check.result {
         Ok(courses) => {
             for course in courses.records() {
@@ -121,8 +168,20 @@ pub(in crate::cli) fn browser(keep_profile: bool) -> u8 {
     }
 }
 
+#[cfg(windows)]
+fn report_browser_navigation(
+    navigation: Option<assignment_manager::webclass_browser::BrowserNavigation>,
+) {
+    if let Some(navigation) = navigation {
+        println!(
+            "webclass browser_navigation {}",
+            serde_json::json!(navigation)
+        );
+    }
+}
+
 #[cfg(not(windows))]
-pub(in crate::cli) fn browser(_keep_profile: bool) -> u8 {
+pub(in crate::cli) fn browser(_keep_profile: bool, _course_id: Option<&str>) -> u8 {
     println!("webclass browser diagnostic=windows_required");
     finish(false)
 }

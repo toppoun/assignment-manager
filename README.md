@@ -60,7 +60,7 @@ cargo run --locked --offline --features synthetic-https-fixture -- university-ch
 Moodleの実データ読み取り手順、WebClassの認証上の制約、両OSの検証条件は
 [Notion同期 Phase 4A](docs/NOTION-SYNC-PHASE-4A.md)を参照してください。
 
-### WebClassの授業一覧だけを確認する
+### WebClassの授業一覧と1授業の課題を確認する
 
 Windowsでは、授業一覧の標準経路は専用Edgeです。Edge、PATH上のNode.js、Windowsのデスクトップセッション、
 大学への接続が必要です。実通信を承認した場合は次を実行します。
@@ -80,6 +80,21 @@ Edgeのデータは現在のWindowsユーザーの `%LOCALAPPDATA%\AssignmentMan
 公式画面から認証を行います。`--browser` は従来のコマンドとの互換のため利用できます。
 設定ファイルがある場合はWebClassの有効・無効を確認します。Edgeでの認証に登録済み資格情報は不要です。
 [ブラウザ経路の通信と制約](docs/WEB-NETWORK-SECURITY.md#webclassのブラウザ認証)
+
+#### 1授業の課題を確認する
+
+授業一覧で表示された対象の `group_id` を指定します。本番の読み取りが承認された場合に実行します。
+
+```powershell
+cargo run --locked --offline -- university-check webclass --course-id 'GROUP_ID' --allow-university-read
+```
+
+一時プロファイルが既定で、末尾に `--keep-profile` を付けると専用プロファイルを再利用します。
+毎回、取得した一覧でIDが完全一致したときだけ、同じEdgeタブから対象授業の課題を1回取得します。
+取得対象には提出済みの課題も含まれます。この確認コマンドでは完了状態の判定や更新は行いません。
+表示項目は授業名とID、課題名とID、期限（日本時間）、提出先URLです。期限がない場合や、取得データから
+提出先URLを確認できない場合は `null` と表示します。表示できる課題が0件の場合も取得と検証が成功すれば
+終了コードは `0` です。IDの不一致、認証失効、応答の検証失敗は終了コード `1` です。
 
 #### オフラインとHTTP診断
 

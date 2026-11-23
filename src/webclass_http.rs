@@ -12,12 +12,20 @@ use crate::university_network::{
     BodyKind, NetworkError, Transport, WEBCLASS_ORIGIN as ORIGIN, read_text,
 };
 pub(crate) const COURSES_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/courses";
-const CONTENTS_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
+pub(crate) const CONTENTS_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
 pub(crate) const DASHBOARD_PATH: &str =
     "/webclass/ip_mods.php/plugin/score_summary_table/dashboard";
 const LOGIN_PATH: &str = "/webclass/login.php";
 const APPLICATION_USER_AGENT: &str =
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+pub(crate) fn contents_url(base: &Url, group_id: &str) -> Url {
+    let mut url = base
+        .join(CONTENTS_PATH)
+        .expect("fixed WebClass contents path");
+    url.query_pairs_mut().append_pair("group_id", group_id);
+    url
+}
 
 /// Errors contain no request URL, headers, response body, or underlying transport error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,9 +95,7 @@ impl WebClassClient {
     ///
     /// Empty IDs are passed through, consistent with the existing parser's string IDs.
     pub fn fetch_contents_json(&self, group_id: &str) -> Result<String, WebClassHttpError> {
-        let mut url = self.endpoint(CONTENTS_PATH);
-        url.query_pairs_mut().append_pair("group_id", group_id);
-        self.fetch_json(url, false)
+        self.fetch_json(contents_url(&self.base_url, group_id), false)
     }
 
     pub(crate) fn shares_run(

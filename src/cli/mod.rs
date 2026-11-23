@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
-const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nWebClass (Windows Edge): university-check webclass --courses-only --allow-university-read [--keep-profile]\nWebClass HTTP diagnostics: university-check webclass --courses-only --allow-university-read --http-probe [--stop-before-consent]\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], university-check webclass --courses-only --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nWebClass (Windows Edge): university-check webclass (--courses-only | --course-id ID) --allow-university-read [--keep-profile]\nWebClass HTTP diagnostics: university-check webclass --courses-only --allow-university-read --http-probe [--stop-before-consent]\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], university-check webclass --courses-only --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 #[cfg(feature = "synthetic-https-fixture")]
 const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)\nMoodle plan: sync moodle --dry-run --fixture\nNotion verification preview: --config PATH sync moodle --dry-run --fixture --allow-notion-read --target ASSIGNMENTS_ID --courses COURSES_ID --reader BOT_ID";
 
@@ -94,8 +94,13 @@ enum Command {
 
 #[derive(Debug, PartialEq, Eq)]
 enum WebClassCheckMode {
-    Browser { keep_profile: bool },
-    HttpProbe { stop_before_consent: bool },
+    Browser {
+        keep_profile: bool,
+        course_id: Option<String>,
+    },
+    HttpProbe {
+        stop_before_consent: bool,
+    },
     Fixture,
     Local,
 }
@@ -258,12 +263,17 @@ impl Arguments {
                     [] | ["--browser"] => (
                         WebClassCheckMode::Browser {
                             keep_profile: false,
+                            course_id: None,
                         },
                         false,
                     ),
-                    ["--keep-profile"] | ["--browser", "--keep-profile"] => {
-                        (WebClassCheckMode::Browser { keep_profile: true }, false)
-                    }
+                    ["--keep-profile"] | ["--browser", "--keep-profile"] => (
+                        WebClassCheckMode::Browser {
+                            keep_profile: true,
+                            course_id: None,
+                        },
+                        false,
+                    ),
                     ["--stop-before-consent"] | ["--http-probe", "--stop-before-consent"] => (
                         WebClassCheckMode::HttpProbe {
                             stop_before_consent: true,
@@ -285,6 +295,27 @@ impl Arguments {
                     _ => return Err(CliError::Usage),
                 };
                 Command::UniversityWebClass { mode, review_local }
+            }
+            [
+                "university-check",
+                "webclass",
+                "--course-id",
+                id,
+                "--allow-university-read",
+                rest @ ..,
+            ] if !id.trim().is_empty() && !id.starts_with("--") => {
+                let keep_profile = match rest {
+                    [] | ["--browser"] => false,
+                    ["--keep-profile"] | ["--browser", "--keep-profile"] => true,
+                    _ => return Err(CliError::Usage),
+                };
+                Command::UniversityWebClass {
+                    mode: WebClassCheckMode::Browser {
+                        keep_profile,
+                        course_id: Some((*id).into()),
+                    },
+                    review_local: false,
+                }
             }
             [
                 "university-check",
@@ -881,9 +912,16 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         );
     }
     if let Command::UniversityWebClass { mode, review_local } = args.command {
-        if let WebClassCheckMode::Browser { keep_profile } = mode {
+        if let WebClassCheckMode::Browser {
+            keep_profile,
+            course_id,
+        } = &mode
+        {
             university::webclass::check_browser_config(args.config.as_deref())?;
-            return Ok(university::webclass::browser(keep_profile));
+            return Ok(university::webclass::browser(
+                *keep_profile,
+                course_id.as_deref(),
+            ));
         }
         #[cfg(feature = "synthetic-https-fixture")]
         if mode == WebClassCheckMode::Fixture {

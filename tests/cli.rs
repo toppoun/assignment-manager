@@ -342,6 +342,19 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
         assert_eq!(output.status.code(), Some(2));
         assert!(stderr(&output).contains("source_disabled"));
     }
+    let output = call(
+        &temp,
+        &[
+            "university-check",
+            "webclass",
+            "--course-id",
+            "fixture-course-002",
+            "--allow-university-read",
+            "--keep-profile",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("source_disabled"));
     assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
     assert!(
         !test_home(&temp)

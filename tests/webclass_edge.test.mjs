@@ -1,33 +1,82 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHash, createPrivateKey, X509Certificate } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer } from "node:https";
+import { connect, createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
-import { runBrowser } from "../src/webclass_browser.mjs";
+import { runBrowser, startProxy } from "../src/webclass_browser.mjs";
 
 const run = process.platform === "win32" && process.env.ASSIGNMENT_MANAGER_TEST_EDGE === "1";
 
-test("isolated Edge SSO reuses an opted-in profile and caps courses to one GET per run", { skip: !run, timeout: 60000 }, async () => {
+test("the loopback proxy rejects an unlisted CONNECT before dialing", async () => {
+  let dialed = false;
+  const proxy = await startProxy(["https://127.0.0.1:443"], () => { dialed = true; });
+  try {
+    const client = connect({ host: "127.0.0.1", port: proxy.port });
+    client.setEncoding("ascii");
+    client.write("CONNECT 127.0.0.1:444 HTTP/1.1\r\nHost: 127.0.0.1:444\r\n\r\n");
+    let reply = "";
+    for await (const chunk of client) reply += chunk;
+    assert.match(reply, /^HTTP\/1\.1 403 Forbidden\r\n/);
+    assert.equal(dialed, false);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("isolated Edge reads only the requested WebClass API endpoints over synthetic HTTPS", { skip: !run, timeout: 120000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "webclass-edge-fixture-"));
-  const courses = await readFile(new URL("../fixtures/webclass/courses_basic.json", import.meta.url), "utf8");
+  const readFixture = (path, encoding) => readFile(new URL(path, import.meta.url), encoding);
+  const [courses, contents, certDer, keyDer, driver, cssoForm] = await Promise.all([
+    readFixture("../fixtures/webclass/courses_basic.json", "utf8"),
+    readFixture("../fixtures/webclass/contents_basic.json", "utf8"),
+    readFixture("../fixtures/network/server.der"),
+    readFixture("../fixtures/network/server-key.der"),
+    readFixture("../src/webclass_browser.mjs", "utf8"),
+    readFixture("../fixtures/webclass_auth/hoppii_csso_form.html", "utf8"),
+  ]);
+  const certificate = new X509Certificate(certDer);
+  const key = createPrivateKey({ key: keyDer, format: "der", type: "pkcs8" }).export({ type: "pkcs8", format: "pem" });
+  const tls = { cert: certificate.toString(), key };
+  const pin = createHash("sha256").update(certificate.publicKey.export({ type: "spki", format: "der" })).digest("base64");
   const coursesPath = "/webclass/ip_mods.php/plugin/score_summary_table/courses";
   const dashboardPath = "/webclass/ip_mods.php/plugin/score_summary_table/dashboard";
   const contentsPath = coursesPath.replace(/courses$/, "contents");
+  const ssoPostPath = "/webclass/singlesignon.php";
+  const cssoQuery = "?ticket=fixture-private-csso-query";
+  const scienceGroup = "fixture-scientific-english-2";
+  const scienceCourses = JSON.stringify(JSON.parse(courses).map((course) => course.group_id === "fixture-course-002"
+    ? { ...course, group_id: scienceGroup, group_name: "科学英語2（合成）" } : course));
+  const scienceContents = contents.replaceAll("fixture-course-002", scienceGroup);
+  const special = " fixture-course+日本 &group_id=other/%?# ";
+  const selectPath = (group) => contentsPath + "?" + new URLSearchParams({ group_id: group });
   const servers = [];
-  const counters = { portal: 0, consent: 0, remembered: 0, acs: 0, courses: 0, contents: 0, unknown: 0 };
+  const counters = { portal: 0, consent: 0, remembered: 0, acs: 0, queriedCsso: 0,
+    courses: 0, contents: 0, unknown: 0, mutation: 0 };
+  const contentsRequests = [];
   const secret = "synthetic-unexported-session";
+  const failedNavigation = "/disconnected?state=fixture-private-navigation";
   let resultMode = "ok";
   let initialCookieSeen = false;
+  let checkingAssignments = false;
+  let handoffOrigin;
+  const usesPortalCsso = () => resultMode === "csso-query" || resultMode === "csso-unapproved-post";
 
-  async function serve(handler) {
-    const server = createServer(handler);
+  async function listen(server) {
     servers.push(server);
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
-    return "http://127.0.0.1:" + server.address().port;
+    return "https://127.0.0.1:" + server.address().port;
+  }
+
+  function serve(handler) {
+    return listen(createServer(tls, handler));
   }
 
   const html = (response, body) => response.writeHead(200, {
@@ -41,22 +90,41 @@ test("isolated Edge SSO reuses an opted-in profile and caps courses to one GET p
       response.writeHead(404).end();
     });
     const forwardAssertion = (response) => html(response,
-      '<form id="assertion" action="' + lms + '/acs" method="post">' +
+      '<form id="assertion" action="' + (usesPortalCsso() ? portal + "/saml/acs" : (handoffOrigin ?? lms) + ssoPostPath) + '" method="post">' +
       '<input type="hidden" name="SAMLResponse" value="fixture-assertion"></form>' +
       '<script>localStorage.setItem("synthetic-consent", "fixture");document.getElementById("assertion").submit();</script>');
     const idp = await serve((request, response) => {
       if (request.url === "/consent" && request.method === "GET") {
-        const target = resultMode === "popup" ? ' target="_blank"' : "";
+        const target = resultMode.startsWith("popup") ? ' target="_blank"' : "";
         const checkRemembered = resultMode === "reauth" ? "" :
           '<script>if (localStorage.getItem("synthetic-consent") === "fixture") location.replace("/remembered");</script>';
         html(response, '<form action="/continue" method="post"' + target + '><button id="accept">Accept</button></form>' + checkRemembered);
       } else if (request.url === "/remembered" && request.method === "GET") {
         counters.remembered++;
+        if (resultMode === "navigation-error") {
+          response.writeHead(302, { Location: failedNavigation }).end();
+        } else if (resultMode === "embedded") {
+          // Wait for the embedded frame and image attempts before completing SSO.
+          html(response, '<body><script>' +
+            'let remaining = 3; const next = () => { if (--remaining === 0) location.replace("/assertion"); };' +
+            'for (const [tag, source] of ' + JSON.stringify([
+              ["iframe", unknown + "/frame"], ["iframe", failedNavigation], ["img", unknown + "/image"],
+            ]) + ') {' +
+            'const child = document.createElement(tag); child.onload = child.onerror = next;' +
+            'child.src = source; document.body.appendChild(child); }</script>');
+        } else {
+          forwardAssertion(response);
+        }
+      } else if (request.url === failedNavigation) {
+        request.socket.destroy();
+      } else if (request.url === "/assertion" && resultMode === "embedded") {
         forwardAssertion(response);
       } else if (request.url === "/continue" && request.method === "POST") {
         counters.consent++;
-        if (resultMode === "unknown") {
+        if (resultMode === "unknown" || resultMode === "popup-unknown") {
           response.writeHead(302, { Location: unknown + "/blocked" }).end();
+        } else if (resultMode === "navigation-error") {
+          response.writeHead(302, { Location: failedNavigation }).end();
         } else {
           forwardAssertion(response);
         }
@@ -65,20 +133,37 @@ test("isolated Edge SSO reuses an opted-in profile and caps courses to one GET p
       }
     });
     const lms = await serve((request, response) => {
-      if (request.url === "/acs" && request.method === "POST") {
+      if ((request.url === ssoPostPath || request.url === ssoPostPath + cssoQuery) && request.method === "POST") {
+        if (resultMode === "sso-error") {
+          request.socket.destroy();
+          return;
+        }
         counters.acs++;
+        if (request.url === ssoPostPath + cssoQuery) counters.queriedCsso++;
         request.resume().on("end", () => response.writeHead(303, {
           Location: "/webclass/",
-          "Set-Cookie": "fixture=" + secret + "; Path=/webclass; HttpOnly; SameSite=Lax",
+          "Set-Cookie": "fixture=" + secret + "; Path=/webclass; HttpOnly; Secure; SameSite=Lax",
         }).end());
       } else if (request.url === "/webclass/") {
         if (request.headers.cookie !== "fixture=" + secret) {
           response.writeHead(401).end();
           return;
         }
-        html(response, '<a href="/webclass/logout.php">ログアウト</a>' +
-          '<script>for (const path of ' + JSON.stringify([contentsPath, coursesPath, coursesPath]) +
+        const loggedIn = '<a href="/webclass/logout.php">ログアウト</a>';
+        const blockedPosts = resultMode === "csso-query" ? ["/webclass/submit", ssoPostPath + cssoQuery] : ["/webclass/submit"];
+        const loginIndicator = checkingAssignments ?
+          '<script>const worker = new Worker("/webclass/guard-worker.js");' +
+          'Promise.all([new Promise(resolve => worker.onmessage = resolve),' +
+          '...' + JSON.stringify(blockedPosts) + '.map(path => fetch(path, { method: "POST" }).catch(()=>{}))]).then(() =>' +
+          'document.body.insertAdjacentHTML("afterbegin", ' + JSON.stringify(loggedIn) + '));</script>' : loggedIn;
+        html(response, loginIndicator +
+          '<script>for (const path of ' + JSON.stringify([contentsPath, selectPath("fixture-course-003"),
+            contentsPath.replace("contents", "%63ontents") + "?group_id=fixture-course-003", coursesPath, coursesPath]) +
           ') fetch(path).catch(()=>{});</script>');
+      } else if (request.url === "/webclass/guard-worker.js") {
+        response.writeHead(200, { "Content-Type": "text/javascript" }).end(
+          'Promise.all(' + JSON.stringify([coursesPath, selectPath("fixture-course-003")]) +
+          '.map(path => fetch(path).catch(()=>{}))).then(() => postMessage("guard-checked"));');
       } else if (request.url === coursesPath && request.method === "GET") {
         counters.courses++;
         if (request.headers.cookie !== "fixture=" + secret || resultMode === "expired") {
@@ -86,10 +171,30 @@ test("isolated Edge SSO reuses an opted-in profile and caps courses to one GET p
         } else if (resultMode === "redirect") {
           response.writeHead(302, { Location: "/webclass/blocked" }).end();
         } else {
-          response.writeHead(200, { "Content-Type": "application/json" }).end(courses);
+          const body = resultMode === "csso-query" ? scienceCourses :
+            resultMode === "special" ? courses.replace("fixture-course-002", special) : courses;
+          response.writeHead(200, { "Content-Type": "application/json" }).end(body);
+        }
+      } else if (new URL(request.url, lms).pathname.replace("%63", "c") === contentsPath) {
+        counters.contents++;
+        contentsRequests.push({ url: request.url, method: request.method, referrer: request.headers.referer, accept: request.headers.accept });
+        if (request.headers.cookie !== "fixture=" + secret || resultMode === "contents-expired") {
+          response.writeHead(403).end();
+        } else if (resultMode === "contents-redirect") {
+          response.writeHead(302, { Location: selectPath("fixture-course-003") }).end();
+        } else if (resultMode === "partial") {
+          response.writeHead(200, { "Content-Type": "application/json", Link: '<next>; rel="next"' }).end(contents);
+        } else if (resultMode === "html") {
+          html(response, "<form>Login</form>");
+        } else if (resultMode === "large") {
+          response.writeHead(200, { "Content-Type": "application/json" }).end(" ".repeat(1024 * 1024 + 1));
+        } else {
+          const body = resultMode === "csso-query" ? scienceContents :
+            resultMode === "special" ? contents.replaceAll("fixture-course-002", special) : contents;
+          response.writeHead(200, { "Content-Type": "application/json" }).end(body);
         }
       } else {
-        if (request.url === contentsPath) counters.contents++;
+        if (request.method === "POST") counters.mutation++;
         if (request.url === "/webclass/blocked") counters.unknown++;
         response.writeHead(404).end();
       }
@@ -97,17 +202,68 @@ test("isolated Edge SSO reuses an opted-in profile and caps courses to one GET p
     const portal = await serve((request, response) => {
       counters.portal++;
       if (request.headers.cookie) initialCookieSeen = true;
+      if (usesPortalCsso() && request.url === "/saml/acs" && request.method === "POST") {
+        request.resume().on("end", () => response.writeHead(303, { Location: "/portal/sso/Parm.php" }).end());
+        return;
+      }
+      if (usesPortalCsso() && request.url === "/portal/sso/Parm.php") {
+        const target = resultMode === "csso-query" ? ssoPostPath : "/webclass/submit";
+        html(response, cssoForm.replace('action="' + ssoPostPath + '"', 'action="' + lms + target + cssoQuery + '"') +
+          '<script>document.forms[0].requestSubmit(document.querySelector("input[type=submit]"));</script>');
+        return;
+      }
       response.writeHead(302, { Location: idp + "/consent" }).end();
     });
-    const flags = ["--proxy-bypass-list=" + [portal, idp, lms, unknown].map((url) => new URL(url).host).join(";")];
+    // The synthetic pin and loopback routes are supplied only by this test.
+    const certificateFlag = "--ignore-certificate-errors-spki-list=" + pin;
+    const flags = [certificateFlag,
+      "--proxy-bypass-list=<-loopback>;" + [portal, idp, lms].map((url) => new URL(url).host).join(";")];
     const edge = join(process.env["ProgramFiles(x86)"], "Microsoft", "Edge", "Application", "msedge.exe");
 
-    async function testRun(profile, interact, options = {}) {
-      return runBrowser({
+    function config(profile, options = {}) {
+      return {
         edge, profile: join(root, profile), entry: portal + "/portal",
-        origins: [portal, idp, lms], lms, coursesPath, dashboardPath,
+        origins: [portal, idp, lms], lms, coursesPath, contentsPath, dashboardPath, ssoPostPath,
         maxBytes: 1024 * 1024, loginMillis: 6000, ...options,
-      }, { flags, interact });
+      };
+    }
+
+    async function testRun(profile, interact, options = {}) {
+      return runBrowser(config(profile, options), { flags, interact });
+    }
+
+    async function checkSelected(profile, group, interact, browserFlags = flags) {
+      checkingAssignments = true;
+      const options = `{ flags: ${JSON.stringify(browserFlags)}, interact: ${interact?.toString() ?? "undefined"} }`;
+      const child = spawn(process.execPath, ["--input-type=module", "--eval", driver + "\nawait runDriver(" + options + ");"],
+        { stdio: ["pipe", "pipe", "inherit"] });
+      const exit = once(child, "close");
+      const output = createInterface({ input: child.stdout });
+      const lines = output[Symbol.asyncIterator]();
+      const send = (value) => child.stdin.write(JSON.stringify(value) + "\n");
+      try {
+        send(config(profile, { selectContents: true }));
+        let done = JSON.parse((await lines.next()).value);
+        if (done.stage === "courses") {
+          assert.ok(!JSON.stringify(done).includes(secret));
+          // Stand in for Rust's pipe response. Rust tests exercise real validation and query encoding.
+          const found = JSON.parse(done.body).some(({ group_id }) => group_id === group);
+          send(found ? selectPath(group) : null);
+          done = JSON.parse((await lines.next()).value);
+        }
+        assert.equal(done.stage, "finished");
+        assert.ok(!JSON.stringify(done).includes(secret));
+        assert.ok(!JSON.stringify(done).includes("fixture-private-navigation"));
+        assert.ok(!JSON.stringify(done).includes("fixture-private-csso-query"));
+        assert.equal((await lines.next()).done, true);
+        assert.deepEqual(await exit, [0, null]);
+        return done.reply;
+      } finally {
+        checkingAssignments = false;
+        child.stdin.end();
+        output.close();
+        await exit;
+      }
     }
 
     async function clickFixtureConsent(pipe, session) {
@@ -159,6 +315,13 @@ test("isolated Edge SSO reuses an opted-in profile and caps courses to one GET p
     const unknownNav = await testRun("unknown", clickFixtureConsent);
     assert.equal(unknownNav.reason, "unknown_destination");
     assert.equal(unknownNav.courses_get, 0);
+    assert.deepEqual(unknownNav.navigation, { stage: "idp", kind: "top_level_request", cause: "navigation_blocked" });
+
+    resultMode = "popup-unknown";
+    const unknownPopup = await testRun("popup-unknown", clickFixtureConsent);
+    assert.equal(unknownPopup.reason, "unknown_destination");
+    assert.deepEqual(unknownPopup.navigation, { stage: "idp", kind: "top_level_request", cause: "navigation_blocked" });
+    assert.equal(unknownPopup.courses_get, 0);
 
     const closed = await testRun("closed", async (pipe) => {
       await pipe.send("Browser.close").catch(() => {});
@@ -180,6 +343,160 @@ test("isolated Edge SSO reuses an opted-in profile and caps courses to one GET p
     assert.equal(counters.contents, 0);
     assert.equal(counters.unknown, 0);
     assert.equal(initialCookieSeen, false);
+
+    resultMode = "ok";
+    const oneCourse = await checkSelected("assignment-fresh", "fixture-course-002", clickFixtureConsent);
+    assert.equal(oneCourse.reason, "ok");
+    assert.equal(oneCourse.courses_get, 1);
+    assert.equal(oneCourse.contents_get, 1);
+    assert.deepEqual(JSON.parse(oneCourse.body), JSON.parse(contents));
+
+    resultMode = "special";
+    const reused = await checkSelected("confirmed", special);
+    assert.equal(reused.reason, "ok");
+    assert.equal(reused.courses_get, 1);
+    assert.equal(reused.contents_get, 1);
+    assert.ok(JSON.parse(reused.body).every(({ group_id }) => group_id === special));
+    assert.equal(counters.remembered, 2);
+
+    resultMode = "ok";
+    const missing = await checkSelected("confirmed", "not-in-courses");
+    assert.equal(missing.reason, "course_selection_stopped");
+    assert.equal(missing.courses_get, 1);
+    assert.equal(missing.contents_get, 0);
+    for (const [mode, diagnostic] of [
+      ["contents-expired", "auth_expired"], ["contents-redirect", "contents_request_failed"],
+      ["partial", "invalid_contents_response"], ["html", "invalid_contents_response"],
+      ["large", "contents_response_limit"],
+    ]) {
+      resultMode = mode;
+      const result = await checkSelected("confirmed", "fixture-course-002");
+      assert.equal(result.reason, diagnostic, mode);
+      assert.equal(result.courses_get, 1, mode);
+      assert.equal(result.contents_get, 1, mode);
+      assert.equal(result.body, undefined, mode);
+    }
+    assert.equal(counters.contents, 7);
+    assert.equal(counters.courses, 14);
+    assert.deepEqual(contentsRequests.map(({ url }) => url), [
+      selectPath("fixture-course-002"), selectPath(special), ...Array(5).fill(selectPath("fixture-course-002")),
+    ]);
+    assert.ok(contentsRequests.every(({ method, referrer, accept }) =>
+      method === "GET" && referrer === lms + dashboardPath && accept === "application/json"));
+    assert.equal(counters.unknown, 0);
+    assert.equal(counters.mutation, 0);
+
+    resultMode = "navigation-error";
+    for (const [profile, interact] of [["confirmed", undefined], ["failed-fresh", clickFixtureConsent]]) {
+      const failedIdp = await checkSelected(profile, "fixture-course-002", interact);
+      assert.deepEqual(failedIdp, {
+        reason: "browser_navigation_failed",
+        navigation: { stage: "idp", kind: "browser_error_page", cause: "connection_closed", request_method: "get" },
+        lms_reached: false, courses_get: 0, contents_get: 0,
+      });
+    }
+    resultMode = "sso-error";
+    const failedSso = await checkSelected("confirmed", "fixture-course-002");
+    assert.deepEqual(failedSso, {
+      reason: "browser_navigation_failed",
+      navigation: { stage: "webclass_sso", kind: "browser_error_page", cause: "connection_closed", request_method: "post" },
+      lms_reached: false, courses_get: 0, contents_get: 0,
+    });
+    assert.equal(counters.contents, 7);
+    assert.equal(counters.courses, 14);
+
+    resultMode = "embedded";
+    const embedded = await checkSelected("confirmed", "fixture-course-002");
+    assert.equal(embedded.reason, "ok");
+    assert.equal(embedded.courses_get, 1);
+    assert.equal(embedded.contents_get, 1);
+    assert.equal(counters.courses, 15);
+    assert.equal(counters.contents, 8);
+    assert.equal(counters.unknown, 0);
+
+    resultMode = "csso-query";
+    const throughProxy = [certificateFlag];
+    const listed = await runBrowser(config("confirmed"), { flags: throughProxy });
+    assert.equal(listed.reason, "ok");
+    assert.equal(listed.courses_get, 1);
+    assert.equal(listed.contents_get, 0);
+    assert.equal(JSON.parse(listed.body).find(({ group_id }) => group_id === scienceGroup).group_name, "科学英語2（合成）");
+    assert.equal(counters.queriedCsso, 1);
+
+    const remembered = counters.remembered;
+    const consent = counters.consent;
+    const selected = await checkSelected("confirmed", scienceGroup, undefined, throughProxy);
+    assert.equal(selected.reason, "ok", JSON.stringify(selected.navigation));
+    assert.equal(selected.courses_get, 1);
+    assert.equal(selected.contents_get, 1);
+    assert.deepEqual(JSON.parse(selected.body), JSON.parse(scienceContents));
+    assert.equal(contentsRequests.at(-1).url, selectPath(scienceGroup));
+    assert.equal(counters.remembered, remembered + 1);
+    assert.equal(counters.consent, consent);
+    assert.equal(counters.queriedCsso, 2);
+
+    const fresh = await checkSelected("csso-query-fresh", scienceGroup, clickFixtureConsent, throughProxy);
+    assert.equal(fresh.reason, "ok");
+    assert.equal(fresh.courses_get, 1);
+    assert.equal(fresh.contents_get, 1);
+    assert.deepEqual(JSON.parse(fresh.body), JSON.parse(scienceContents));
+    assert.equal(counters.consent, consent + 1);
+    assert.equal(counters.queriedCsso, 3);
+
+    resultMode = "csso-unapproved-post";
+    const blocked = await checkSelected("confirmed", scienceGroup, undefined, throughProxy);
+    assert.equal(blocked.reason, "browser_navigation_failed");
+    assert.equal(blocked.navigation.cause, "navigation_blocked");
+    assert.equal(blocked.lms_reached, false);
+    assert.equal(blocked.courses_get, 0);
+    assert.equal(blocked.contents_get, 0);
+    assert.equal(counters.unknown, 0);
+    assert.equal(counters.mutation, 0);
+
+    async function failedHandoff(origin, cause, proxyCause, options = {}) {
+      handoffOrigin = origin;
+      const before = { courses: counters.courses, contents: counters.contents };
+      const reply = await runBrowser(config("confirmed", { origins: [portal, idp, origin], lms: origin }),
+        { flags: [certificateFlag], ...options }, () => assert.fail("SSO failure reached course selection"));
+      assert.equal(reply.reason, "browser_navigation_failed");
+      assert.equal(reply.lms_reached, false);
+      assert.equal(reply.courses_get, 0);
+      assert.equal(reply.contents_get, 0);
+      assert.equal(reply.navigation.stage, "webclass_sso");
+      assert.equal(reply.navigation.request_method, "post");
+      assert.equal(reply.navigation.cause, cause);
+      assert.equal(reply.navigation.proxy_connect_observed, proxyCause);
+      assert.ok(!JSON.stringify(reply).includes("127.0.0.1"));
+      assert.equal(counters.courses, before.courses);
+      assert.equal(counters.contents, before.contents);
+    }
+
+    resultMode = "ok";
+    const badTls = await listen(createTcpServer((socket) => {
+      socket.once("data", () => socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"));
+    }));
+    await failedHandoff(badTls, "tls_failure", undefined);
+
+    const reset = await listen(createTcpServer((socket) => {
+      socket.once("data", () => socket.resetAndDestroy());
+    }));
+    const bypassReset = "--proxy-bypass-list=<-loopback>;" + new URL(reset).host;
+    await failedHandoff(reset, "connection_reset", undefined, { flags: [certificateFlag, bypassReset] });
+
+    const unavailable = createTcpServer();
+    const refused = await listen(unavailable);
+    await new Promise((resolve) => unavailable.close(resolve));
+    await failedHandoff(refused, "proxy_failure", "connection_refused");
+
+    // Keep local HTTP/TLS servers real. Inject only the unresolvable/stalled dial in the proxy.
+    const unresolvedPort = Number(new URL(lms).port);
+    const dialWithLookup = (lookup) => (target) => target.port === unresolvedPort
+      ? connect({ ...target, host: "fixture.invalid", lookup }) : connect(target);
+    const rejectLookup = (_host, _options, callback) => {
+      queueMicrotask(() => callback(Object.assign(new Error(), { code: "ENOTFOUND" })));
+    };
+    await failedHandoff(lms, "proxy_failure", "dns_failure", { dial: dialWithLookup(rejectLookup) });
+    await failedHandoff(lms, "proxy_failure", "timeout", { dial: dialWithLookup(() => {}), connectMillis: 350 });
   } finally {
     await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

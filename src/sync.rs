@@ -9,8 +9,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-#[cfg(windows)]
-pub(crate) use acquisition::validate_webclass_courses_json;
 pub use acquisition::{
     AcquiredAssignments, AcquiredWebClassCourses, MoodleAcquisition, MoodleAcquisitionError,
     SourceCourse, WebClassAcquisition, WebClassAcquisitionAttempt, WebClassCourseCheck,
@@ -22,6 +20,8 @@ use acquisition::{
     WebClassEvent, acquire_webclass_courses, run_with_webclass_reauth, visit_moodle,
     visit_webclass_groups,
 };
+#[cfg(windows)]
+pub(crate) use acquisition::{validate_webclass_contents_json, validate_webclass_courses_json};
 
 use crate::moodle_http::{MoodleClient, MoodleFeed};
 use crate::persistence::{AssignmentImportSummary, MoodleCourseResolution, SqliteStore};

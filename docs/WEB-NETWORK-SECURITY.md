@@ -195,7 +195,7 @@ URL、Cookie、トークン、資格情報、SAML本文を出力・保存しな�
 再要求を説明できる。大学の製品・設定と、本人の同意選択の適用範囲は未確認。
 [OSSTech OpenAM 14 SAML設定ガイド 7.1.1・7.2](https://www.osstech.co.jp/download/updates/docs/openam/OSTD-OpenAM14-SAML-SetupGuide.pdf#page=28)
 
-Windowsでは、一覧専用CLIの `--allow-university-read` がMicrosoft Edgeを一時プロファイルで
+Windowsでは、授業一覧と1授業の課題確認CLIの `--allow-university-read` がMicrosoft Edgeを一時プロファイルで
 起動する。Edgeは標準のインストール先から探し、同梱ドライバーはPATH上のNode.jsで動く。
 WebClassが既存設定で無効な場合はEdge起動前に終了する。
 ユーザーは大学公式のHOPPIIで認証と同意を行い、WebClassリンクを開く。SAMLフォームの送信と
@@ -205,19 +205,47 @@ WebClassが既存設定で無効な場合はEdge起動前に終了する。
 アプリの所有マーカーを検証し、パス上の再解析ポイントを拒否する。OSの排他ロックは
 Edgeの終了まで保持し、保持プロファイルの削除・初期化は行わない。認証と同意の保持期間は
 大学とEdgeの設定に従う。異常終了後も新しいタブから開始し、復元タブがあれば停止する。
-授業一覧GETが401または403の場合はその試行を終了し、再認証は次回の本人操作に委ねる。
+`courses` または `contents` が401または403の場合はその試行を終了し、再認証は次回の本人操作に委ねる。
 
 Edgeの制御には継承したDevToolsパイプを使い、デバッグ用のTCPポートを開かない。
 専用のループバックプロキシはHOPPII、IdP、WebClassのHTTPS `CONNECT` のみ転送する。
 TLS証明書はEdgeが検証する。許可済みオリジン内のリダイレクトと新規タブを処理し、
-未知のトップレベルオリジンでは終了する。`contents` とダウンロードを拒否し、
-WebClass取得の前にService Workerをバイパスする。
+未知のトップレベルオリジンでは終了する。ダウンロードを拒否し、WebClass取得の前にService Workerを
+バイパスする。
+
+遷移先の診断は `webclass browser_navigation` 行に固定値だけを表示する。`stage` はブラウザ起動時の
+`startup`、HOPPIIの `hoppii`、認証側の `idp`、WebClassへのSSO引き渡しの `webclass_sso`、
+WebClassの `webclass` のいずれか。未知の遷移要求では、そのタブで最後に確認した段階を表示する。
+`kind=top_level_request` はトップレベルの遷移要求、`top_level_commit` は表示先が切り替わった時点、
+`browser_internal_page` はブラウザ内部ページを表す。Edgeが通信失敗を示すページをトップレベルに
+表示した場合は `browser_navigation_failed` と `kind=browser_error_page` を返す。iframeで拒否された
+遷移やサブリソースの拒否だけでは認証を中断しない。URL、クエリ、Cookie、トークン、ブラウザの
+エラー原文は診断に含めない。
+
+エラーページを同じタブ、フレーム、読み込みIDのDevTools通信失敗と照合し、`cause` に
+`dns_failure`、`tls_failure`、`connection_refused`、`connection_reset`、`connection_closed`、
+`proxy_failure`、`timeout`、`navigation_blocked`、`unknown_network_failure` のいずれかを出す。
+照合できたリクエストの `request_method` は `get` または `post` で、送信の試行を表す。
+同じ許可先へのCONNECT失敗をプロキシが観測した場合は `proxy_connect_observed` を併記する。
+これはEdgeがトンネル確立失敗を報告した遷移中の観測であり、個々のHTTPSリクエストとCONNECTの
+対応までは確定できない。複数の異なる失敗が観測された場合は省略する。通信の証拠を照合できない
+場合は `unknown_network_failure` とし、ログイン待ち時間切れや、取得APIの `auth_expired` と区別する。
 
 WebClassのタブでログアウト操作または既知のダッシュボードを確認したら、同一オリジンの固定
 `courses` に1回だけGETを送る。`mode` と `credentials` は `same-origin`、
 `redirect` は `error` とする。完全なHTTP 200 JSON、UTF-8、本文上限、タイムアウトを確認する。
 Cookieやローカルストレージはブラウザ内で管理する。Rust側は既存の `parse_courses`、
 授業IDの検証、件数上限を共用し、授業の取得値と年度・学期別件数を端末に表示する。
+
+`--course-id ID` を指定した場合、Rustで検証した授業一覧に完全一致する `group_id` がある場合だけ、
+既存HTTPクライアントと同じ形式の `contents?group_id=…` を組み立てる。同じEdgeタブの同じフレームに
+限定して1回のGETを許可する。埋め込みフレームにもリクエスト制限を適用し、ワーカーからWebClassへの
+通信を拒否する。
+このモードでWebClassに送るPOSTは認証中の `/webclass/singlesignon.php` への画面遷移に限る。
+フォームの送信先にクエリが付いていても、許可済みのHTTPSオリジンと完全一致するパスで判定する。
+応答全体を既存の
+`parse_contents` と授業グループ・課題IDの検証、`map_contents_for_group` に渡し、検証を通った課題の
+取得値を端末に表示する。認証情報はEdgeのプロファイル内で管理する。
 
 ブラウザ経路から従来の固定 `ASK_IF_CHANGE` を送るHTTP同意処理を呼び出さない。
 既存のデスクトップ・Web同期は `HoseiAuthenticator` とHTTPセッションの再認証を利用中。
@@ -226,9 +254,13 @@ Cookieやローカルストレージはブラウザ内で管理する。Rust側�
 同意APIを外部クライアントから利用する契約は、大学について未確認。
 [OSSTech OpenAM 14 SAML設定ガイド 7.5](https://www.osstech.co.jp/download/updates/docs/openam/OSTD-OpenAM14-SAML-SetupGuide.pdf#page=36)
 
-合成検証ではWindows EdgeとループバックのIdP・SPを使う。テスト専用の操作でSAML遷移を開始し、
-同一ブラウザから既存の授業fixtureを1回取得する。プロファイルの再利用と分離、異常終了後の
-再認証、未知の遷移先、ブラウザ終了、認証失効、重複GETの拒否を確認する。
+合成検証ではWindows EdgeとループバックのHTTPSのIdP・SPを使う。テスト専用の操作でSAML遷移を開始し、
+同じブラウザから授業と指定した1グループの課題のfixtureを取得する。プロファイルの再利用と分離、
+異常終了後の再認証、未知の遷移先、ブラウザ終了、認証失効、リダイレクト、ページやワーカーからの
+余分なGETとSSO以外のPOSTの拒否を確認する。IdPとWebClassのSSOでの通信失敗をブラウザエラーページと
+して報告し、iframeや画像で通信が拒否されても正常なSSOを継続できることも確認する。CONNECT拒否、
+切断、TLS失敗にはループバックのソケットを使い、名前解決失敗と接続タイムアウトは合成ダイヤルで
+再現する。テストでは一時作成したEdgeプロファイルとループバックのサービスだけを使う。
 
 ```powershell
 $env:ASSIGNMENT_MANAGER_TEST_EDGE = '1'

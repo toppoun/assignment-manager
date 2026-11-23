@@ -18,21 +18,29 @@ fn webclass_defaults_to_temporary_edge_and_retention_requires_an_explicit_flag()
             &[][..],
             WebClassCheckMode::Browser {
                 keep_profile: false,
+                course_id: None,
             },
         ),
         (
             &["--browser"][..],
             WebClassCheckMode::Browser {
                 keep_profile: false,
+                course_id: None,
             },
         ),
         (
             &["--keep-profile"][..],
-            WebClassCheckMode::Browser { keep_profile: true },
+            WebClassCheckMode::Browser {
+                keep_profile: true,
+                course_id: None,
+            },
         ),
         (
             &["--browser", "--keep-profile"][..],
-            WebClassCheckMode::Browser { keep_profile: true },
+            WebClassCheckMode::Browser {
+                keep_profile: true,
+                course_id: None,
+            },
         ),
         (
             &["--http-probe"][..],
@@ -58,6 +66,43 @@ fn webclass_defaults_to_temporary_edge_and_retention_requires_an_explicit_flag()
     }
     assert!(parse(&[base.as_slice(), &["--http-probe", "--keep-profile"]].concat()).is_err());
     assert!(parse(&[&base[..3], &["--keep-profile"]].concat()).is_err());
+}
+
+#[test]
+fn webclass_one_course_requires_an_exact_id_and_explicit_edge_read_permission() {
+    let base = [
+        "university-check",
+        "webclass",
+        "--course-id",
+        " Course+日本 ",
+    ];
+    for flags in [
+        &["--allow-university-read"][..],
+        &["--allow-university-read", "--keep-profile"][..],
+    ] {
+        assert_eq!(
+            parse(&[base.as_slice(), flags].concat()).unwrap().command,
+            Command::UniversityWebClass {
+                mode: WebClassCheckMode::Browser {
+                    keep_profile: flags.len() == 2,
+                    course_id: Some(base[3].into()),
+                },
+                review_local: false,
+            },
+        );
+    }
+    for flags in [
+        &[][..],
+        &["--fixture"][..],
+        &["--allow-university-read", "--courses-only"][..],
+        &["--allow-university-read", "--http-probe"][..],
+        &["--allow-university-read", "--course-id", "another-course"][..],
+    ] {
+        assert!(parse(&[base.as_slice(), flags].concat()).is_err());
+    }
+    for id in ["", " \t", "--keep-profile"] {
+        assert!(parse(&[&base[..3], &[id, "--allow-university-read"]].concat()).is_err());
+    }
 }
 
 #[cfg(windows)]

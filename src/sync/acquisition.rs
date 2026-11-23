@@ -442,10 +442,20 @@ pub fn acquire_webclass_group(
     let raw = client
         .fetch_contents_json(group_id)
         .map_err(webclass_fetch_error)?;
-    let contents = parse_contents(&raw).map_err(|_| WebClassSyncError::Parse)?;
-    client
-        .check_sync_records(contents.len())
-        .map_err(|_| WebClassSyncError::Validation)?;
+    validate_webclass_contents_json(&raw, group_id, |count| {
+        client
+            .check_sync_records(count)
+            .map_err(|_| WebClassSyncError::Validation)
+    })
+}
+
+pub(crate) fn validate_webclass_contents_json(
+    raw: &str,
+    group_id: &str,
+    mut checkpoint: impl FnMut(usize) -> Result<(), WebClassSyncError>,
+) -> Result<AcquiredAssignments, WebClassSyncError> {
+    let contents = parse_contents(raw).map_err(|_| WebClassSyncError::Parse)?;
+    checkpoint(contents.len())?;
     let observation = AssignmentObservation::try_new(
         SyncScope::WebClassContents(group_id.to_owned()),
         contents
@@ -465,9 +475,7 @@ pub fn acquire_webclass_group(
     })?;
     let assignments = AcquiredAssignments::try_new(batch, observation)
         .map_err(|_| WebClassSyncError::Validation)?;
-    client
-        .check_sync_records(assignments.batch().as_slice().len())
-        .map_err(|_| WebClassSyncError::Validation)?;
+    checkpoint(assignments.batch().as_slice().len())?;
     Ok(assignments)
 }
 

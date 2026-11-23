@@ -30,6 +30,7 @@ use course_check::{CourseCheck, CourseRequestMeter};
 pub use course_check::{WebClassMethodCounts, WebClassRequestCounts};
 
 pub(crate) const USER_PAGE: &str = "/portal/u001/index.php";
+pub(crate) const WEBCLASS_SSO_POST_PATH: &str = "/webclass/singlesignon.php";
 const PORTAL_PUBLIC_PATH: &str = "/portal/index.php";
 const PORTAL_LOGIN_PATH: &str = "/portal/login/login.php";
 const PORTAL_PUBLIC: &str = "/portal/index.php?next=";

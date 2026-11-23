@@ -150,7 +150,7 @@ impl CourseCheck {
                 _,
             ) => true,
             (_, 0, &Method::POST, "/saml/acs", _)
-            | (_, 2, &Method::POST, "/webclass/singlesignon.php", None)
+            | (_, 2, &Method::POST, super::WEBCLASS_SSO_POST_PATH, None)
             | (
                 _,
                 2,
