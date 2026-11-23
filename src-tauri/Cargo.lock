@@ -64,10 +64,13 @@ version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
  "aws-lc-rs",
+ "base64 0.23.1",
  "chrono",
+ "flate2",
  "hyper",
  "ical",
  "keyring-core",
+ "quick-xml",
  "reqwest",
  "rpassword",
  "rusqlite",

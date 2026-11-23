@@ -5,6 +5,61 @@ fn parse(words: &[&str]) -> Result<Arguments, CliError> {
     Arguments::parse(&words.iter().map(|word| (*word).into()).collect::<Vec<_>>())
 }
 
+#[test]
+fn webclass_defaults_to_temporary_edge_and_retention_requires_an_explicit_flag() {
+    let base = [
+        "university-check",
+        "webclass",
+        "--courses-only",
+        "--allow-university-read",
+    ];
+    for (flags, mode) in [
+        (
+            &[][..],
+            WebClassCheckMode::Browser {
+                keep_profile: false,
+            },
+        ),
+        (
+            &["--browser"][..],
+            WebClassCheckMode::Browser {
+                keep_profile: false,
+            },
+        ),
+        (
+            &["--keep-profile"][..],
+            WebClassCheckMode::Browser { keep_profile: true },
+        ),
+        (
+            &["--browser", "--keep-profile"][..],
+            WebClassCheckMode::Browser { keep_profile: true },
+        ),
+        (
+            &["--http-probe"][..],
+            WebClassCheckMode::HttpProbe {
+                stop_before_consent: false,
+            },
+        ),
+        (
+            &["--stop-before-consent"][..],
+            WebClassCheckMode::HttpProbe {
+                stop_before_consent: true,
+            },
+        ),
+    ] {
+        let args = parse(&[base.as_slice(), flags].concat()).unwrap();
+        assert_eq!(
+            args.command,
+            Command::UniversityWebClass {
+                mode,
+                review_local: false
+            }
+        );
+    }
+    assert!(parse(&[base.as_slice(), &["--http-probe", "--keep-profile"]].concat()).is_err());
+    assert!(parse(&[&base[..3], &["--keep-profile"]].concat()).is_err());
+}
+
 #[cfg(windows)]
 #[test]
 fn integration_cli_requires_explicit_dual_read_permissions_and_network_route() {

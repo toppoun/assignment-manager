@@ -379,6 +379,621 @@ fn course_only_login_stops_at_rejected_authentication_without_calling_the_api() 
 }
 
 #[test]
+fn course_only_rejects_bad_idp_entry_redirects_before_sending() {
+    let valid_query = "SAMLRequest=synthetic%2Brequest&RelayState=synthetic-state";
+    for target in [
+        IDP_SSO.to_owned(),
+        format!("{IDP_SSO}?SAMLRequest=only"),
+        format!("{IDP_SSO}?RelayState=only"),
+        format!("{IDP_SSO}?SAMLRequest=&RelayState=synthetic-state"),
+        format!("{IDP_SSO}?SAMLRequest=synthetic-request&RelayState"),
+        format!("{IDP_SSO}?SAMLRequest=synthetic%ZZrequest&RelayState=synthetic-state"),
+        format!("{IDP_SSO}?SAMLRequest=synthetic-request&RelayState=%00"),
+        format!("{IDP_SSO}?{valid_query}&RelayState=duplicate"),
+        format!("{IDP_SSO}?{valid_query}&extra=synthetic-extra"),
+        format!("{IDP_SSO}?{valid_query}&"),
+        format!("{IDP_SSO}/?{valid_query}"),
+        format!("/idp/profile/SAML2/POST/SSO?{valid_query}"),
+        format!("{XUI}?{valid_query}"),
+    ] {
+        let mut fixture = secured_flow(false);
+        fixture.exchanges[0].truncate(1);
+        fixture.exchanges[0][0] = Exchange::redirect(
+            "GET",
+            USER_PAGE,
+            endpoint(&fixture.endpoints.idp, &target).as_str(),
+        )
+        .without_cookies();
+        fixture.exchanges[1].clear();
+        fixture.exchanges[2].clear();
+        let error = run_course_check(fixture).result.unwrap_err();
+        assert_eq!(
+            error,
+            WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChangedWithReason(
+                AuthStep::IdpToOpenAm,
+                ProtocolReason::RequestNotAllowed,
+            ))
+        );
+    }
+}
+
+#[test]
+fn course_only_rejects_invalid_authnrequest_before_contacting_idp() {
+    let mut fixture = secured_flow(false);
+    fixture.exchanges[0].truncate(1);
+    let mut redirect = endpoint(&fixture.endpoints.idp, IDP_SSO);
+    redirect.query_pairs_mut().extend_pairs([
+        ("SAMLRequest", "invalid-deflate"),
+        ("RelayState", "synthetic-relay-state"),
+    ]);
+    fixture.exchanges[0][0] =
+        Exchange::redirect("GET", USER_PAGE, redirect.as_str()).without_cookies();
+    fixture.exchanges[1].clear();
+    fixture.exchanges[2].clear();
+    assert_eq!(
+        run_course_check(fixture).result.unwrap_err(),
+        WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChanged(
+            AuthStep::HoppiiToIdp,
+        )),
+    );
+}
+
+#[test]
+fn course_only_mismatched_xui_issuer_stops_before_openam() {
+    let mut fixture = secured_flow(false);
+    fixture.exchanges[0].truncate(1);
+    fixture.exchanges[1].truncate(1);
+    fixture.exchanges[2].clear();
+    let xui = xui_url_with_issuer(&fixture.endpoints.idp, "urn:fixture:other-provider");
+    fixture.exchanges[1][0]
+        .response_headers
+        .iter_mut()
+        .find(|(name, _)| *name == "Location")
+        .unwrap()
+        .1 = xui.into();
+    assert_eq!(
+        run_course_check(fixture).result.unwrap_err(),
+        WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChanged(
+            AuthStep::IdpToOpenAm,
+        )),
+    );
+}
+
+#[test]
+fn course_only_stops_before_sending_an_unapproved_success_url() {
+    const PRIVATE_VALUE: &str = "synthetic-secret-session-value";
+    for success_url in [
+        format!("/openam/unconfirmed/{PRIVATE_VALUE}?request={PRIVATE_VALUE}"),
+        format!("{IDP_SSO}?SAMLRequest=synthetic%2Brequest&RelayState={PRIVATE_VALUE}"),
+        format!("/openam/SSORedirect/metaAlias/synthetic-idp?ReqID={PRIVATE_VALUE}"),
+        "/openam/SSORedirect/metaAlias/other/../synthetic-idp?ReqID=synthetic-request-id".into(),
+        "/openam/SSORedirect/metaAlias/synthetic-idp?ReqID=synthetic-request-id&ReqID=other".into(),
+        "/openam/SSORedirect/metaAlias/synthetic-idp?ReqID=synthetic%ZZrequest".into(),
+    ] {
+        let mut fixture = secured_flow(false);
+        fixture.exchanges[0].truncate(1);
+        fixture.exchanges[1].truncate(4);
+        fixture.exchanges[1][3].body =
+            json!({"tokenId": TOKEN, "successUrl": success_url}).to_string();
+        fixture.exchanges[2].clear();
+        let check = run_course_check(fixture);
+        assert_eq!(check.requests.idp, WebClassMethodCounts { get: 1, post: 3 });
+        let error = check.result.unwrap_err();
+        assert_eq!(
+            error,
+            WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChanged(
+                AuthStep::OpenAmSuccess,
+            ))
+        );
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains(PRIVATE_VALUE));
+        assert!(!diagnostic.contains(TOKEN));
+    }
+}
+
+#[test]
+fn production_course_policy_rejects_the_legacy_fixture_return() {
+    let mut fixture = secured_flow(false);
+    fixture.exchanges[0].truncate(1);
+    fixture.exchanges[1].truncate(4);
+    fixture.exchanges[2].clear();
+    let (report, requests) = run_production_saml_probe(fixture);
+    assert_eq!(report.stop, SamlProbeStop::QueryStructure);
+    assert_eq!(report.query_matches, Some(false));
+    assert_eq!(requests.idp, WebClassMethodCounts { get: 1, post: 3 });
+}
+
+fn run_production_saml_probe(fixture: FullFlow) -> (SamlProbeReport, WebClassRequestCounts) {
+    let (report, requests, _) = run_production_observation(fixture);
+    (report, requests)
+}
+
+fn run_production_observation(
+    fixture: FullFlow,
+) -> (
+    SamlProbeReport,
+    WebClassRequestCounts,
+    Option<ConsentProbeReport>,
+) {
+    let meter = CourseRequestMeter::default();
+    let [hoppii, idp, webclass] = origins();
+    let endpoints = AuthEndpoints {
+        hoppii,
+        idp,
+        webclass,
+        timeout: TIMEOUT,
+    };
+    let restriction = CourseCheck::new(&endpoints, false, meter.clone());
+    let (mut clients, servers, _) = start(fixture, vec![]);
+    clients.begin_run();
+    let failure = clients
+        .authenticator()
+        .connect_webclass(
+            HoseiCredentials::new(STUDENT, PASSWORD),
+            &endpoints,
+            Some(restriction),
+        )
+        .err()
+        .expect("production course policy must stop without a WebClass session");
+    finish_all(servers);
+    let HoseiAuthError::SamlProbeStopped(report) = failure else {
+        panic!("unexpected observation failure: {failure:?}");
+    };
+    let mut meter = meter.lock().unwrap();
+    let requests = meter.requests;
+    assert_eq!(requests.hoppii, WebClassMethodCounts { get: 1, post: 0 });
+    assert_eq!(requests.idp.post, 3);
+    assert_eq!(requests.webclass, WebClassMethodCounts::default());
+    assert_eq!(requests.courses_get, 0);
+    (report, requests, meter.consent.take())
+}
+
+fn probe_success_url() -> Url {
+    let [hoppii, idp, _] = origins();
+    let mut url = endpoint(&idp, "/openam/SSORedirect/metaAlias/fixtureRealm/provider1");
+    let acs = endpoint(&hoppii, ACS_TARGET);
+    url.query_pairs_mut().extend_pairs([
+        ("ReqID", "fixture-openam-request"),
+        ("index", "null"),
+        ("acsURL", acs.as_str()),
+        ("spEntityID", SYNTHETIC_SP_ENTITY_ID),
+        ("binding", authn_request::HTTP_POST),
+    ]);
+    url
+}
+
+fn production_probe_flow(goto: &str, success: &str, response: Option<Exchange>) -> FullFlow {
+    let mut fixture = secured_flow(false);
+    fixture.exchanges[0].truncate(1);
+    fixture.exchanges[1].truncate(4);
+    fixture.exchanges[2].clear();
+    let xui = xui_url_with_goto(&fixture.endpoints.idp, SYNTHETIC_SP_ENTITY_ID, goto);
+    fixture.exchanges[1][0]
+        .response_headers
+        .iter_mut()
+        .find(|(name, _)| *name == "Location")
+        .unwrap()
+        .1 = xui.to_string();
+    let auth = parse_xui_auth_url(&xui, &fixture.endpoints.idp).unwrap();
+    let auth_target = format!("{}?{}", auth.path(), auth.query().unwrap());
+    for exchange in &mut fixture.exchanges[1][1..] {
+        exchange.target.clone_from(&auth_target);
+    }
+    fixture.exchanges[1][3].body = json!({"tokenId": TOKEN, "successUrl": success}).to_string();
+    fixture.exchanges[1].extend(response);
+    fixture
+}
+
+#[test]
+fn production_probe_checks_the_form_and_never_posts_the_assertion() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let target = probe_success_url();
+    let target_path = format!("{}?{}", target.path(), target.query().unwrap());
+    let acs = endpoint(&origins()[0], ACS_TARGET);
+    let xml = r#"<p:Response xmlns:p="urn:oasis:names:tc:SAML:2.0:protocol" Version="2.0" InResponseTo="_fixture_saml_id"><p:Status/></p:Response>"#;
+    let encoded = STANDARD.encode(xml);
+    let html = SAML.replace(
+        "https://synthetic-hoppii.example.invalid/synthetic-saml/acs?requestId=synthetic-saml-request-id",
+        acs.as_str(),
+    ).replace("synthetic-saml-response-not-an-assertion", &encoded);
+    for (body, action_matches, id_matches, stop) in [
+        (
+            html.clone(),
+            Some(true),
+            Some(true),
+            SamlProbeStop::ActionMatched,
+        ),
+        (
+            html.replace(ACS_TARGET, "/saml/other"),
+            Some(false),
+            None,
+            SamlProbeStop::ActionMismatch,
+        ),
+        (
+            html.replace("method=\"post\"", "method=\"get\""),
+            Some(true),
+            None,
+            SamlProbeStop::UnexpectedFormMethod,
+        ),
+        (
+            html.replace(
+                &encoded,
+                &STANDARD.encode(xml.replace("_fixture_saml_id", "_different")),
+            ),
+            Some(true),
+            Some(false),
+            SamlProbeStop::ResponseRequestMismatch,
+        ),
+        (
+            html.replace(&encoded, "opaque-response"),
+            Some(true),
+            None,
+            SamlProbeStop::ResponseRequestUnverified,
+        ),
+        (
+            "<html>No SAML form</html>".into(),
+            None,
+            None,
+            SamlProbeStop::UnrecognizedForm,
+        ),
+    ] {
+        let (report, requests) = run_production_saml_probe(production_probe_flow(
+            target_path.strip_prefix("/openam").unwrap(),
+            &target_path,
+            Some(
+                Exchange::new("GET", &target_path, 200, &body).cookie("iPlanetDirectoryPro", TOKEN),
+            ),
+        ));
+        assert_eq!(requests.idp.get, 2);
+        assert_eq!(report.query_matches, Some(true));
+        assert_eq!(report.acs_url_matches, Some(true));
+        assert_eq!(report.status, Some(StatusCode::OK));
+        assert_eq!(report.form_recognized, Some(action_matches.is_some()));
+        assert_eq!(
+            report.form_method,
+            action_matches.map(|_| {
+                if stop == SamlProbeStop::UnexpectedFormMethod {
+                    "GET"
+                } else {
+                    "POST"
+                }
+            })
+        );
+        assert_eq!(report.action_matches, action_matches);
+        assert_eq!(report.saml_response_present, action_matches.map(|_| true));
+        assert_eq!(report.relay_state_present, action_matches.map(|_| true));
+        assert_eq!(report.in_response_to_matches, id_matches);
+        assert_eq!(report.stop, stop);
+        let diagnostic = format!("{report:?}");
+        for value in [
+            acs.as_str(),
+            &encoded,
+            "_fixture_saml_id",
+            "synthetic-relay-state",
+        ] {
+            assert!(!diagnostic.contains(value));
+        }
+    }
+}
+
+fn consent_location(target: &Url, issuer: &str) -> Url {
+    let idp = &origins()[1];
+    let mut consent = endpoint(idp, CONSENT);
+    consent.query_pairs_mut().extend_pairs([
+        ("realm", "/"),
+        ("idpEntityId", endpoint(idp, "/idp/metadata").as_str()),
+        ("spEntityId", issuer),
+        ("consentID", "synthetic-page-reference"),
+        ("originalRequestURI", target.as_str()),
+    ]);
+    consent
+}
+
+#[test]
+fn six_request_probe_stops_before_a_valid_consent_page() {
+    let target = probe_success_url();
+    let target_path = format!("{}?{}", target.path(), target.query().unwrap());
+    let consent = consent_location(&target, SYNTHETIC_SP_ENTITY_ID);
+    let fixture = production_probe_flow(
+        target.as_str(),
+        target.as_str(),
+        Some(
+            Exchange::redirect("GET", &target_path, consent.as_str())
+                .cookie("iPlanetDirectoryPro", TOKEN),
+        ),
+    );
+    let (mut clients, servers, _) = start(fixture, vec![]);
+    clients.begin_run();
+    let check = sync::observe_webclass_saml_before_consent(
+        &clients.authenticator(),
+        HoseiCredentials::new(STUDENT, PASSWORD),
+    );
+    finish_all(servers);
+    let Err(WebClassCourseListError::Authentication(HoseiAuthError::SamlProbeStopped(report))) =
+        check.result
+    else {
+        panic!("expected an observation stop");
+    };
+    assert_eq!(report.status, Some(StatusCode::FOUND));
+    assert_eq!(report.stop, SamlProbeStop::ConsentRequired);
+    assert_eq!(
+        check.requests.hoppii,
+        WebClassMethodCounts { get: 1, post: 0 }
+    );
+    assert_eq!(check.requests.idp, WebClassMethodCounts { get: 2, post: 3 });
+    assert_eq!(check.requests.webclass, WebClassMethodCounts::default());
+    assert_eq!(check.requests.courses_get, 0);
+    let details = check.consent.unwrap();
+    assert_eq!(details.stop, "stopped_before_consent_get");
+    assert_eq!(details.page_status, None);
+}
+
+#[test]
+fn consent_observation_uses_one_get_and_never_follows_its_response() {
+    let target = probe_success_url();
+    let target_path = format!("{}?{}", target.path(), target.query().unwrap());
+    let consent = consent_location(&target, SYNTHETIC_SP_ENTITY_ID);
+    let consent_path = format!("{}?{}", consent.path(), consent.query().unwrap());
+    for (page, status) in [
+        (
+            Exchange::new(
+                "GET",
+                &consent_path,
+                200,
+                r#"<form method="post"><button>Agree</button></form>"#,
+            ),
+            200,
+        ),
+        (Exchange::redirect("GET", &consent_path, &target_path), 302),
+    ] {
+        let mut fixture = production_probe_flow(
+            target.as_str(),
+            target.as_str(),
+            Some(
+                Exchange::redirect("GET", &target_path, consent.as_str())
+                    .cookie("iPlanetDirectoryPro", TOKEN),
+            ),
+        );
+        fixture.exchanges[1].push(page.cookie("iPlanetDirectoryPro", TOKEN));
+        let (report, requests, details) = run_production_observation(fixture);
+        assert_eq!(requests.idp.get, 3);
+        assert_eq!(requests.idp.post, 3);
+        assert_eq!(requests.hoppii.post, 0);
+        assert_eq!(requests.webclass.get, 0);
+        assert_eq!(requests.webclass.post, 0);
+        assert_eq!(requests.courses_get, 0);
+        let details = details.unwrap();
+        assert_eq!(details.page_status, Some(status));
+        if status == 200 {
+            assert!(details.page.is_some());
+            assert_eq!(report.stop, SamlProbeStop::ConsentPageObserved);
+        } else {
+            assert!(details.page.is_none());
+            assert_eq!(report.stop, SamlProbeStop::ConsentRequired);
+        }
+    }
+}
+
+#[test]
+fn consent_observation_records_unrecognized_query_names_without_sending_get() {
+    let target = probe_success_url();
+    let target_path = format!("{}?{}", target.path(), target.query().unwrap());
+    let mut consent = consent_location(&target, SYNTHETIC_SP_ENTITY_ID);
+    consent
+        .query_pairs_mut()
+        .append_pair("consentMode", "synthetic-unverified");
+    let fixture = production_probe_flow(
+        target.as_str(),
+        target.as_str(),
+        Some(
+            Exchange::redirect("GET", &target_path, consent.as_str())
+                .cookie("iPlanetDirectoryPro", TOKEN),
+        ),
+    );
+    let (report, requests, details) = run_production_observation(fixture);
+    assert_eq!(report.stop, SamlProbeStop::ConsentRequired);
+    assert_eq!(requests.idp.get, 2);
+    let details = details.unwrap();
+    assert!(details.page_status.is_none());
+    assert_eq!(details.stop, "unverified_consent_query");
+    let output = serde_json::to_string(&details).unwrap();
+    assert!(output.contains("consentMode"));
+    assert!(!output.contains("synthetic-page-reference"));
+    assert!(!output.contains("synthetic-unverified"));
+}
+
+#[test]
+fn consent_observation_rejects_a_different_sp_after_successful_login() {
+    let target = probe_success_url();
+    let target_path = format!("{}?{}", target.path(), target.query().unwrap());
+    let other_issuer = "urn:fixture:other:service-provider";
+    let consent = consent_location(&target, other_issuer);
+    let fixture = production_probe_flow(
+        target.as_str(),
+        target.as_str(),
+        Some(
+            Exchange::redirect("GET", &target_path, consent.as_str())
+                .cookie("iPlanetDirectoryPro", TOKEN),
+        ),
+    );
+    let (report, requests, details) = run_production_observation(fixture);
+    assert_eq!(report.stop, SamlProbeStop::ConsentRequired);
+    assert_eq!(requests.idp.get, 2);
+    let details = details.unwrap();
+    assert!(details.page_status.is_none());
+    assert_eq!(details.stop, "consent_issuer_mismatch");
+    assert!(
+        !serde_json::to_string(&details)
+            .unwrap()
+            .contains(other_issuer)
+    );
+}
+
+#[test]
+fn production_probe_records_redirect_status_without_following_it() {
+    let target = probe_success_url();
+    let target_path = format!("{}?{}", target.path(), target.query().unwrap());
+    for (redirect, stop) in [
+        (CONSENT, SamlProbeStop::ConsentRequired),
+        (target_path.as_str(), SamlProbeStop::HttpStatus),
+    ] {
+        let (report, requests) = run_production_saml_probe(production_probe_flow(
+            target.as_str(),
+            target.as_str(),
+            Some(
+                Exchange::redirect("GET", &target_path, redirect)
+                    .cookie("iPlanetDirectoryPro", TOKEN),
+            ),
+        ));
+        assert_eq!(requests.idp.get, 2);
+        assert_eq!(report.status, Some(StatusCode::FOUND));
+        assert_eq!(report.form_recognized, None);
+        assert_eq!(report.action_matches, None);
+        assert_eq!(report.stop, stop);
+    }
+}
+
+#[test]
+fn production_probe_blocks_changed_targets_before_the_get() {
+    let valid = probe_success_url();
+    let candidate = valid.as_str();
+    for (wrong, stop, query_matches, acs_matches, match_goto) in [
+        (
+            candidate.replace("acsURL=", "other="),
+            SamlProbeStop::QueryStructure,
+            Some(false),
+            None,
+            true,
+        ),
+        (
+            candidate.replace("acsURL=", "acs%55RL="),
+            SamlProbeStop::QueryStructure,
+            Some(false),
+            None,
+            false,
+        ),
+        (
+            candidate.replace("ReqID=", "ReqID=duplicate&ReqID="),
+            SamlProbeStop::QueryStructure,
+            Some(false),
+            None,
+            false,
+        ),
+        (
+            candidate.replace("ReqID=", "ReqID=%GG"),
+            SamlProbeStop::InvalidTarget,
+            None,
+            None,
+            false,
+        ),
+        (
+            candidate.replace("fixtureRealm/provider1", "fixtureRealm/other/provider1"),
+            SamlProbeStop::ProviderPath,
+            Some(true),
+            Some(true),
+            true,
+        ),
+        (
+            candidate.replace("fixtureRealm/provider1", "fixtureRealm/other/../provider1"),
+            SamlProbeStop::InvalidTarget,
+            None,
+            None,
+            false,
+        ),
+        (
+            candidate.replace("fixtureRealm/provider1", "fixtureRealm%2Fprovider1"),
+            SamlProbeStop::InvalidTarget,
+            None,
+            None,
+            false,
+        ),
+        (
+            candidate.replace(
+                "requestId%3Dsynthetic-saml-request-id",
+                "requestId%3Danother-acs",
+            ),
+            SamlProbeStop::AcsUrlMismatch,
+            Some(true),
+            Some(false),
+            true,
+        ),
+        (
+            candidate.replace("service-provider", "other-provider"),
+            SamlProbeStop::IssuerMismatch,
+            Some(true),
+            Some(true),
+            true,
+        ),
+        (
+            candidate.replace("HTTP-POST", "HTTP-Artifact"),
+            SamlProbeStop::BindingMismatch,
+            Some(true),
+            Some(true),
+            true,
+        ),
+        (
+            candidate.replace("index=null", "index=0"),
+            SamlProbeStop::UnexpectedIndex,
+            Some(true),
+            Some(true),
+            true,
+        ),
+        (
+            candidate.replace("fixture-openam-request", "other-request"),
+            SamlProbeStop::GotoMismatch,
+            Some(true),
+            Some(true),
+            false,
+        ),
+    ] {
+        let goto = if match_goto {
+            wrong.as_str()
+        } else {
+            candidate
+        };
+        let (report, requests) =
+            run_production_saml_probe(production_probe_flow(goto, &wrong, None));
+        assert_eq!(requests.idp.get, 1);
+        assert_eq!(report.status, None);
+        assert_eq!(report.query_matches, query_matches);
+        assert_eq!(report.acs_url_matches, acs_matches);
+        assert_eq!(report.stop, stop);
+    }
+}
+
+#[test]
+fn course_only_stops_for_direct_consent_or_unexpected_mfa_callbacks() {
+    for (index, body, expected) in [
+        (
+            3,
+            json!({"tokenId": TOKEN, "successUrl": CONSENT}).to_string(),
+            HoseiAuthError::ConsentRequired,
+        ),
+        (
+            1,
+            INITIAL.replace("NameCallback", "SyntheticMfaCallback"),
+            HoseiAuthError::ProtocolChanged(AuthStep::OpenAmCredentials),
+        ),
+        (
+            2,
+            SCRIPTED2.replace("HiddenValueCallback", "SyntheticMfaCallback"),
+            HoseiAuthError::ProtocolChanged(AuthStep::OpenAmScripted2),
+        ),
+    ] {
+        let mut fixture = secured_flow(false);
+        fixture.exchanges[0].truncate(1);
+        fixture.exchanges[1].truncate(index + 1);
+        fixture.exchanges[1][index].body = body;
+        fixture.exchanges[2].clear();
+        assert_eq!(
+            run_course_check(fixture).result.unwrap_err(),
+            WebClassCourseListError::Authentication(expected)
+        );
+    }
+}
+
+#[test]
 fn course_only_stops_before_any_consent_post_and_leaves_normal_login_available() {
     let mut fixture = flow();
     fixture.exchanges[0].truncate(1);
@@ -425,19 +1040,21 @@ fn course_only_blocks_unknown_redirects_and_does_not_send_cookies_or_log_urls() 
 
 #[test]
 fn course_only_blocks_an_unverified_saml_post_target_before_transmitting() {
-    let mut fixture = secured_flow(false);
-    fixture.exchanges[0].truncate(1);
-    fixture.exchanges[2].clear();
-    let saml = &mut fixture.exchanges[1].last_mut().unwrap().body;
-    *saml = saml.replace("/saml/acs?", "/saml/unknown?");
-    let error = run_course_check(fixture).result.unwrap_err();
-    assert_eq!(
-        error,
-        WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChangedWithReason(
-            AuthStep::HoppiiAcs,
-            ProtocolReason::RequestNotAllowed,
-        ))
-    );
+    for wrong_acs in ["/saml/unknown", "/saml/acs?requestId=another-assertion"] {
+        let mut fixture = secured_flow(false);
+        fixture.exchanges[0].truncate(1);
+        fixture.exchanges[2].clear();
+        let saml = &mut fixture.exchanges[1].last_mut().unwrap().body;
+        *saml = saml.replace(ACS_TARGET, wrong_acs);
+        let error = run_course_check(fixture).result.unwrap_err();
+        assert_eq!(
+            error,
+            WebClassCourseListError::Authentication(HoseiAuthError::ProtocolChangedWithReason(
+                AuthStep::HoppiiAcs,
+                ProtocolReason::RequestNotAllowed,
+            ))
+        );
+    }
 }
 
 #[test]
@@ -1196,7 +1813,7 @@ fn transport_rejects_methods_and_hoppii_limits_before_sending() {
     );
     finish(server);
     assert_eq!(
-        meter.lock().unwrap().hoppii,
+        meter.lock().unwrap().requests.hoppii,
         WebClassMethodCounts { get: 34, post: 1 }
     );
 }

@@ -11,6 +11,8 @@ const COURSES: &str = "/webclass/ip_mods.php/plugin/score_summary_table/courses"
 const STUDENT: &str = "student-test";
 const PASSWORD: &str = "synthetic-password";
 const TOKEN: &str = "synthetic-openam-token";
+const SYNTHETIC_SP_ENTITY_ID: &str = "urn:fixture:hoppii:service-provider";
+const ACS_TARGET: &str = "/saml/acs?requestId=synthetic-saml-request-id";
 const SECRETS: &[&str] = &[
     STUDENT,
     PASSWORD,
@@ -29,21 +31,41 @@ const SECRETS: &[&str] = &[
 ];
 
 fn xui_url(idp: &Url) -> Url {
+    xui_url_with_issuer(idp, SYNTHETIC_SP_ENTITY_ID)
+}
+
+fn xui_url_with_issuer(idp: &Url, issuer: &str) -> Url {
+    xui_url_with_goto(
+        idp,
+        issuer,
+        "/SSORedirect/metaAlias/synthetic-idp?ReqID=synthetic-request-id",
+    )
+}
+
+fn xui_url_with_goto(idp: &Url, issuer: &str, goto: &str) -> Url {
     let mut url = endpoint(idp, XUI);
     let mut query = idp.clone();
     query.query_pairs_mut().extend_pairs([
         ("realm", "/"),
         ("forward", "true"),
-        ("spEntityID", HOPPII_ORIGIN),
+        ("spEntityID", issuer),
         ("askConsent", "true"),
-        (
-            "goto",
-            "/SSORedirect/metaAlias/synthetic-idp?ReqID=synthetic-request-id",
-        ),
+        ("goto", goto),
         ("AMAuthCookie", "synthetic-am-auth-cookie"),
     ]);
     url.set_fragment(Some(&format!("login/&{}", query.query().unwrap())));
     url
+}
+
+fn fixture_authn_request(idp: &Url, acs: &Url) -> String {
+    format!(
+        r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_fixture_saml_id" Version="2.0" IssueInstant="2026-01-01T00:00:00Z" Destination="{}" AssertionConsumerServiceURL="{}" ProtocolBinding="{}">
+            <saml:Issuer>{SYNTHETIC_SP_ENTITY_ID}</saml:Issuer>
+        </samlp:AuthnRequest>"#,
+        endpoint(idp, IDP_SSO),
+        quick_xml::escape::escape(acs.as_str()),
+        authn_request::HTTP_POST,
+    )
 }
 
 struct RecordedRequest {
@@ -325,13 +347,16 @@ impl FullFlow {
         } else {
             endpoints
         };
-        let idp_sso = endpoint(&endpoints.idp, "/idp/sso?request=synthetic-request-id");
+        let acs = endpoint(&endpoints.hoppii, ACS_TARGET);
+        let xml = fixture_authn_request(&endpoints.idp, &acs);
+        let mut idp_sso = endpoint(&endpoints.idp, IDP_SSO);
+        idp_sso.query_pairs_mut().extend_pairs([
+            ("SAMLRequest", authn_request::encode_fixture(xml.as_bytes()).as_str()),
+            ("RelayState", "synthetic&relay"),
+        ]);
+        let idp_target = format!("{}?{}", idp_sso.path(), idp_sso.query().unwrap());
         let auth = parse_xui_auth_url(&xui_url(&endpoints.idp), &endpoints.idp).unwrap();
         let auth_target = format!("{}?{}", auth.path(), auth.query().unwrap());
-        let acs = endpoint(
-            &endpoints.hoppii,
-            "/saml/acs?requestId=synthetic-saml-request-id",
-        );
         let saml = SAML.replace("https://synthetic-hoppii.example.invalid/synthetic-saml/acs?requestId=synthetic-saml-request-id", acs.as_str());
         let csso = CSSO.replace(
             "/webclass/singlesignon.php",
@@ -359,7 +384,7 @@ impl FullFlow {
         let mut idp = vec![
             Exchange::redirect(
                 "GET",
-                "/idp/sso?request=synthetic-request-id",
+                &idp_target,
                 xui_url(&endpoints.idp).as_str(),
             )
             .response_header("Set-Cookie", "idp_test=synthetic-cookie; Path=/openam"),
@@ -411,7 +436,7 @@ impl FullFlow {
             Exchange::redirect("GET", USER_PAGE, idp_sso.as_str()).without_cookies(),
             Exchange::redirect(
                 "POST",
-                "/saml/acs?requestId=synthetic-saml-request-id",
+                ACS_TARGET,
                 "/portal/index.php?next=",
             )
             .request_form(&saml)

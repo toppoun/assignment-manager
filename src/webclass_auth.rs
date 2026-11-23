@@ -19,17 +19,24 @@ use crate::university_network::{
     Source, Transport, WEBCLASS_ORIGIN, read_text,
 };
 
+mod authn_request;
+pub(crate) use authn_request::SamlProbeTarget;
+mod consent_observation;
+pub(crate) use consent_observation::ConsentPageTarget;
+pub use consent_observation::ConsentProbeReport;
 pub(crate) mod course_check;
+use authn_request::{AuthnRequest, CourseSamlSession};
 use course_check::{CourseCheck, CourseRequestMeter};
 pub use course_check::{WebClassMethodCounts, WebClassRequestCounts};
 
-const USER_PAGE: &str = "/portal/u001/index.php";
+pub(crate) const USER_PAGE: &str = "/portal/u001/index.php";
 const PORTAL_PUBLIC_PATH: &str = "/portal/index.php";
 const PORTAL_LOGIN_PATH: &str = "/portal/login/login.php";
 const PORTAL_PUBLIC: &str = "/portal/index.php?next=";
 const PORTAL_LOGIN: &str = "/portal/login/login.php?next=";
 const PARM_PATH: &str = "/portal/sso/Parm.php";
 const PARM: &str = "/portal/sso/Parm.php?auth_mode=1&group_id=";
+const IDP_SSO: &str = "/idp/profile/SAML2/Redirect/SSO";
 const AUTHENTICATE: &str = "/openam/json/authenticate";
 const XUI: &str = "/openam/XUI/";
 const CONSENT: &str = "/openam/saml2/consent/";
@@ -111,6 +118,45 @@ pub enum ProtocolReason {
     UserInfo,
 }
 
+/// Redacted result of stopping the production course check before the SAML POST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamlProbeReport {
+    pub query_matches: Option<bool>,
+    pub acs_url_matches: Option<bool>,
+    pub status: Option<StatusCode>,
+    pub form_recognized: Option<bool>,
+    pub form_method: Option<&'static str>,
+    pub action_matches: Option<bool>,
+    pub saml_response_present: Option<bool>,
+    pub relay_state_present: Option<bool>,
+    pub in_response_to_matches: Option<bool>,
+    pub stop: SamlProbeStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamlProbeStop {
+    InvalidTarget,
+    ConsentRequired,
+    ConsentPageObserved,
+    QueryStructure,
+    ProviderPath,
+    AcsUrlMismatch,
+    IssuerMismatch,
+    BindingMismatch,
+    UnexpectedIndex,
+    GotoMismatch,
+    SessionCookie,
+    RequestFailed,
+    HttpStatus,
+    ResponseBody,
+    UnrecognizedForm,
+    UnexpectedFormMethod,
+    ActionMismatch,
+    ResponseRequestMismatch,
+    ResponseRequestUnverified,
+    ActionMatched,
+}
+
 /// Contains only fixed categories, steps, reasons and HTTP status codes, never transport causes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoseiAuthError {
@@ -122,6 +168,7 @@ pub enum HoseiAuthError {
     ProtocolChangedWithReason(AuthStep, ProtocolReason),
     RedirectLimit(AuthStep),
     ConsentRequired,
+    SamlProbeStopped(SamlProbeReport),
     RequestLimit,
     ConsentFailed,
     HoppiiSessionFailed,
@@ -150,6 +197,9 @@ impl fmt::Display for HoseiAuthError {
                 write!(f, "Hosei authentication redirect limit reached at {step:?}")
             }
             Self::ConsentRequired => f.write_str("Hosei SAML consent is required"),
+            Self::SamlProbeStopped(report) => {
+                write!(f, "WebClass SAML check stopped at {:?}", report.stop)
+            }
             Self::RequestLimit => f.write_str("WebClass course-check request limit reached"),
             Self::ConsentFailed => write!(f, "Hosei SAML consent failed"),
             Self::HoppiiSessionFailed => {
@@ -237,18 +287,19 @@ impl HoseiAuthenticator {
         &self,
         credentials: HoseiCredentials<'_>,
         meter: CourseRequestMeter,
+        stop_before_consent: bool,
         check: impl FnOnce(WebClassClient) -> Result<T, E>,
     ) -> Result<T, E> {
         if self.policy.is_none() {
             return Err(HoseiAuthError::ClientInitialization.into());
         }
-        self.login_checked(credentials, Some(meter), check)
+        self.login_checked(credentials, Some((meter, stop_before_consent)), check)
     }
 
     fn login_checked<T, E: From<HoseiAuthError>>(
         &self,
         credentials: HoseiCredentials<'_>,
-        meter: Option<CourseRequestMeter>,
+        course_check: Option<(CourseRequestMeter, bool)>,
         check: impl FnOnce(WebClassClient) -> Result<T, E>,
     ) -> Result<T, E> {
         #[cfg(feature = "synthetic-https-fixture")]
@@ -258,14 +309,22 @@ impl HoseiAuthenticator {
         {
             return Err(HoseiAuthError::ClientInitialization.into());
         }
+        let production = AuthEndpoints::production();
+        let (endpoints, fixture_paths) = (&production, false);
         #[cfg(any(test, feature = "synthetic-https-fixture"))]
-        if let Some(endpoints) = &self.test_endpoints {
-            let restriction = meter.map(|meter| CourseCheck::new(endpoints, true, meter));
-            return check(self.connect_webclass(credentials, endpoints, restriction)?);
-        }
-        let endpoints = AuthEndpoints::production();
-        let restriction = meter.map(|meter| CourseCheck::new(&endpoints, false, meter));
-        check(self.connect_webclass(credentials, &endpoints, restriction)?)
+        let (endpoints, fixture_paths) = self
+            .test_endpoints
+            .as_ref()
+            .map_or((endpoints, fixture_paths), |endpoints| (endpoints, true));
+        let restriction = course_check.map(|(meter, stop_before_consent)| {
+            let check = CourseCheck::new(endpoints, fixture_paths && !stop_before_consent, meter);
+            if stop_before_consent {
+                check.stop_before_consent()
+            } else {
+                check
+            }
+        });
+        check(self.connect_webclass(credentials, endpoints, restriction)?)
     }
 
     fn connect_webclass(
@@ -279,20 +338,28 @@ impl HoseiAuthenticator {
         if let Some(restriction) = restriction {
             session.http.restrict_course_check(restriction);
         }
-        let auth_url = session.discover_openam()?;
+        let (auth_url, course_saml) = session.discover_openam()?;
         let success = session.authenticate(&auth_url, credentials)?;
-        let success_url = resolve_destination(
-            &endpoints.idp,
-            success.success_url(),
-            &endpoints.idp,
-            AuthStep::OpenAmSuccess,
-        )?;
-        if session.http.is_course_check() && success_url.path() == CONSENT {
-            return Err(HoseiAuthError::ConsentRequired);
+        if session.http.observes_course_saml() {
+            let course_saml = course_saml.ok_or(HoseiAuthError::ClientInitialization)?;
+            return Err(HoseiAuthError::SamlProbeStopped(
+                session.observe_course_saml(&success, &course_saml),
+            ));
         }
+        let success_url = match &course_saml {
+            Some(course_saml) => {
+                course_saml.verify_success(success.success_url(), &endpoints.idp)?
+            }
+            None => resolve_destination(
+                &endpoints.idp,
+                success.success_url(),
+                &endpoints.idp,
+                AuthStep::OpenAmSuccess,
+            )?,
+        };
         session.install_openam_cookie(success.token_id())?;
         drop(success);
-        session.saml_to_hoppii(success_url)?;
+        session.saml_to_hoppii(success_url, course_saml.as_ref())?;
         session.establish_hoppii_session()?;
         session.webclass_sso()?;
 
@@ -397,33 +464,46 @@ impl<'a> AuthSession<'a> {
     }
 
     fn send(&self, request: RequestBuilder, step: AuthStep) -> Result<Response, HoseiAuthError> {
-        self.http.send(request).map_err(|error| {
-            if self.http.is_course_check() {
-                match error {
-                    NetworkError::Policy => {
-                        return HoseiAuthError::ProtocolChangedWithReason(
-                            step,
-                            ProtocolReason::RequestNotAllowed,
-                        );
-                    }
-                    NetworkError::ResourceLimit => return HoseiAuthError::RequestLimit,
-                    _ => {}
-                }
-            }
-            transport_error(error, step)
-        })
+        self.http
+            .send_auth(request, step)
+            .map_err(|error| self.send_error(error, step))
     }
 
-    fn discover_openam(&self) -> Result<Url, HoseiAuthError> {
+    fn send_error(&self, error: NetworkError, step: AuthStep) -> HoseiAuthError {
+        if self.http.is_course_check() {
+            match error {
+                NetworkError::Policy => {
+                    return HoseiAuthError::ProtocolChangedWithReason(
+                        step,
+                        ProtocolReason::RequestNotAllowed,
+                    );
+                }
+                NetworkError::ResourceLimit => return HoseiAuthError::RequestLimit,
+                _ => {}
+            }
+        }
+        transport_error(error, step)
+    }
+
+    fn discover_openam(&self) -> Result<(Url, Option<CourseSamlSession>), HoseiAuthError> {
         let response = self.send(
             self.http.get(endpoint(&self.endpoints.hoppii, USER_PAGE)),
             AuthStep::HoppiiToIdp,
         )?;
         let idp_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::HoppiiToIdp)?;
+        let authn_request = self
+            .http
+            .is_course_check()
+            .then(|| AuthnRequest::from_redirect(&idp_url, self.endpoints))
+            .transpose()?;
         drop(response);
         let response = self.send(self.http.get(idp_url), AuthStep::IdpToOpenAm)?;
         let xui_url = redirect_destination(&response, &self.endpoints.idp, AuthStep::IdpToOpenAm)?;
-        parse_xui_auth_url(&xui_url, &self.endpoints.idp)
+        let auth_url = parse_xui_auth_url(&xui_url, &self.endpoints.idp)?;
+        let course_saml = authn_request
+            .map(|request| request.bind_xui(&auth_url, &self.endpoints.idp))
+            .transpose()?;
+        Ok((auth_url, course_saml))
     }
 
     fn openam_post(&self, url: &Url) -> RequestBuilder {
@@ -497,8 +577,109 @@ impl<'a> AuthSession<'a> {
         Ok(())
     }
 
-    fn saml_to_hoppii(&self, success_url: Url) -> Result<(), HoseiAuthError> {
-        let response = self.send(self.http.get(success_url), AuthStep::Saml)?;
+    fn observe_course_saml(
+        &self,
+        success: &OpenAmSuccess,
+        course_saml: &CourseSamlSession,
+    ) -> SamlProbeReport {
+        let mut report = SamlProbeReport {
+            query_matches: None,
+            acs_url_matches: None,
+            status: None,
+            form_recognized: None,
+            form_method: None,
+            action_matches: None,
+            saml_response_present: None,
+            relay_state_present: None,
+            in_response_to_matches: None,
+            stop: SamlProbeStop::ActionMatched,
+        };
+        if let Err(stop) = self.inspect_course_saml(success, course_saml, &mut report) {
+            report.stop = stop;
+        }
+        report
+    }
+
+    fn inspect_course_saml(
+        &self,
+        success: &OpenAmSuccess,
+        course_saml: &CourseSamlSession,
+        report: &mut SamlProbeReport,
+    ) -> Result<(), SamlProbeStop> {
+        let target = course_saml.probe_target(success, &self.endpoints.idp, report)?;
+        self.install_openam_cookie(success.token_id())
+            .map_err(|_| SamlProbeStop::SessionCookie)?;
+        let response = self
+            .http
+            .send_course_saml_probe(target)
+            .map_err(|_| SamlProbeStop::RequestFailed)?;
+        report.status = Some(response.status());
+        if response.status() == StatusCode::FOUND {
+            let consent = consent_observation::observe(
+                &self.http,
+                response,
+                &self.endpoints.idp,
+                course_saml,
+            );
+            let stop = if consent.page.is_some() {
+                SamlProbeStop::ConsentPageObserved
+            } else if consent.query.is_some() {
+                SamlProbeStop::ConsentRequired
+            } else {
+                SamlProbeStop::HttpStatus
+            };
+            self.http.record_course_consent(consent);
+            return Err(stop);
+        }
+        if response.status() != StatusCode::OK {
+            return Err(SamlProbeStop::HttpStatus);
+        }
+        let text = read_ok(response, AuthStep::Saml).map_err(|_| SamlProbeStop::ResponseBody)?;
+        let form = parse_auto_submit_form(&text);
+        drop(text);
+        report.form_recognized = Some(false);
+        let form = form.map_err(|_| SamlProbeStop::UnrecognizedForm)?;
+        report.form_method = Some(form.method);
+        let matches = course_saml
+            .verify_acs(form.action(), &self.endpoints.hoppii)
+            .is_ok();
+        report.action_matches = Some(matches);
+        let saml_response = form.field_value("SAMLResponse");
+        let relay_state = form.field_value("RelayState");
+        report.saml_response_present = saml_response.as_ref().ok().map(Option::is_some);
+        report.relay_state_present = relay_state.as_ref().ok().map(Option::is_some);
+        form.validate_saml()
+            .map_err(|_| SamlProbeStop::UnrecognizedForm)?;
+        report.form_recognized = Some(true);
+        if form.method != "POST" {
+            return Err(SamlProbeStop::UnexpectedFormMethod);
+        }
+        if !matches {
+            return Err(SamlProbeStop::ActionMismatch);
+        }
+        report.in_response_to_matches = saml_response
+            .ok()
+            .flatten()
+            .and_then(|encoded| course_saml.response_matches_request(encoded));
+        match report.in_response_to_matches {
+            Some(true) => Ok(()),
+            Some(false) => Err(SamlProbeStop::ResponseRequestMismatch),
+            None => Err(SamlProbeStop::ResponseRequestUnverified),
+        }
+    }
+
+    fn saml_to_hoppii(
+        &self,
+        success_url: Url,
+        course_saml: Option<&CourseSamlSession>,
+    ) -> Result<(), HoseiAuthError> {
+        let response = if course_saml.is_some() {
+            self.http
+                .send_course_saml_success(success_url)
+                .map_err(|error| self.send_error(error, AuthStep::Saml))?
+        } else {
+            self.send(self.http.get(success_url), AuthStep::Saml)?
+        };
         let response = if is_redirect(response.status()) {
             let consent_url =
                 redirect_destination(&response, &self.endpoints.idp, AuthStep::Consent)?;
@@ -519,8 +700,12 @@ impl<'a> AuthSession<'a> {
             .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::Saml))?;
         form.validate_saml()
             .map_err(|_| HoseiAuthError::ProtocolChanged(AuthStep::Saml))?;
-        let action =
-            resolve_destination(&base, form.action(), &self.endpoints.hoppii, AuthStep::Saml)?;
+        let action = match course_saml {
+            Some(course_saml) => course_saml.verify_acs(form.action(), &self.endpoints.hoppii)?,
+            None => {
+                resolve_destination(&base, form.action(), &self.endpoints.hoppii, AuthStep::Saml)?
+            }
+        };
         let response = self.send(
             self.http.post(action).form(&form_pairs(&form)),
             AuthStep::HoppiiAcs,
@@ -1227,6 +1412,7 @@ impl fmt::Debug for FormField {
 
 pub(crate) struct AutoSubmitForm {
     action: String,
+    method: &'static str,
     fields: Vec<FormField>,
 }
 
@@ -1255,6 +1441,12 @@ pub(crate) fn parse_auto_submit_form(html: &str) -> Result<AutoSubmitForm, WebCl
         .filter(|action| !action.trim().is_empty())
         .ok_or(WebClassAuthParseError::MissingField("action"))?
         .to_owned();
+    let method = match form.attr("method") {
+        Some(method) if method.eq_ignore_ascii_case("post") => "POST",
+        None => "GET",
+        Some(method) if method.eq_ignore_ascii_case("get") => "GET",
+        Some(_) => "other",
+    };
     let fields = form
         .select(&input_selector)
         .filter_map(|input| {
@@ -1265,7 +1457,11 @@ pub(crate) fn parse_auto_submit_form(html: &str) -> Result<AutoSubmitForm, WebCl
             })
         })
         .collect();
-    Ok(AutoSubmitForm { action, fields })
+    Ok(AutoSubmitForm {
+        action,
+        method,
+        fields,
+    })
 }
 
 impl AutoSubmitForm {

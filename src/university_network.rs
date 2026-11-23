@@ -22,7 +22,10 @@ use reqwest::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, HeaderValue, REFERER},
 };
 
-use crate::webclass_auth::course_check::CourseCheck;
+use crate::webclass_auth::{
+    AuthStep, ConsentPageTarget, ConsentProbeReport, SamlProbeTarget,
+    course_check::{CourseCheck, CourseCheckRequest},
+};
 
 #[cfg(windows)]
 pub use crate::windows_moodle_tls::MoodleCrlError;
@@ -787,6 +790,16 @@ impl Transport {
     pub(crate) fn is_course_check(&self) -> bool {
         self.course_check.is_some()
     }
+    pub(crate) fn observes_course_saml(&self) -> bool {
+        self.course_check
+            .as_ref()
+            .is_some_and(CourseCheck::observes_saml)
+    }
+    pub(crate) fn observes_course_consent(&self) -> bool {
+        self.course_check
+            .as_ref()
+            .is_some_and(CourseCheck::observes_consent)
+    }
     pub(crate) fn shares_run(&self, run: &Arc<RunBudget>) -> bool {
         self.run.as_ref().is_some_and(|r| Arc::ptr_eq(r, run))
     }
@@ -812,20 +825,68 @@ impl Transport {
         &self,
         request: RequestBuilder,
     ) -> Result<Response, NetworkError> {
-        self.execute(request, true).map_err(|(error, _)| error)
+        self.execute(request, CourseCheckRequest::Courses)
+            .map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn send_auth(
+        &self,
+        request: RequestBuilder,
+        step: AuthStep,
+    ) -> Result<Response, NetworkError> {
+        self.execute(request, CourseCheckRequest::Auth(step))
+            .map_err(|(error, _)| error)
+    }
+
+    /// The auth flow supplies the URL after binding the success response to the
+    /// current SAML request. The course policy can still decline the dispatch.
+    pub(crate) fn send_course_saml_success(&self, url: Url) -> Result<Response, NetworkError> {
+        if !self.is_course_check() {
+            return Err(NetworkError::Policy);
+        }
+        self.execute(self.get(url), CourseCheckRequest::SamlSuccess)
+            .map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn send_course_saml_probe(
+        &self,
+        target: SamlProbeTarget,
+    ) -> Result<Response, NetworkError> {
+        if !self.observes_course_saml() {
+            return Err(NetworkError::Policy);
+        }
+        self.execute(self.get(target.into_url()), CourseCheckRequest::SamlProbe)
+            .map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn send_course_consent_page(
+        &self,
+        target: ConsentPageTarget,
+    ) -> Result<Response, NetworkError> {
+        if !self.observes_course_consent() {
+            return Err(NetworkError::Policy);
+        }
+        self.execute(self.get(target.into_url()), CourseCheckRequest::ConsentPage)
+            .map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn record_course_consent(&self, report: ConsentProbeReport) {
+        if let Some(check) = &self.course_check {
+            check.record_consent(report);
+        }
     }
 
     pub(crate) fn send_with_detail(
         &self,
         request: RequestBuilder,
     ) -> Result<Response, (NetworkError, RequestFailure)> {
-        self.execute(request, false)
+        self.execute(request, CourseCheckRequest::Other)
     }
 
     fn execute(
         &self,
         request: RequestBuilder,
-        course_list: bool,
+        purpose: CourseCheckRequest,
     ) -> Result<Response, (NetworkError, RequestFailure)> {
         let rejected = (NetworkError::Policy, RequestFailure::Policy);
         let limit = (NetworkError::ResourceLimit, RequestFailure::ResourceLimit);
@@ -868,7 +929,7 @@ impl Transport {
         }
         if let Some(check) = &self.course_check {
             check
-                .reserve(request.method(), request.url(), course_list)
+                .reserve(request.method(), request.url(), purpose)
                 .map_err(|error| {
                     if error == NetworkError::Policy {
                         rejected

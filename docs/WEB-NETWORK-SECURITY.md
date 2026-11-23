@@ -115,27 +115,148 @@ OS getaddrinfoに委譲したlookupは待機を5秒で終了するが、OS内の
 
 ## WebClass授業一覧専用CLI
 
-`university-check webclass --courses-only` の実取得には、既存のTLS検証と3ホストの
-HTTPS 443制限に加えて、一覧専用の送信直前の検査を適用する。
+Windowsの授業一覧取得は専用Edgeを既定とする。以下は `--http-probe` を明示したときの
+HTTP診断の通信制限。既存のTLS検証に加えてHTTPS 443の2ホストに限定し、合計最大7件で停止する。
 
 | ホスト | 許可する本番パスとメソッド | GET / POST 上限 |
 |---|---|---:|
-| `hoppii2025.hosei.ac.jp` | GET `/portal/u001/index.php`、`/portal/index.php`、`/portal/login/login.php`、`/portal/sso/Parm.php`。最後のパスには既存の固定クエリだけを許可する | 34 / 1 |
-| `idp.hosei.ac.jp` | POST `/openam/json/authenticate`。XUI URLは既存のパーサーで読み取るだけ | 3 / 5 |
-| `lms2025.hosei.ac.jp` | POST `/webclass/singlesignon.php`。GET `/webclass/login.php`、`/webclass/`。認証後の取得処理からだけ GET `/webclass/ip_mods.php/plugin/score_summary_table/courses` を1回許可 | 11 / 1 |
+| `hoppii2025.hosei.ac.jp` | 初回GET `/portal/u001/index.php` | 1 / 0 |
+| `idp.hosei.ac.jp` | 認証前GET `/idp/profile/SAML2/Redirect/SSO`、POST `/openam/json/authenticate`、条件を満たす場合のみ `successUrl` GETと `/openam/saml2/consent/` GET | 3 / 3 |
+| `lms2025.hosei.ac.jp` | 本番試験の範囲外 | 0 / 0 |
 
-IdPの初回SSO・認証後の戻り先、およびHOPPIIのACSの本番パスはローカル資料で
-特定できていない。合成HTTPSの固定パスは本番で許可せず、未確認の本番パスは
-リクエスト送信前に拒否する。実取得前に、認証情報やクエリ値を除いた経路を確認する必要がある。
+実測済みのIdP GETはパスが完全一致し、クエリに `SAMLRequest` と `RelayState` が
+各1個ある場合だけ許可する。順序は任意。空の値、不正なパーセントエンコード、
+制御文字、重複、追加のキーを拒否する。`/openam/XUI/` は直前の `Location` から
+フラグメントをメモリ内で解析する。このパスへのGETは0回。
 
-同意要求は `consent_required` で停止する。同意APIへのPOSTは行わない。
-許可済みのPOSTと、301/302/303後のGETは別の要求として検査する。
-POSTに続く307/308は停止し、GETからの307/308はGETとして同じ検査を通す。
-リダイレクトは連鎖ごとに最大10回で、課題の `contents` は許可対象外とする。
+一覧専用CLIはHOPPIIの検証済みHTTPS応答から `SAMLRequest` を取り出す。標準Base64と
+raw DEFLATEを使い、展開上限64 KiB、XML深さ上限32で解析する。DTDと外部エンティティは
+許可しない。この経路では `AuthnRequest` にリクエストID、SPの `Issuer`、IdP SSOと
+一致する `Destination`、HTTPS 443のHOPPII上のACS URL、`HTTP-POST` を要求する。
+ACSは正規のパスを持つ絶対URLに限り、ACS indexによる選択は受け付けない。
+
+認証POST前に `Issuer` とXUIの `spEntityID` を完全一致で照合する。認証成功後は同じ
+試行の `goto` と `successUrl` を、パスとクエリを含めて照合する。値は試行中のみ
+メモリに保持する。SAMLのリクエストIDとOpenAMの `ReqID` は別の識別子として扱う。
+
+本番試験では `/openam/SSORedirect/metaAlias/` に英数字2セグメントが続き、クエリが
+`ReqID`、`index`、`acsURL`、`spEntityID`、`binding` 各1個の場合に限り、GETを検討する。
+`acsURL`、`spEntityID`、`binding` は同じ試行のAuthnRequestと照合する。この経路は直接
+ACS URL指定に限定し、PingAMの公開例にある `index=null` を要求する。パスと値の全照合に
+成功した時点で、同じ試行のGETを送信直前に1回予約する。
+
+フォームの `action` はACS候補とメモリ内で照合し、SAML ACS POSTの前に停止する。
+公開例との整合性に基づく試験であり、正式なSP登録情報の確認は引き続き必要である。
+合成HTTPSの `--fixture` では従来の授業一覧取得を確認できる。
+
+同意画面のGETは、検証済み `successUrl` の応答がHTTP 302で、単一の `Location` が
+同じIdPのHTTPS 443上の正確な `/openam/saml2/consent/` を指す場合に限り検討する。
+クエリは4 KiB・16項目までとし、重複、制御文字、不正なエンコードを拒否する。
+本番で確認した `realm`、`idpEntityId`、`spEntityId`、`consentID`、`originalRequestURI` の
+5キーを対象とする。`realm` は同じ試行のXUIのrealm、`spEntityId` はHOPPIIの
+AuthnRequest.Issuer、`originalRequestURI` は取得済みの `successUrl` のパスとクエリに
+照合する。`idpEntityId` はIdPのTLS応答に含まれた同一オリジンの正規のHTTPS識別子に
+限定する。その識別子への通信は発生しない。正式なIdPメタデータとの照合は未確認。
+未知のキーや不一致があれば、クエリ構造と照合結果を報告して送信前に停止する。
+GETで受け取ったHTMLはメモリ内で解析し、
+フォームの送信、スクリプトの実行、後続リダイレクトの追跡は行わない。
+同意・拒否・ACSへのPOST、授業一覧、課題の `contents` は本番試験の許可対象外とする。
 
 ホスト・メソッド別のカウンターはHTTPクライアントへの送信直前に加算し、上限到達後は
 カウントを増やさず拒否する。TLSや接続で失敗した送信試行も上限に含まれる。
-集計値は応答の有無を問わず表示する。認証値、URL、クエリ、レスポンス本文は出力しない。
+集計値は応答の有無を問わず表示する。失敗時は固定の診断カテゴリと、
+該当する場合は固定の認証段階を表示する。認証値、URL、クエリ、レスポンス本文は出力しない。
+
+### 承認後に実施するSSO経路の観測
+
+VPNと既存設定を使い、本人の承認後に既存の一覧専用CLIを1回実行する。
+OpenAMの3つのPOSTのうち、資格情報を送るのは2回目だけ。自動リダイレクトと
+自動再試行は0回。同意画面を取得した時点か、そのGET条件が成立しなかった時点で停止する。
+未対応のMFA、照合不成立、認証エラーでも停止する。
+
+本人が大学公式の画面で同意した後、その状態が新しいCLI試行に適用されるかは
+`university-check webclass --courses-only --allow-university-read --stop-before-consent` で確認する。
+上限はHOPPII GET 1件、IdP GET 2件、OpenAM POST 3件の計6件。同意画面へのGETは
+送信前のポリシーで拒否する。SAMLフォームが返った場合は、method、ACSとの一致、
+`SAMLResponse` と `RelayState` の有無を報告する。SAML Responseの `InResponseTo` は
+64 KiB・深さ32の範囲で、DTDを拒否して同じ試行のAuthnRequest.IDと照合する。
+ここで確認できるのは応答との対応関係まで。SAMLの署名は未検証のまま停止する。
+
+CLIはホスト・メソッド別件数、戻り先のクエリ構造とACSの照合結果、GETのHTTP
+ステータス、SAMLフォームの認識と `action` の照合結果を報告する。同意画面の分岐では、
+302のクエリ構造と、取得した画面の既知のラベル・属性名・フォームの構造も報告する。
+URL、Cookie、トークン、資格情報、SAML本文を出力・保存しない。
+
+### WebClassのブラウザ認証
+
+ブラウザで本人が承諾した後の新しいCLI試行でも、検証済み `successUrl` は同意画面への
+302を返した。OSSTechの実装では、送信属性の同意機能が暗号化した情報をブラウザの
+ローカルストレージに保持する。大学がこの方式を使う場合、独立したHTTPセッションでの
+再要求を説明できる。大学の製品・設定と、本人の同意選択の適用範囲は未確認。
+[OSSTech OpenAM 14 SAML設定ガイド 7.1.1・7.2](https://www.osstech.co.jp/download/updates/docs/openam/OSTD-OpenAM14-SAML-SetupGuide.pdf#page=28)
+
+Windowsでは、一覧専用CLIの `--allow-university-read` がMicrosoft Edgeを一時プロファイルで
+起動する。Edgeは標準のインストール先から探し、同梱ドライバーはPATH上のNode.jsで動く。
+WebClassが既存設定で無効な場合はEdge起動前に終了する。
+ユーザーは大学公式のHOPPIIで認証と同意を行い、WebClassリンクを開く。SAMLフォームの送信と
+セッション確立は大学のページが担う。中止は専用ブラウザを閉じる。待機上限は5分。
+通常終了時にはWindowsのジョブで子プロセスを終了し、一時プロファイルを削除する。
+`--keep-profile` の指定時だけ、`%LOCALAPPDATA%\AssignmentManagerWebClassEdge` を使う。
+アプリの所有マーカーを検証し、パス上の再解析ポイントを拒否する。OSの排他ロックは
+Edgeの終了まで保持し、保持プロファイルの削除・初期化は行わない。認証と同意の保持期間は
+大学とEdgeの設定に従う。異常終了後も新しいタブから開始し、復元タブがあれば停止する。
+授業一覧GETが401または403の場合はその試行を終了し、再認証は次回の本人操作に委ねる。
+
+Edgeの制御には継承したDevToolsパイプを使い、デバッグ用のTCPポートを開かない。
+専用のループバックプロキシはHOPPII、IdP、WebClassのHTTPS `CONNECT` のみ転送する。
+TLS証明書はEdgeが検証する。許可済みオリジン内のリダイレクトと新規タブを処理し、
+未知のトップレベルオリジンでは終了する。`contents` とダウンロードを拒否し、
+WebClass取得の前にService Workerをバイパスする。
+
+WebClassのタブでログアウト操作または既知のダッシュボードを確認したら、同一オリジンの固定
+`courses` に1回だけGETを送る。`mode` と `credentials` は `same-origin`、
+`redirect` は `error` とする。完全なHTTP 200 JSON、UTF-8、本文上限、タイムアウトを確認する。
+Cookieやローカルストレージはブラウザ内で管理する。Rust側は既存の `parse_courses`、
+授業IDの検証、件数上限を共用し、授業の取得値と年度・学期別件数を端末に表示する。
+
+ブラウザ経路から従来の固定 `ASK_IF_CHANGE` を送るHTTP同意処理を呼び出さない。
+既存のデスクトップ・Web同期は `HoseiAuthenticator` とHTTPセッションの再認証を利用中。
+課題取得と既存同期の移行が済むまでこれらを維持する。授業一覧用の `--browser` 互換指定、
+`--http-probe`、`--stop-before-consent`、プローブ専用の観測コードは利用状況を確認して整理する。
+同意APIを外部クライアントから利用する契約は、大学について未確認。
+[OSSTech OpenAM 14 SAML設定ガイド 7.5](https://www.osstech.co.jp/download/updates/docs/openam/OSTD-OpenAM14-SAML-SetupGuide.pdf#page=36)
+
+合成検証ではWindows EdgeとループバックのIdP・SPを使う。テスト専用の操作でSAML遷移を開始し、
+同一ブラウザから既存の授業fixtureを1回取得する。プロファイルの再利用と分離、異常終了後の
+再認証、未知の遷移先、ブラウザ終了、認証失効、重複GETの拒否を確認する。
+
+```powershell
+$env:ASSIGNMENT_MANAGER_TEST_EDGE = '1'
+node --test tests/webclass_edge.test.mjs
+```
+
+Edgeを既定にした際、従来の無効設定をEdge起動前に確認していなかったため、通常・全機能の
+CLI回帰テストで実Edgeが計2件起動した。プロセスは停止し、テスト用の一時プロファイルを
+削除した。大学へのHTTP送信の有無と件数は不明。再発防止として、無効設定を起動前に拒否し、
+CLI回帰テストは実Edgeのインストール先を参照できない環境で無効設定の各モードを確認する。
+
+### 授業の分類と連携
+
+初回の本番取得で確認できたのは52件と、その応答内での授業IDの一意性。授業レコードを保存して
+いないため、当回の年度・学期別内訳と過年度授業の有無は未確認。CLIは新しい取得や合成データの
+検証時に、`year` と取得したままの `semester` ごとの件数を表示する。対象年度・学期の決定と
+履修中かどうかの確認には、公式の履修情報、または本人が確認した授業の選択を使う。WebClassで
+表示できることだけで履修中と判定せず、全件をNotionへ登録対象にしない。
+
+WebClassの `group_id` は同じ一覧内で一意として扱う。年度をまたいだ安定性は、年度・学期の
+異なる検証済み一覧で再割当や同一授業の識別子変化を確認するまで未確定。Moodleとの対応は
+WebClassの `group_id` とMoodleのソース・カテゴリ識別情報を記録し、年度、学期、公式授業コード
+または公式の対応情報で照合する。名称や曜日・時限は候補の絞り込みに使い、重複や曖昧な候補は
+本人確認まで未対応とする。
+
+課題取得を追加するときは、選択・確認済みの授業IDだけを同じEdgeセッションの固定 `contents`
+GETに渡す。送信回数とレスポンス上限、返却された `group_id` の照合、既存の `parse_contents` と
+マッピングを合成環境で検証し、最初は読み取りで確認する。その後に既存同期への接続を検討する。
 
 ## TLS / proxy / redirects / timeouts
 

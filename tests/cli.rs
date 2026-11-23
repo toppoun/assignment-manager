@@ -31,7 +31,22 @@ fn call(temp: &tempfile::TempDir, args: &[&str]) -> Output {
     let variable = "HOME";
     #[cfg(not(target_os = "macos"))]
     let variable = "LOCALAPPDATA";
-    Command::new(PROGRAM)
+    let mut command = Command::new(PROGRAM);
+    #[cfg(windows)]
+    {
+        // This suite checks CLI argument and config handling. The browser fixture
+        // suite is the only test entry point that starts an installed Edge.
+        for variable in [
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "ProgramFiles",
+            "TMP",
+            "TEMP",
+        ] {
+            command.env(variable, temp.path());
+        }
+    }
+    command
         .env(variable, test_home(temp))
         .args(args)
         .output()
@@ -316,18 +331,23 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     disabled["webclass"] = serde_json::Value::Bool(false);
     fs::write(path, disabled.to_string()).unwrap();
-    let output = call(
-        &temp,
-        &[
-            "university-check",
-            "webclass",
-            "--courses-only",
-            "--allow-university-read",
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("source_disabled"));
+    let webclass = [
+        "university-check",
+        "webclass",
+        "--courses-only",
+        "--allow-university-read",
+    ];
+    for flags in [&[][..], &["--keep-profile"][..], &["--http-probe"][..]] {
+        let output = call(&temp, &[webclass.as_slice(), flags].concat());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains("source_disabled"));
+    }
     assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
+    assert!(
+        !test_home(&temp)
+            .join("AssignmentManagerWebClassEdge")
+            .exists()
+    );
 }
 
 #[cfg(feature = "synthetic-https-fixture")]

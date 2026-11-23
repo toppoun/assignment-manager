@@ -13,7 +13,8 @@ use crate::university_network::{
 };
 pub(crate) const COURSES_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/courses";
 const CONTENTS_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/contents";
-const DASHBOARD_PATH: &str = "/webclass/ip_mods.php/plugin/score_summary_table/dashboard";
+pub(crate) const DASHBOARD_PATH: &str =
+    "/webclass/ip_mods.php/plugin/score_summary_table/dashboard";
 const LOGIN_PATH: &str = "/webclass/login.php";
 const APPLICATION_USER_AGENT: &str =
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));

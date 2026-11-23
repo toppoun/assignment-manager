@@ -230,7 +230,12 @@ fn serve(
             let scenario = *control.scenario.lock().unwrap();
             // Replay the fixture's SSO sequence for every login.
             let starts_login = (role == 0 && request.target == USER_PAGE && queue.is_empty())
-                || (role == 1 && request.target.starts_with("/idp/sso?") && queue.is_empty())
+                || (role == 1
+                    && request
+                        .target
+                        .split_once('?')
+                        .is_some_and(|(path, _)| path == IDP_SSO)
+                    && queue.is_empty())
                 || (role == 2 && request.target == "/webclass/singlesignon.php");
             if starts_login {
                 queue = template.clone().into();

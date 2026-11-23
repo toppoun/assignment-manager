@@ -344,18 +344,42 @@ pub fn login_and_acquire_webclass_courses(
     authenticator: &HoseiAuthenticator,
     credentials: HoseiCredentials<'_>,
 ) -> WebClassCourseCheck {
+    run_webclass_course_check(authenticator, credentials, false)
+}
+
+/// Observes the production SAML response with a six-request ceiling and no consent page GET.
+pub fn observe_webclass_saml_before_consent(
+    authenticator: &HoseiAuthenticator,
+    credentials: HoseiCredentials<'_>,
+) -> WebClassCourseCheck {
+    run_webclass_course_check(authenticator, credentials, true)
+}
+
+fn run_webclass_course_check(
+    authenticator: &HoseiAuthenticator,
+    credentials: HoseiCredentials<'_>,
+    stop_before_consent: bool,
+) -> WebClassCourseCheck {
     let meter = CourseRequestMeter::default();
-    let result = authenticator.login_for_course_check(credentials, meter.clone(), |client| {
-        acquire_webclass_courses(&client)
-    });
-    let requests = *meter.lock().unwrap_or_else(|error| error.into_inner());
-    WebClassCourseCheck { result, requests }
+    let result = authenticator.login_for_course_check(
+        credentials,
+        meter.clone(),
+        stop_before_consent,
+        |client| acquire_webclass_courses(&client),
+    );
+    let mut meter = meter.lock().unwrap_or_else(|error| error.into_inner());
+    WebClassCourseCheck {
+        result,
+        requests: meter.requests,
+        consent: meter.consent.take(),
+    }
 }
 
 #[derive(Debug)]
 pub struct WebClassCourseCheck {
     pub result: Result<AcquiredWebClassCourses, WebClassCourseListError>,
     pub requests: WebClassRequestCounts,
+    pub consent: Option<crate::webclass_auth::ConsentProbeReport>,
 }
 
 /// One pass over the course list in response order. On failure, earlier groups
@@ -465,10 +489,22 @@ pub(super) fn acquire_webclass_courses(
     let raw = client
         .fetch_courses_json()
         .map_err(WebClassCourseListError::Fetch)?;
-    let records = parse_courses(&raw).map_err(WebClassCourseListError::Parse)?;
-    client
-        .check_sync_courses(records.len())
-        .map_err(|_| WebClassCourseListError::Limit)?;
+    validate_webclass_courses_json(&raw, |count| {
+        client
+            .check_sync_courses(count)
+            .map_err(|_| WebClassCourseListError::Limit)
+    })
+}
+
+pub(crate) fn validate_webclass_courses_json(
+    raw: &str,
+    checkpoint: impl FnOnce(usize) -> Result<(), WebClassCourseListError>,
+) -> Result<AcquiredWebClassCourses, WebClassCourseListError> {
+    let records = parse_courses(raw).map_err(WebClassCourseListError::Parse)?;
+    if records.len() > crate::university_network::MAX_COURSES {
+        return Err(WebClassCourseListError::Limit);
+    }
+    checkpoint(records.len())?;
     AcquiredWebClassCourses::from_records(records).map_err(WebClassCourseListError::Validation)
 }
 

@@ -33,7 +33,7 @@ fn xui_fragment_decodes_and_reencodes_the_six_required_parameters() {
         pairs["goto"],
         "/openam/SSORedirect/metaAlias/synthetic-idp?ReqID=synthetic-request-id"
     );
-    assert_eq!(pairs["spEntityID"], HOPPII_ORIGIN);
+    assert_eq!(pairs["spEntityID"], SYNTHETIC_SP_ENTITY_ID);
     assert_eq!(pairs["AMAuthCookie"], "synthetic-am-auth-cookie");
 }
 

@@ -4,9 +4,12 @@ use assignment_manager::{
     notion::normalize_data_source_id,
     observation::ObservationValidationError,
     secured_sync::SecuredSyncClients,
-    sync::{WebClassCourseCheck, WebClassCourseListError, login_and_acquire_webclass_courses},
+    sync::{
+        WebClassCourseCheck, WebClassCourseListError, login_and_acquire_webclass_courses,
+        observe_webclass_saml_before_consent,
+    },
     university_network::NetworkPolicy,
-    webclass_auth::{HoseiAuthError, ProtocolReason},
+    webclass_auth::{HoseiAuthError, ProtocolReason, SamlProbeStop},
     webclass_http::WebClassHttpError,
 };
 use serde::Deserialize;
@@ -44,7 +47,119 @@ pub(in crate::cli) fn check_local(path: &Path) -> Result<u8, CliError> {
     Ok(finish(true))
 }
 
-pub(in crate::cli) fn check(path: &Path, review_local: bool) -> Result<u8, CliError> {
+pub(in crate::cli) fn check_browser_config(explicit: Option<&Path>) -> Result<(), CliError> {
+    let default;
+    let path = match explicit {
+        Some(path) => path,
+        None => {
+            let Ok(root) = config::root() else {
+                return Ok(());
+            };
+            default = root.join("config.json");
+            &default
+        }
+    };
+    match config::read_bytes(path) {
+        Ok(bytes) => credential_namespace(&bytes).map(|_| ()),
+        Err(ConfigError::Missing) if explicit.is_none() => Ok(()),
+        Err(error) => Err(CliError::Config(error)),
+    }
+}
+
+#[cfg(windows)]
+pub(in crate::cli) fn browser(keep_profile: bool) -> u8 {
+    use assignment_manager::webclass_browser::{self, ProfileMode};
+
+    if !crate::cli::windows_dialog::interactive_station() {
+        println!("webclass browser diagnostic=interactive_windows_session_required");
+        return finish(false);
+    }
+    println!(
+        "Edgeの大学公式画面で認証し、HOPPIIのWebClassリンクを開いてください。中止する場合は専用のEdgeを閉じてください。"
+    );
+    let (mode, profile) = if keep_profile {
+        (ProfileMode::Retained, "retained")
+    } else {
+        (ProfileMode::Temporary, "temporary")
+    };
+    let check = webclass_browser::run(mode);
+    println!(
+        "webclass browser lms_reached={} courses_get={} profile={profile}",
+        check.lms_reached, check.courses_get
+    );
+    match check.result {
+        Ok(courses) => {
+            for course in courses.records() {
+                println!(
+                    "webclass course {}",
+                    serde_json::json!({
+                        "group_id": course.group_id,
+                        "group_name": course.group_name,
+                        "year": course.year,
+                        "semester": course.semester,
+                        "day_of_week": course.day_of_week,
+                        "class_order": course.class_order,
+                    })
+                );
+            }
+            for ((year, semester), count) in course_period_counts(courses.records()) {
+                println!(
+                    "webclass course_period {}",
+                    serde_json::json!({"year": year, "semester": semester, "count": count})
+                );
+            }
+            println!(
+                "webclass courses={} validation=passed enrollment=undetermined",
+                courses.records().len()
+            );
+            finish(true)
+        }
+        Err(reason) => {
+            println!("webclass courses=0 validation=failed diagnostic={reason}");
+            finish(false)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(in crate::cli) fn browser(_keep_profile: bool) -> u8 {
+    println!("webclass browser diagnostic=windows_required");
+    finish(false)
+}
+
+#[cfg(windows)]
+fn course_period_counts(
+    records: &[assignment_manager::webclass::WebClassCourse],
+) -> std::collections::BTreeMap<(i32, &str), usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for course in records {
+        *counts
+            .entry((course.year, course.semester.as_str()))
+            .or_default() += 1;
+    }
+    counts
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn course_summary_counts_source_periods_without_normalizing_them() {
+    let raw = include_str!("../../../fixtures/webclass/courses_basic.json");
+    let mut courses = assignment_manager::webclass::parse_courses(raw).unwrap();
+    courses[0].year = 2025;
+    courses[1].semester.clear();
+    assert_eq!(
+        course_period_counts(&courses)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        [((2025, "2"), 1), ((2026, ""), 1), ((2026, "2"), 1)]
+    );
+}
+
+pub(in crate::cli) fn http_probe(
+    path: &Path,
+    review_local: bool,
+    stop_before_consent: bool,
+) -> Result<u8, CliError> {
     if review_local && !can_review() {
         return Ok(finish(false));
     }
@@ -52,7 +167,11 @@ pub(in crate::cli) fn check(path: &Path, review_local: bool) -> Result<u8, CliEr
     let mut clients = SecuredSyncClients::new(NetworkPolicy::default());
     clients.begin_run();
     let acquired = credentials::with_webclass_credentials(&target, |credentials| {
-        login_and_acquire_webclass_courses(&clients.authenticator(), credentials)
+        if stop_before_consent {
+            observe_webclass_saml_before_consent(&clients.authenticator(), credentials)
+        } else {
+            login_and_acquire_webclass_courses(&clients.authenticator(), credentials)
+        }
     })
     .map_err(CliError::Credential)?;
     drop(clients);
@@ -98,7 +217,40 @@ fn report(check: WebClassCourseCheck, review_local: bool) -> u8 {
             + u16::from(r.webclass.get)
             + u16::from(r.webclass.post)
     );
+    if let Some(consent) = &check.consent
+        && let Ok(summary) = serde_json::to_string(consent)
+    {
+        println!(
+            "webclass consent_get={} consent_observation={summary}",
+            u8::from(r.idp.get >= 3)
+        );
+    }
     let courses = match check.result {
+        Err(WebClassCourseListError::Authentication(HoseiAuthError::SamlProbeStopped(result))) => {
+            let status = result.status.map(|code| code.as_u16().to_string());
+            println!(
+                "webclass saml_query={} acs_url={} success_get={} http_status={} saml_form={} form_method={} action_acs={} saml_response={} relay_state={} in_response_to={} stop={:?}",
+                comparison(result.query_matches),
+                comparison(result.acs_url_matches),
+                u8::from(r.idp.get >= 2),
+                status.as_deref().unwrap_or("none"),
+                match result.form_recognized {
+                    Some(true) => "recognized",
+                    Some(false) => "unrecognized",
+                    None => "undetermined",
+                },
+                result.form_method.unwrap_or("undetermined"),
+                comparison(result.action_matches),
+                presence(result.saml_response_present),
+                presence(result.relay_state_present),
+                comparison(result.in_response_to_matches),
+                result.stop,
+            );
+            return finish(matches!(
+                result.stop,
+                SamlProbeStop::ActionMatched | SamlProbeStop::ConsentPageObserved
+            ));
+        }
         Ok(courses) if courses.records().is_empty() => {
             println!("webclass courses=0 validation=empty");
             return finish(false);
@@ -109,6 +261,17 @@ fn report(check: WebClassCourseCheck, review_local: bool) -> u8 {
                 "webclass courses=0 validation=failed diagnostic={}",
                 diagnostic(error)
             );
+            if let WebClassCourseListError::Authentication(
+                HoseiAuthError::ProtocolChanged(step)
+                | HoseiAuthError::ProtocolChangedWithReason(step, _)
+                | HoseiAuthError::RedirectLimit(step)
+                | HoseiAuthError::HttpStatus(step, _)
+                | HoseiAuthError::Request(step)
+                | HoseiAuthError::Timeout(step),
+            ) = error
+            {
+                println!("webclass authentication_stage={step:?}");
+            }
             return finish(false);
         }
     };
@@ -124,6 +287,22 @@ fn report(check: WebClassCourseCheck, review_local: bool) -> u8 {
     #[cfg(not(windows))]
     let _ = review_local;
     finish(true)
+}
+
+fn comparison(result: Option<bool>) -> &'static str {
+    match result {
+        Some(true) => "match",
+        Some(false) => "mismatch",
+        None => "undetermined",
+    }
+}
+
+fn presence(result: Option<bool>) -> &'static str {
+    match result {
+        Some(true) => "present",
+        Some(false) => "absent",
+        None => "undetermined",
+    }
 }
 
 fn can_review() -> bool {
