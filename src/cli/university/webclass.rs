@@ -151,13 +151,7 @@ pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8
             }
         };
     }
-    let check = webclass_browser::run(mode);
-    println!(
-        "webclass browser lms_reached={} courses_get={} profile={profile}",
-        check.lms_reached, check.courses_get
-    );
-    report_browser_navigation(check.navigation);
-    match check.result {
+    match read_browser_course_list(mode) {
         Ok(courses) => {
             for course in courses.records() {
                 println!(
@@ -189,6 +183,24 @@ pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8
             finish(false)
         }
     }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(in crate::cli) fn read_browser_course_list(
+    mode: assignment_manager::webclass_browser::ProfileMode,
+) -> Result<assignment_manager::sync::AcquiredWebClassCourses, &'static str> {
+    use assignment_manager::webclass_browser::{self, ProfileMode};
+    let check = webclass_browser::run(mode);
+    let profile = match mode {
+        ProfileMode::Temporary => "temporary",
+        ProfileMode::Retained => "retained",
+    };
+    println!(
+        "webclass browser lms_reached={} courses_get={} profile={profile}",
+        check.lms_reached, check.courses_get
+    );
+    report_browser_navigation(check.navigation);
+    check.result
 }
 
 #[cfg(any(windows, target_os = "macos"))]

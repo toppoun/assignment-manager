@@ -55,7 +55,7 @@ fn validated(scope: SyncScope, candidates: Vec<AssignmentCandidate>) -> Acquired
     .unwrap()
 }
 
-fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition {
+pub(super) fn moodle(candidates: Vec<AssignmentCandidate>) -> MoodleAcquisition {
     MoodleAcquisition {
         assignments: validated(SyncScope::MoodleFeed(FEED.into()), candidates),
         courses: HashMap::new(),
@@ -87,7 +87,7 @@ pub(super) fn input_with_course(
     )
 }
 
-fn group(id: &str, tasks: &[(&str, &str)]) -> AcquiredAssignments {
+pub(super) fn group(id: &str, tasks: &[(&str, &str)]) -> AcquiredAssignments {
     validated(
         SyncScope::WebClassContents(id.into()),
         tasks
@@ -97,7 +97,7 @@ fn group(id: &str, tasks: &[(&str, &str)]) -> AcquiredAssignments {
     )
 }
 
-fn attempt(
+pub(super) fn attempt(
     course_ids: &[&str],
     groups: Vec<AcquiredAssignments>,
     result: Result<(), WebClassSyncError>,
@@ -144,6 +144,26 @@ fn snapshot_row(
 
 fn moodle_row(task_id: &str, title: &str) -> NotionAssignment {
     snapshot_row(task_id, Some(key(task_id)), UniversitySource::Moodle, title)
+}
+
+#[test]
+fn notion_deadline_comparison_accepts_only_the_stored_minute_boundary() {
+    use super::wire::notion_deadline_matches;
+
+    let source = deadline("2026-11-24T14:59:59Z");
+    assert!(notion_deadline_matches(
+        &deadline("2026-11-24T14:59:00Z"),
+        &source
+    ));
+    assert!(!notion_deadline_matches(
+        &deadline("2026-11-24T15:00:00Z"),
+        &source
+    ));
+    assert!(!notion_deadline_matches(
+        &deadline("2026-11-24T14:59:01Z"),
+        &source
+    ));
+    assert!(!notion_deadline_matches(&None, &source));
 }
 
 fn deadline(value: &str) -> Option<Deadline> {

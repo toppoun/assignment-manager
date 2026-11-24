@@ -2,6 +2,8 @@
 
 mod apply;
 mod client;
+mod course_rules;
+mod course_setup;
 #[cfg(feature = "synthetic-https-fixture")]
 mod course_trial;
 #[cfg(feature = "synthetic-https-fixture")]
@@ -17,7 +19,10 @@ mod tests;
 mod trial;
 mod wire;
 
-pub use apply::{ApplyError, ApplyPreview, ApplyReport};
+pub use apply::{
+    ApplyError, ApplyPreview, ApplyReport, AssignmentReadback, ProductionAssignmentWriter,
+    ProductionWriterCheckError, ProtectedManualAssignment,
+};
 pub use apply::{
     MOODLE_INTEGRATION_SCOPE, MoodleBindingAudit, MoodlePreviewCoverage, MoodlePreviewMappings,
 };
@@ -26,6 +31,12 @@ pub use apply::{MoodleCreatePreview, MoodleUpdatePreview};
 #[cfg(any(windows, test))]
 pub use apply::{MoodleLiveCreateChoices, MoodleLiveCreateResult, MoodleLiveTarget};
 pub use client::{NOTION_VERSION, NotionClient, NotionError};
+pub use course_rules::{
+    CourseRuleSummary, VerificationCourse, VerificationCourseRule, live_assignment_read_target,
+};
+pub use course_setup::{
+    CourseSetupInput, CourseSetupPreview, CourseSetupVerification, valid_course_setup_term,
+};
 #[cfg(feature = "synthetic-https-fixture")]
 pub use course_trial::{CourseCreationTrial, CourseSnapshot, CourseTrialError};
 pub use inspection::{InspectionReport, PropertyFinding, PropertyStatus, SnapshotSummary};
@@ -33,12 +44,14 @@ pub use plan::{
     AssignmentPatch, ConflictReason, CourseMapping, DeferredReason, NotionAssignment,
     NotionSnapshot, PlanAction, PlannedAssignment, plan_sync,
 };
-pub use reader::{DryRunCounts, DryRunReport};
+pub use reader::{CoursePlanCounts, DryRunCounts, DryRunReport};
 #[cfg(feature = "synthetic-https-fixture")]
 pub use trial::MoodleCreateTarget;
 pub use trial::{TrialAssignment, TrialRole, TrialTarget, VerificationTarget};
 pub use wire::uuid as normalize_data_source_id;
-pub use wire::{NotionPropertyIds, NotionTarget, PreparedWrite};
+pub use wire::{
+    CourseRulesTarget, CourseSetupProperties, NotionPropertyIds, NotionTarget, PreparedWrite,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
@@ -146,6 +159,8 @@ pub struct SyncAssignment {
     pub title: String,
     pub deadline: Option<Deadline>,
     pub course_key: Option<ExternalRecordKey>,
+    /// Academic term observed in WebClass's course list, independent of the v1 key.
+    course_term: Option<String>,
     pub submission_url: Option<String>,
 }
 
@@ -223,7 +238,7 @@ impl SyncInput {
                 }) {
                     return Err(InvalidSourceData::InvalidScope);
                 }
-                input.insert(candidate, UniversitySource::Moodle, course)?;
+                input.insert(candidate, UniversitySource::Moodle, course, None)?;
             }
         }
         if let Some(webclass) = webclass {
@@ -265,12 +280,13 @@ impl SyncInput {
 
         let mut courses = HashMap::new();
         if let Some(list) = latest.course_list() {
-            for course in list.courses() {
+            for (course, record) in list.courses().iter().zip(list.records()) {
                 let key = &course.external_key;
                 if key.origin != OriginKind::WebClass
                     || key.scope != DEFAULT_COURSE_SOURCE_SCOPE
                     || key.id.trim().is_empty()
-                    || courses.insert(key.id.as_str(), key).is_some()
+                    || key.id != record.group_id
+                    || courses.insert(key.id.as_str(), (key, record)).is_some()
                 {
                     return Err(InvalidSourceData::InvalidScope);
                 }
@@ -284,11 +300,13 @@ impl SyncInput {
             if !completed.insert(id) {
                 return Err(InvalidSourceData::InvalidScope);
             }
-            let course = courses
+            let (course, record) = courses
                 .get(id.as_str())
                 .ok_or(InvalidSourceData::InvalidScope)?;
+            let term = format!("{}:{}", record.year, record.semester);
+            let term = course_rules::valid_term(&term).then_some(term.as_str());
             for candidate in group.batch().as_slice() {
-                self.insert(candidate, UniversitySource::WebClass, Some(course))?;
+                self.insert(candidate, UniversitySource::WebClass, Some(course), term)?;
             }
         }
         Ok(())
@@ -299,6 +317,7 @@ impl SyncInput {
         candidate: &AssignmentCandidate,
         source: UniversitySource,
         course: Option<&ExternalRecordKey>,
+        course_term: Option<&str>,
     ) -> Result<(), InvalidSourceData> {
         if candidate.title.trim().is_empty() {
             return Err(InvalidSourceData::EmptyTitle);
@@ -318,6 +337,7 @@ impl SyncInput {
             title: candidate.title.clone(),
             deadline: candidate.deadline.clone(),
             course_key: course.cloned(),
+            course_term: course_term.map(str::to_owned),
             submission_url: None,
         });
         Ok(())

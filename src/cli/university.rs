@@ -7,6 +7,10 @@ use assignment_manager::{
 
 use super::{CliError, Config, CredentialStatus, config::Moodle, credentials};
 
+#[cfg(target_os = "macos")]
+pub(super) mod course_setup;
+#[cfg(target_os = "macos")]
+pub(super) mod dry_run;
 pub(super) mod webclass;
 
 pub(super) fn moodle(

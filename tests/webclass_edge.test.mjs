@@ -249,8 +249,10 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
         if (done.stage === "courses") {
           assert.ok(!JSON.stringify(done).includes(secret));
           // Stand in for Rust's pipe response. Rust tests exercise real validation and query encoding.
-          const found = JSON.parse(done.body).some(({ group_id }) => group_id === group);
-          send(found ? selectPath(group) : null);
+          const listed = new Set(JSON.parse(done.body).map(({ group_id }) => group_id));
+          send(Array.isArray(group)
+            ? group.filter((id) => listed.has(id)).map(selectPath)
+            : listed.has(group) ? selectPath(group) : null);
           done = JSON.parse((await lines.next()).value);
         }
         assert.equal(done.stage, "finished");
@@ -454,6 +456,20 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
     assert.equal(blocked.contents_get, 0);
     assert.equal(counters.unknown, 0);
     assert.equal(counters.mutation, 0);
+
+    resultMode = "ok";
+    const beforeBatch = contentsRequests.length;
+    const selectedGroups = ["fixture-course-001", "fixture-course-002"];
+    const batch = await checkSelected("confirmed", selectedGroups);
+    assert.equal(batch.reason, "ok");
+    assert.equal(batch.courses_get, 1);
+    assert.equal(batch.contents_get, 2);
+    assert.equal(batch.bodies.length, 2);
+    assert.deepEqual(contentsRequests.slice(beforeBatch).map(({ url }) => url), selectedGroups.map(selectPath));
+    const repeated = await checkSelected("confirmed", [selectedGroups[0], selectedGroups[0]]);
+    assert.equal(repeated.reason, "browser_protocol");
+    assert.equal(repeated.contents_get, 0);
+    assert.equal(contentsRequests.length, beforeBatch + 2);
 
     async function failedHandoff(origin, cause, proxyCause, options = {}) {
       handoffOrigin = origin;

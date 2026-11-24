@@ -39,8 +39,10 @@ use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
 const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nWebClass (Windows Edge / macOS Chrome): university-check webclass (--courses-only | --course-id ID) --allow-university-read [--keep-profile]\nWebClass HTTP diagnostics: university-check webclass --courses-only --allow-university-read --http-probe [--stop-before-consent]\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], university-check webclass --courses-only --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+#[cfg(target_os = "macos")]
+const DEFAULT_PRODUCTION_FIRST_SYNC_COUNT: usize = 35;
 #[cfg(feature = "synthetic-https-fixture")]
-const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)\nMoodle plan: sync moodle --dry-run --fixture\nNotion verification preview: --config PATH sync moodle --dry-run --fixture --allow-notion-read --target ASSIGNMENTS_ID --courses COURSES_ID --reader BOT_ID";
+const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)\nCourse setup: sync --setup-courses --fixture --term YEAR:SEMESTER [--apply]\nMoodle plan: sync moodle --dry-run --fixture\nNotion verification preview: --config PATH sync moodle --dry-run --fixture --allow-notion-read --target ASSIGNMENTS_ID --courses COURSES_ID --reader BOT_ID";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -50,6 +52,32 @@ enum Command {
     Status(bool),
     Register(Kind),
     Sync(bool),
+    #[cfg(target_os = "macos")]
+    VerificationDryRun,
+    #[cfg(target_os = "macos")]
+    ProductionDryRun,
+    #[cfg(target_os = "macos")]
+    ProductionFirstSync {
+        writer: String,
+        create: usize,
+    },
+    #[cfg(target_os = "macos")]
+    RegisterProductionWriter,
+    #[cfg(target_os = "macos")]
+    VerificationApply {
+        create: usize,
+        update: usize,
+        unchanged: usize,
+    },
+    CourseSetupFixture {
+        term: String,
+        apply: bool,
+    },
+    #[cfg(target_os = "macos")]
+    CourseSetupPreview {
+        term: String,
+        expected_plan: Option<String>,
+    },
     NotionCheck,
     NotionFixturePreview,
     MoodleFixturePlan,
@@ -110,7 +138,11 @@ impl Command {
     fn uses_fixture(&self) -> bool {
         matches!(
             self,
-            Self::InitState(true) | Self::Status(true) | Self::Sync(true) | Self::FixtureApply
+            Self::InitState(true)
+                | Self::Status(true)
+                | Self::Sync(true)
+                | Self::FixtureApply
+                | Self::CourseSetupFixture { .. }
         )
     }
 
@@ -187,7 +219,111 @@ impl Arguments {
                 }
             }
             ["sync", "--dry-run"] => Command::Sync(false),
+            #[cfg(target_os = "macos")]
+            [
+                "sync",
+                "--dry-run",
+                "--allow-university-read",
+                "--allow-notion-read",
+            ] if config.is_some() => Command::VerificationDryRun,
+            #[cfg(target_os = "macos")]
+            [
+                "sync",
+                "--dry-run",
+                "--allow-university-read",
+                "--allow-notion-read",
+                "--production-read-only",
+            ] if config.is_some() => Command::ProductionDryRun,
+            #[cfg(target_os = "macos")]
+            [
+                "sync",
+                "--apply",
+                "--allow-university-read",
+                "--allow-notion-read",
+                "--allow-notion-write",
+                "--production-first-sync",
+                "--writer",
+                writer,
+                rest @ ..,
+            ] if config.is_some() => {
+                let create = match rest {
+                    [] => DEFAULT_PRODUCTION_FIRST_SYNC_COUNT,
+                    ["--expect-create", count] => count.parse().map_err(|_| CliError::Usage)?,
+                    _ => return Err(CliError::Usage),
+                };
+                if create == 0 {
+                    return Err(CliError::Usage);
+                }
+                Command::ProductionFirstSync {
+                    writer: (*writer).into(),
+                    create,
+                }
+            }
+            #[cfg(target_os = "macos")]
+            [
+                "sync",
+                "--apply",
+                "--allow-university-read",
+                "--allow-notion-read",
+                "--allow-notion-write",
+                "--expect-create",
+                create,
+                "--expect-unchanged",
+                unchanged,
+                rest @ ..,
+            ] if config.is_some() => {
+                let update = match rest {
+                    [] => 0,
+                    ["--expect-update", count] => count.parse().map_err(|_| CliError::Usage)?,
+                    _ => return Err(CliError::Usage),
+                };
+                Command::VerificationApply {
+                    create: create.parse().map_err(|_| CliError::Usage)?,
+                    update,
+                    unchanged: unchanged.parse().map_err(|_| CliError::Usage)?,
+                }
+            }
             ["sync", "--dry-run", "--fixture"] => Command::Sync(true),
+            #[cfg(target_os = "macos")]
+            [
+                "sync",
+                "--setup-courses",
+                "--term",
+                term,
+                "--allow-university-read",
+                "--allow-notion-read",
+                rest @ ..,
+            ] if config.is_some() && assignment_manager::notion::valid_course_setup_term(term) => {
+                let expected_plan = match rest {
+                    [] => None,
+                    ["--apply", "--allow-notion-write", "--expect-plan", id]
+                        if id.len() == 64
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')) =>
+                    {
+                        Some((*id).into())
+                    }
+                    _ => return Err(CliError::Usage),
+                };
+                Command::CourseSetupPreview {
+                    term: (*term).into(),
+                    expected_plan,
+                }
+            }
+            [
+                "sync",
+                "--setup-courses",
+                "--fixture",
+                "--term",
+                term,
+                rest @ ..,
+            ] if matches!(rest, [] | ["--apply"]) && !term.starts_with('-') => {
+                Command::CourseSetupFixture {
+                    term: (*term).into(),
+                    apply: !rest.is_empty(),
+                }
+            }
             #[cfg(windows)]
             [
                 "sync",
@@ -351,6 +487,10 @@ impl Arguments {
             ["notion-check", "--allow-notion-read"] => Command::NotionCheck,
             ["notion-trial", "--target", id, rest @ ..] => {
                 Command::NotionTrial((*id).into(), trial::Command::parse(rest)?)
+            }
+            #[cfg(target_os = "macos")]
+            ["credentials", "set", "notion-writer"] if config.is_some() => {
+                Command::RegisterProductionWriter
             }
             ["credentials", "set", kind] => {
                 Command::Register(Kind::parse(kind).ok_or(CliError::Usage)?)
@@ -564,6 +704,7 @@ impl Receipt {
             c.create, c.update, c.unchanged, c.conflict, c.deferred
         );
         println!("course_relation_mismatch={}", c.course_relation_mismatch);
+        println!("{}", c.course_rules);
         println!(
             "result={} issue={}",
             self.outcome.code(),
@@ -694,6 +835,36 @@ fn notion_diagnosis(error: NotionError) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn display_production_writer_errors(
+    errors: &[assignment_manager::notion::ProductionWriterCheckError],
+) {
+    for failure in errors {
+        print!(
+            "production_writer=failed stage={} diagnostic={}",
+            failure.stage,
+            notion_diagnosis(failure.error),
+        );
+        if let Some(endpoint) = &failure.endpoint {
+            print!(" method=GET endpoint={endpoint}");
+            let status = match failure.error {
+                NotionError::Authentication => Some(401),
+                NotionError::Forbidden => Some(403),
+                NotionError::NotFound => Some(404),
+                NotionError::Conflict => Some(409),
+                NotionError::RateLimited => Some(429),
+                NotionError::Overloaded => Some(529),
+                NotionError::Server(status) | NotionError::Rejected(status) => Some(status),
+                _ => None,
+            };
+            if let Some(status) = status {
+                print!(" http_status={status}");
+            }
+        }
+        println!();
+    }
+}
+
 fn display_inspection(inspection: &InspectionReport) {
     println!("{inspection}");
     if let Some(error) = inspection.error {
@@ -707,12 +878,20 @@ fn check_notion(config: &Config, paths: &Paths) -> Result<u8, CliError> {
     let inspection = client.inspect(
         &config.notion,
         &config.sample_assignment_page_ids,
-        &config.course_mappings,
+        config.legacy_course_mappings(),
     );
     display_inspection(&inspection);
     match (inspection.error, inspection.snapshot) {
         (None, Some(snapshot)) if snapshot.duplicate_keys != 0 => {
             println!("result=partial issue=conflict");
+            Ok(3)
+        }
+        (None, Some(_))
+            if inspection
+                .course_rules
+                .is_some_and(|rules| rules.has_issues()) =>
+        {
+            println!("result=partial issue=course_rules");
             Ok(3)
         }
         (None, Some(_)) => {
@@ -746,22 +925,24 @@ fn preview_with_client(
         &acquired.input,
         &config.notion,
         &config.sample_assignment_page_ids,
-        &config.course_mappings,
+        config.legacy_course_mappings(),
     );
     display_inspection(&inspection);
-    let unconfigured = acquired
-        .input
-        .assignments()
-        .values()
-        .filter_map(|assignment| assignment.course_key.as_ref())
-        .filter(|key| {
-            !config
-                .course_mappings
-                .iter()
-                .any(|mapping| &mapping.course_key == *key)
-        })
-        .count();
-    println!("course_mapping_unconfigured={unconfigured}");
+    if config.notion.course_rules.is_none() {
+        let unconfigured = acquired
+            .input
+            .assignments()
+            .values()
+            .filter_map(|assignment| assignment.course_key.as_ref())
+            .filter(|key| {
+                !config
+                    .course_mappings
+                    .iter()
+                    .any(|mapping| &mapping.course_key == *key)
+            })
+            .count();
+        println!("course_mapping_unconfigured={unconfigured}");
+    }
     if let Some(state) = &state {
         plan.defer_unreconciled(state);
     }
@@ -777,6 +958,9 @@ fn preview_with_client(
 
 #[cfg(feature = "synthetic-https-fixture")]
 fn run_fixture(command: Command, root: PathBuf) -> Result<u8, CliError> {
+    if let Command::CourseSetupFixture { term, apply } = &command {
+        return fixture_run::course_setup(term, *apply);
+    }
     if command == Command::FixtureApply {
         return fixture_run::apply(&root.join("fixture-apply"));
     }
@@ -815,6 +999,14 @@ fn run_fixture(_: Command, _: PathBuf) -> Result<u8, CliError> {
 fn execute(args: Arguments) -> Result<u8, CliError> {
     if args.command == Command::Help {
         println!("{USAGE}");
+        #[cfg(target_os = "macos")]
+        println!(
+            "Course setup preview: --config PATH sync --setup-courses --term YEAR:SEMESTER --allow-university-read --allow-notion-read\nCourse setup verification apply: add --apply --allow-notion-write --expect-plan PLAN_ID"
+        );
+        #[cfg(target_os = "macos")]
+        println!(
+            "Live dry run: --config PATH sync --dry-run --allow-university-read --allow-notion-read [--production-read-only]\nVerification assignment apply: --config PATH sync --apply --allow-university-read --allow-notion-read --allow-notion-write --expect-create N --expect-unchanged N [--expect-update N]\nProduction first sync: --config PATH sync --apply --allow-university-read --allow-notion-read --allow-notion-write --production-first-sync --writer BOT_ID [--expect-create N]\nProduction writer registration: --config PATH credentials set notion-writer"
+        );
         println!(
             "Offline WebClass preflight: university-check webclass --courses-only --check-local [--http-probe]"
         );
@@ -839,6 +1031,52 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             "Windows verification courses: --config PATH notion-moodle-courses [check-local | --dry-run | --allow-notion-create | --verify]"
         );
         return Ok(0);
+    }
+    #[cfg(target_os = "macos")]
+    if args.command == Command::RegisterProductionWriter {
+        let path = args.config.as_deref().ok_or(CliError::Usage)?;
+        credentials::register_production_writer(&Config::read(path)?)?;
+        return Ok(0);
+    }
+    #[cfg(target_os = "macos")]
+    if matches!(
+        args.command,
+        Command::VerificationDryRun
+            | Command::ProductionDryRun
+            | Command::VerificationApply { .. }
+            | Command::ProductionFirstSync { .. }
+    ) {
+        let path = args.config.as_deref().ok_or(CliError::Usage)?;
+        use university::dry_run::Mode;
+        let mode = match args.command {
+            Command::VerificationApply {
+                create,
+                update,
+                unchanged,
+            } => Mode::VerificationApply {
+                expected: (create, update, unchanged),
+            },
+            Command::ProductionDryRun => Mode::ProductionDryRun,
+            Command::ProductionFirstSync { ref writer, create } => {
+                Mode::ProductionFirstSync { writer, create }
+            }
+            _ => Mode::VerificationDryRun,
+        };
+        return university::dry_run::execute(&Config::read(path)?, path, mode);
+    }
+    #[cfg(target_os = "macos")]
+    if let Command::CourseSetupPreview {
+        term,
+        expected_plan,
+    } = &args.command
+    {
+        let path = args.config.as_deref().ok_or(CliError::Usage)?;
+        return university::course_setup::execute(
+            &Config::read(path)?,
+            path,
+            term,
+            expected_plan.as_deref(),
+        );
     }
     #[cfg(windows)]
     if let Command::MoodleIntegration {

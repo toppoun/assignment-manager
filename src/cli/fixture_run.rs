@@ -16,6 +16,35 @@ use assignment_manager::{
 
 use super::{AcquisitionStatus, CliError, InspectionReport, Receipt};
 
+pub(super) fn course_setup(term: &str, apply: bool) -> Result<u8, CliError> {
+    match fixture::exercise_course_setup(term, apply, |pass, plan| {
+        println!(
+            "pass={pass} create_courses={} create_rules={} reuse_courses={} reuse_rules={} held={}",
+            plan.create_courses, plan.create_rules, plan.reuse_courses, plan.reuse_rules, plan.held
+        );
+    }) {
+        Ok(()) => {
+            println!("result=success apply={apply}");
+            Ok(0)
+        }
+        Err(fixture::ApplyError::State(error)) => Err(CliError::State(error)),
+        Err(fixture::ApplyError::Notion(error)) => {
+            println!("notion_error={}", super::notion_diagnosis(error));
+            Err(CliError::FixtureFailed)
+        }
+        Err(error) => {
+            println!(
+                "course_setup_error={}",
+                match error {
+                    fixture::ApplyError::PlanChanged => "plan_changed",
+                    _ => "reconciliation_required",
+                }
+            );
+            Err(CliError::FixtureFailed)
+        }
+    }
+}
+
 pub(super) fn apply(directory: &std::path::Path) -> Result<u8, CliError> {
     let acquired = acquire(Scenario::BothSuccess)?;
     let reports =
@@ -82,12 +111,8 @@ fn run(
     let acquired = acquire(scenario)?;
     let (notion, _server) =
         assignment_manager::notion::fixture::start().map_err(|_| CliError::FixtureFailed)?;
-    let (inspection, mut report) = notion.inspect_dry_run(
-        &acquired.input,
-        &assignment_manager::notion::fixture::target(),
-        &[],
-        &[],
-    );
+    let (inspection, mut report) =
+        notion.inspect_dry_run(&acquired.input, &fixture::course_rules_target(), &[], &[]);
     if let Some(state) = state {
         report.defer_unreconciled(state);
     }

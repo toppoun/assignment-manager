@@ -1162,6 +1162,35 @@ fn assert_import_matches(
 }
 
 #[test]
+fn course_preview_calendar_reads_categories_on_start_events_and_rejects_duplicate_uids() {
+    let mut flow = flow();
+    flow.exchanges.iter_mut().for_each(Vec::clear);
+    let mut full = moodle_response(200);
+    full.body = COURSE_ICS.into();
+    let mut duplicate = moodle_response(200);
+    duplicate.body = COURSE_ICS.replace(
+        "UID:synthetic-ai-start@example.invalid",
+        "UID:synthetic-db-end@example.invalid",
+    );
+    let (mut clients, servers, _) = start(flow, vec![full, duplicate]);
+    let feed = feed();
+    clients.begin_run();
+    let client = clients.moodle().unwrap();
+    let events = sync::acquire_moodle_calendar(&client, &feed).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(
+        events
+            .iter()
+            .any(|event| crate::moodle::single_course_category(event, &feed) == Some("AI2026_Ak"))
+    );
+    clients.begin_run();
+    let client = clients.moodle().unwrap();
+    let error = sync::acquire_moodle_calendar(&client, &feed).unwrap_err();
+    assert_eq!(error.diagnostic.code(), "moodle_uid_duplicate");
+    finish_all(servers);
+}
+
+#[test]
 fn acquisition_without_a_store_matches_both_legacy_imports() {
     let mut f = flow();
     f.exchanges[2].extend(full_sync());

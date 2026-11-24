@@ -1,10 +1,13 @@
 mod apply_tests;
+mod course_rules;
 #[cfg(feature = "synthetic-https-fixture")]
 mod course_trial;
 #[cfg(feature = "synthetic-https-fixture")]
 mod moodle_integration;
 mod moodle_live_create;
 pub(super) mod trial_tests;
+#[cfg(target_os = "macos")]
+mod verification_live;
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -210,6 +213,7 @@ fn target() -> NotionTarget {
     NotionTarget {
         assignments_data_source_id: A.into(),
         courses_data_source_id: C.into(),
+        course_rules: None,
         properties: NotionPropertyIds {
             title: "title".into(),
             deadline: "due".into(),

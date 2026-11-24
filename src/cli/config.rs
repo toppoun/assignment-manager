@@ -66,7 +66,7 @@ impl Config {
                 .map_err(|_| ConfigError::Invalid)?;
         }
         let mut mapped_keys = HashSet::new();
-        for mapping in &config.course_mappings {
+        for mapping in config.legacy_course_mappings() {
             let key = &mapping.course_key;
             let scope_matches = match key.origin {
                 OriginKind::Moodle => MoodleFeed::new(
@@ -87,6 +87,14 @@ impl Config {
             }
         }
         Ok(config)
+    }
+
+    pub fn legacy_course_mappings(&self) -> &[CourseMapping] {
+        if self.notion.course_rules.is_some() {
+            &[]
+        } else {
+            &self.course_mappings
+        }
     }
 
     pub fn target_id(&self) -> Result<String, ConfigError> {

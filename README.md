@@ -216,6 +216,70 @@ Create / Update / Unchanged / Conflict / Deferred の件数を表示します。
 同期状態DBは読み取り専用で開きます。件数と固定分類だけを別の
 `last-dry-run.json` に記録します。
 
+#### Macで実課題を読み取る検証用dry-run
+
+授業対応表を設定した検証用Notionを指定し、読み取り用IntegrationとMoodleの授業関連カレンダーURLを
+同じ設定先のキーチェーンに登録します（`credentials set notion`、`credentials set moodle`）。
+対話端末で次を実行し、専用Chromeで大学公式画面の認証を完了してHOPPIIのWebClassリンクを開きます。
+
+```sh
+cargo run --locked --offline -- --config local/notion-verification.json sync --dry-run --allow-university-read --allow-notion-read
+```
+
+Moodleの授業関連ICSを読み、HOPPIIは確定ルールの `group_id` と学期が授業一覧に一致した授業だけから課題を取得します。
+取得後にNotionの課題・授業対応表を読み直し、取得元別・授業別の件数、対応先、対象外と保留の内訳、同期計画を表示します。
+取得できなかった授業やルールの要確認事項があれば終了コード `3` を返します。キーチェーンの承認が必要な場合は、
+対話端末に表示されるmacOSの確認画面で実行中のCLIへのアクセスを許可します。
+対象は検証用の3データソースに限定され、Notionや状態DBへの書き込みは行いません。
+
+検証用課題DBへの適用には、検証用Writerの課題DBに対する読み取り・追加権限が必要です。
+課題名・期限の更新を試す場合は、課題DBへの更新権限も必要です。
+最新のdry-runで確認した件数を指定します。次の例は新規34件と変更なし1件の計画です。
+
+```sh
+cargo run --locked --offline -- --config local/notion-verification.json sync --apply --allow-university-read --allow-notion-read --allow-notion-write --expect-create 34 --expect-unchanged 1
+```
+
+課題名・期限の更新を許可する場合は、同じコマンドに `--expect-update N` を追加します。省略時の期待値は0件です。
+適用前に最新の取得データとNotionを照合し、件数や計画が変わった場合、または保留・競合がある場合は停止します。
+適用後は登録内容をNotionから再取得し、同じ取得データを使って再dry-runと再適用を行います。
+Notionが期限を分精度で返した場合は、取得元の期限と同じ分であれば一致として扱います。
+既存の課題ページでは、同期キーとページを再確認したうえで課題名・期限の差分だけを書き込みます。
+更新の応答を失った場合は、同じリクエストを再送せず、ページを読み直して更新結果を確認します。
+作成結果が不明な場合は、次回に完全なNotion一覧から同期キーを照合します。一意に確認できたページを再利用し、
+該当ページを確認できない場合や複数一致した場合は保留します。
+
+#### Macで本番用Notionを読み取り専用で確認
+
+本番用は別の設定ファイル、課題データソースIDごとのキーチェーン項目と状態DBを使います。
+課題DB・授業DB・授業対応表を本番の読み取り用Integrationに共有し、授業DBの同期用学期をテキスト型で設定します。
+`course_rules.course_term` にそのプロパティIDを指定してください。
+
+```sh
+cargo run --locked --offline -- --config local/notion-production.json notion-check --allow-notion-read
+cargo run --locked --offline -- --config local/notion-production.json sync --dry-run --allow-university-read --allow-notion-read --production-read-only
+```
+
+`--production-read-only` は登録済みの本番用3データソースを照合し、本番用状態DBを読み取り専用で参照します。
+
+#### Macで本番へ初回同期する
+
+本番専用WriterのIntegrationに `Read content` と `Insert content` を設定し、本番の課題DBと授業DBを個別に接続します。
+ターミナルで次のコマンドを実行し、非表示プロンプトでWriterのトークンを入力します。
+登録時にBot IDと本番のスキーマを確認し、トークンをReaderと別のキーチェーン項目に保存します。
+登録時の `production_writer=failed` に `stage` と `http_status` が表示された場合は、対象のAPIとデータソースIDを確認してください。
+`assignments_data_source` と `courses_data_source` は元の課題DBと授業DBへの共有をそれぞれ確認します。授業対応表はReaderが参照します。
+
+```sh
+cargo run --locked --offline -- --config local/notion-production.json credentials set notion-writer
+cargo run --locked --offline -- --config local/notion-production.json sync --apply --allow-university-read --allow-notion-read --allow-notion-write --production-first-sync --writer BOT_ID
+```
+
+新規作成の期待件数は既定で35件です。最新のdry-runで新規件数を確認したうえで、`--expect-create N` で期待件数を指定できます。
+初回の計画で新規件数が期待値と一致し、更新・変更なし・保留・競合0件と既存の手動課題1件を確認できた場合に、対話承認のプロンプトが表示されます。
+表示された計画を確認してから `APPLY PRODUCTION N` の `N` をその件数に置き換えて入力します。
+承認後に計画を再照合し、本番課題DBへの課題作成だけを実行します。作成後はNotionを読み戻し、同一の取得データで再同期が書き込み0件になることを確認します。
+
 Phase 3Cの合成HTTPモックでの作成・再同期、障害復旧、実書き込みの有効化条件は
 [Notion同期 Phase 3C](docs/NOTION-SYNC-PHASE-3C.md)を参照してください。
 
@@ -228,8 +292,125 @@ Phase 3Cの合成HTTPモックでの作成・再同期、障害復旧、実書�
 
 ### 授業の対応表と既存課題の移行案
 
-`course_mappings` は人が確認するローカル設定です。たとえば以下のように
-出所・スコープ・外部IDの完全一致を、確認済みの授業ページIDに対応づけます。
+独立したNotion授業対応表を使う場合は、既存の `notion` 設定に次の `course_rules` を追加します。
+`course_term` は既存授業DBの「学期」のプロパティIDです。それ以外のプロパティIDは対応表のものを指定し、
+「元の授業名」にはNotionのタイトル列を使います。読み取り接続には対応表も共有します。
+
+```json
+"course_rules": {
+  "data_source_id": "00000000-0000-4000-8000-000000000004",
+  "course_term": "course-term",
+  "source": "origin",
+  "scope": "scope",
+  "external_id": "external",
+  "term": "term",
+  "course": "destination",
+  "status": "rule-status"
+}
+```
+
+| 対応表の列 | 型と入力値 |
+| --- | --- |
+| 元の授業名 | タイトル。表示用の授業名またはカテゴリ名 |
+| 取得元 (`source`) | 単一選択。`HOPPII` / `Moodle` |
+| スコープ (`scope`) | テキスト。HOPPIIは `default`、Moodleは取得設定と同じフィードスコープ |
+| 外部識別子 (`external_id`) | テキスト。HOPPIIは `group_id`、Moodleは授業関連ICSの単一 `CATEGORIES` を復号した文字列 |
+| 学期 (`term`) | テキスト。`年度:WebClassのsemester原値`。合成データでは `2026:2`。既存授業DBの学期も同じ形式 |
+| 対応する授業 (`course`) | 既存授業DBへのRelation。確定行では同じ学期のページを1件選択 |
+| 設定状態 (`status`) | 単一選択。`未設定` / `確定` / `対象外` |
+
+対応表を設定した場合、`notion-check` と `sync --dry-run --fixture --allow-notion-read` は
+ルールをNotionから読み、取得元・スコープ・外部識別子を完全一致で照合します。Moodleの確定行は、
+そのフィード内でカテゴリが1つの開講学期を示すことを確認してから設定します。学期をまたいで同じキーを
+複数行に登録すると保留になります。設定状態、重複、不正なRelation、確認できない学期は件数で表示します。
+`対象外` は同期対象から外し、対応表を最後まで読み取れないときは課題の変更案を作りません。
+確定先と異なる非空の課題Relationは、課題の更新全体を保留します。
+`sync --dry-run --fixture` では大学とNotionの両方を合成し、この対応表を検証できます。
+
+#### 授業対応の初期設定（合成環境）
+
+授業DBにはタイトルと学期のほか、新規作成時の照合と復旧に使う `HOPPII group_id`（テキスト）を用意します。
+既存授業と対応付ける場合は、WebClassの授業IDと学期を確認し、既存ページの `HOPPII group_id` と学期を設定します。
+その2項目が一致すれば既存ページを使います。同名で学期が一致または不明の既存ページに `group_id` がない場合は、
+対応表に `未設定` を追加するところまで進めます。Notionで既存ページを選び、Relationを1件設定してから `確定` にします。
+
+実Notion側では、既存の授業DBと課題DBに加えて、上表の7項目を持つ独立した授業対応表DBが必要です。
+授業DBの初期設定用プロパティIDは `notion.course_rules.setup` に指定します。`year`、`day`、`period` は任意です。
+年度の型は数値で、曜日と時限はテキストです。曜日・時限にはWebClassの値をそのまま記録します。
+
+```json
+"setup": {
+  "group_id": "hoppii-group",
+  "year": "year",
+  "day": "day",
+  "period": "period"
+}
+```
+
+合成環境では次の順で操作します。1行目で作成・再利用・保留の件数を確認し、2行目で合成Notionへ反映します。
+2行目は同じ合成データに再実行し、追加作成が0件になるところまで表示します。指定学期は `年度:semester原値` です。
+
+```sh
+cargo run --locked --offline --features synthetic-https-fixture -- sync --setup-courses --fixture --term 2026:2
+cargo run --locked --offline --features synthetic-https-fixture -- sync --setup-courses --fixture --term 2026:2 --apply
+```
+
+WebClassの新規授業では、授業ページを作成してから、そのページを参照するHOPPIIルールを `確定` で作成します。
+Moodleは有効なカテゴリを `未設定` で登録し、Notion上でユーザーが授業と学期を確認して確定します。
+書き込み結果が不明な場合は、同じ状態DBを使って再実行すると、外部キーで確認できた既存ページから再開します。
+該当ページを確認できない作成意図は保留されます。このコマンドの書き込み先はループバックの合成Notionに限定されています。
+
+#### Macで実データを使った授業初期設定のプレビュー
+
+検証用設定には `notion.course_rules.setup.group_id`、`webclass: true`、`moodle.host`・`moodle.path`・`moodle.scope` を指定します。
+読み取り用Notion Integrationと、コース関連のMoodleカレンダーURLは、同じ検証用設定を指定してMacのKeychainに登録します。
+未登録の場合は `credentials set notion` または `credentials set moodle` を使います。MoodleのURL全体は非表示の入力欄に入力します。
+
+```sh
+cargo run --locked --offline -- --config local/notion-verification.json university-check webclass --courses-only --check-local
+cargo run --locked --offline -- --config local/notion-verification.json sync --setup-courses --term 2026:2 --allow-university-read --allow-notion-read
+```
+
+2行目で開く一時Chromeプロファイルの大学公式画面で認証し、HOPPIIのWebClassリンクを開きます。
+取得範囲はWebClassの授業一覧、MoodleのICS 1件、Notionの設定対象です。実行結果は端末に表示します。
+`candidate` に対象授業・カテゴリ、その作成／再利用／保留、対応ルール案、Notionの既存ページ候補が出ます。
+`existing_course_without_group_id` は、Moodle由来の検証ページを確認するための一覧です。現在のカテゴリと名前が一致する場合は候補として表示します。
+名前は空白と英数字の全半角・大文字小文字の違いを吸収して比較します。名前だけの一致では授業を結びません。
+MoodleのICSは開講学期を持たないため、指定学期は候補の値です。カテゴリの学期と実際の対応先はユーザーが確認します。
+終了コード `3` は確認待ちの保留を含むプレビューです。検証用DBのプレビューは `plan_id` を表示します。
+プレビューでは作成意図を読み取り専用で照合し、Notionページの作成・再利用・保留を表示します。
+
+#### Macで検証用Notionに授業初期設定を適用
+
+書き込み先は検証用授業DBと授業対応表DBです。既存の検証用Writer（Bot ID `41e85934-7e84-81b1-a761-002702fbd8d2`）に、
+両データソースの Read content と Insert content を付与します。既存の読み取り用Integrationで3つのデータソースを検証し、
+Writerは新規ページの作成だけに使います。
+
+Macの標準 `trial.json` にある検証用Reader・WriterのBot IDを使い、既存コマンドでWriterのトークンをKeychainに登録します。
+トークンは非表示入力欄に入力します。
+
+```sh
+cargo run --locked --offline -- notion-trial --target 41e85934-7e84-817e-b1d2-000b68726503 credentials set write
+```
+
+現行ビルドでプレビューを実行し、`create_courses`、`create_rules`、`reuse_courses`、`held` と各行を確認します。
+そのプレビューに表示された64桁の `plan_id` を使います。
+
+```sh
+cargo run --locked --offline -- --config local/notion-verification.json sync --setup-courses --term 2026:2 --allow-university-read --allow-notion-read
+cargo run --locked --offline -- --config local/notion-verification.json sync --setup-courses --term 2026:2 --allow-university-read --allow-notion-read --apply --allow-notion-write --expect-plan PLAN_ID
+```
+
+適用時は大学データとNotionを再取得し、計画が変わっていれば `issue=plan_changed` で停止します。
+作成の直前にも対応ルールの外部キーと授業の対応先を照合します。作成結果が不明なときは、同じMacの
+`course-setup-targets/<授業対応表データソースID>/course-setup.sqlite3` を使ってプレビューから再開します。
+作成済みのページが確認できる場合は再利用し、作成意図が残っていてページを確認できない場合は保留します。
+授業ページと対応ルールは別々のAPIリクエストで作成します。適用中に別のクライアントが同じ対象を編集・作成する場合は、
+直前照合からAPI書き込みまでの間に競合が起きる可能性があります。
+
+#### 旧設定と既存課題の移行
+
+以下の `course_mappings` は旧経路と移行候補の形式です。
 
 ```json
 "course_mappings": [

@@ -1,6 +1,7 @@
 //! Isolated browser adapter for read-only WebClass checks.
 
 use std::{
+    collections::BTreeMap,
     env, io,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -12,10 +13,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     notion::state::{StateError, TargetLock, check_path},
     sync::{
-        AcquiredAssignments, AcquiredWebClassCourses, WebClassCourseListError, WebClassSyncError,
+        AcquiredAssignments, AcquiredWebClassCourses, WebClassAcquisition,
+        WebClassAcquisitionAttempt, WebClassCourseListError, WebClassSyncError,
         validate_webclass_contents_json, validate_webclass_courses_json,
     },
-    university_network::{BodyKind, HOPPII_ORIGIN, IDP_ORIGIN, MAX_RECORDS, WEBCLASS_ORIGIN},
+    university_network::{
+        BodyKind, HOPPII_ORIGIN, IDP_ORIGIN, MAX_COURSES, MAX_RECORDS, WEBCLASS_ORIGIN,
+    },
     webclass::WebClassCourse,
     webclass_auth::{USER_PAGE, WEBCLASS_SSO_POST_PATH},
     webclass_http::{CONTENTS_PATH, COURSES_PATH, DASHBOARD_PATH, contents_url},
@@ -196,6 +200,7 @@ struct BrowserReply {
     lms_reached: bool,
     navigation: Option<BrowserNavigation>,
     body: Option<String>,
+    bodies: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -207,7 +212,18 @@ enum DriverMessage {
 
 struct DriverResult {
     reply: BrowserReply,
-    selection: Option<Result<WebClassCourse, &'static str>>,
+    selection: Option<Result<SelectedCourses, &'static str>>,
+}
+
+#[derive(Clone, Copy)]
+enum RequestedCourses<'a> {
+    Single(&'a str),
+    Confirmed(&'a BTreeMap<String, String>),
+}
+
+struct SelectedCourses {
+    list: AcquiredWebClassCourses,
+    ids: Vec<String>,
 }
 
 fn driver_command(profile: &BrowserProfile) -> Command {
@@ -228,7 +244,7 @@ fn driver_command(profile: &BrowserProfile) -> Command {
 fn run_driver(
     config: &BrowserConfig<'_>,
     profile: &BrowserProfile,
-    course_id: Option<&str>,
+    request: Option<RequestedCourses<'_>>,
 ) -> Result<DriverResult, &'static str> {
     #[cfg(windows)]
     let job = platform::BrowserJob::new().ok_or("browser_setup")?;
@@ -243,7 +259,7 @@ fn run_driver(
     }
     let mut stdout = BufReader::new(child.stdout.take().expect("piped browser result"));
     let stdin = child.stdin.take().expect("piped browser driver");
-    let result = exchange_driver(&mut stdout, stdin, config, course_id);
+    let result = exchange_driver(&mut stdout, stdin, config, request);
     drop(stdout);
     #[cfg(windows)]
     if result.is_err() {
@@ -265,7 +281,7 @@ fn exchange_driver(
     stdout: &mut impl BufRead,
     mut stdin: impl Write,
     config: &BrowserConfig<'_>,
-    course_id: Option<&str>,
+    request: Option<RequestedCourses<'_>>,
 ) -> Result<DriverResult, &'static str> {
     fn send(writer: &mut impl Write, value: &impl Serialize) -> Result<(), &'static str> {
         serde_json::to_writer(&mut *writer, value).map_err(|_| "browser_protocol")?;
@@ -287,15 +303,26 @@ fn exchange_driver(
     let bound = config.max_bytes * 6 + 65536;
     let mut message = receive(stdout, bound)?;
     let mut selection = None;
-    if let (Some(course_id), DriverMessage::Courses { body }) = (course_id, &message) {
-        let course = select_course(body, course_id);
-        let target = course.as_ref().ok().map(|course| {
+    if let (Some(request), DriverMessage::Courses { body }) = (request, &message) {
+        let courses = select_courses(body, request);
+        let target = |group_id: &str| {
             let origin = reqwest::Url::parse(config.lms).expect("fixed WebClass origin");
-            let url = contents_url(&origin, &course.group_id);
+            let url = contents_url(&origin, group_id);
             format!("{}?{}", url.path(), url.query().expect("group_id query"))
-        });
-        send(&mut stdin, &target)?;
-        selection = Some(course);
+        };
+        match (courses.as_ref().ok(), request) {
+            (Some(courses), RequestedCourses::Single(_)) => {
+                send(&mut stdin, &target(&courses.ids[0]))?
+            }
+            (Some(courses), RequestedCourses::Confirmed(_)) => {
+                send(
+                    &mut stdin,
+                    &courses.ids.iter().map(|id| target(id)).collect::<Vec<_>>(),
+                )?;
+            }
+            (None, _) => send(&mut stdin, &Option::<String>::None)?,
+        }
+        selection = Some(courses);
         message = receive(stdout, bound)?;
     }
     match message {
@@ -315,23 +342,36 @@ fn parse_courses(body: &str) -> Result<AcquiredWebClassCourses, &'static str> {
     })
 }
 
-fn select_course(body: &str, course_id: &str) -> Result<WebClassCourse, &'static str> {
-    parse_courses(body)?
+fn select_courses(
+    body: &str,
+    request: RequestedCourses<'_>,
+) -> Result<SelectedCourses, &'static str> {
+    let list = parse_courses(body)?;
+    let ids: Vec<_> = list
         .records()
         .iter()
-        .find(|course| course.group_id == course_id)
-        .cloned()
-        .ok_or("course_id_not_found")
+        .filter(|course| match request {
+            RequestedCourses::Single(id) => course.group_id == id,
+            RequestedCourses::Confirmed(groups) => groups
+                .get(&course.group_id)
+                .is_some_and(|term| *term == format!("{}:{}", course.year, course.semester)),
+        })
+        .map(|course| course.group_id.clone())
+        .collect();
+    if matches!(request, RequestedCourses::Single(_)) && ids.is_empty() {
+        return Err("course_id_not_found");
+    }
+    Ok(SelectedCourses { list, ids })
 }
 
 impl BrowserReply {
-    fn checked_body(&self, expected_contents_get: u8) -> Result<&str, &'static str> {
+    fn check_complete(&self, expected_contents_get: u8) -> Result<(), &'static str> {
         match self.reason.as_str() {
             "ok" if self.lms_reached
                 && self.courses_get == 1
                 && self.contents_get == expected_contents_get =>
             {
-                self.body.as_deref().ok_or("browser_protocol")
+                Ok(())
             }
             "acquisition_context_changed" => Err("acquisition_context_changed"),
             "auth_expired" => Err("auth_expired"),
@@ -355,6 +395,14 @@ impl BrowserReply {
             _ => Err("browser_protocol"),
         }
     }
+
+    fn checked_body(&self, expected_contents_get: u8) -> Result<&str, &'static str> {
+        self.check_complete(expected_contents_get)?;
+        self.body
+            .as_deref()
+            .filter(|_| self.bodies.is_none())
+            .ok_or("browser_protocol")
+    }
 }
 
 fn parse_assignments(driver: DriverResult) -> Result<BrowserCourseAssignments, &'static str> {
@@ -368,11 +416,29 @@ fn parse_assignments(driver: DriverResult) -> Result<BrowserCourseAssignments, &
         return Err(reason);
     }
     let body = reply.checked_body(1)?;
-    let course = selection.and_then(Result::ok).ok_or("browser_protocol")?;
+    let selected = selection.and_then(Result::ok).ok_or("browser_protocol")?;
+    let [id] = selected.ids.as_slice() else {
+        return Err("browser_protocol");
+    };
+    let course = selected
+        .list
+        .records()
+        .iter()
+        .find(|course| course.group_id == *id)
+        .cloned()
+        .ok_or("browser_protocol")?;
+    let assignments = parse_contents(body, &course.group_id)?;
+    Ok(BrowserCourseAssignments {
+        course,
+        assignments,
+    })
+}
+
+fn parse_contents(body: &str, group_id: &str) -> Result<AcquiredAssignments, &'static str> {
     if body.len() > BodyKind::WebClassJson.limit() {
         return Err("contents_response_limit");
     }
-    let assignments = validate_webclass_contents_json(body, &course.group_id, |count| {
+    validate_webclass_contents_json(body, group_id, |count| {
         if count > MAX_RECORDS {
             Err(WebClassSyncError::Validation)
         } else {
@@ -383,11 +449,41 @@ fn parse_assignments(driver: DriverResult) -> Result<BrowserCourseAssignments, &
         WebClassSyncError::Parse => "invalid_contents_json",
         WebClassSyncError::Map => "invalid_contents_deadline",
         _ => "invalid_contents_group_or_identity",
-    })?;
-    Ok(BrowserCourseAssignments {
-        course,
-        assignments,
     })
+}
+
+fn parse_batches(driver: DriverResult) -> Result<WebClassAcquisition, &'static str> {
+    let DriverResult { reply, selection } = driver;
+    if reply.reason == "course_selection_stopped"
+        && let Some(Err(reason)) = selection
+    {
+        return Err(reason);
+    }
+    if reply.reason != "ok" {
+        reply.check_complete(0)?;
+    }
+    let selected = selection.and_then(Result::ok).ok_or("browser_protocol")?;
+    reply.check_complete(u8::try_from(selected.ids.len()).map_err(|_| "browser_protocol")?)?;
+    let bodies = reply
+        .bodies
+        .filter(|bodies| reply.body.is_none() && bodies.len() == selected.ids.len())
+        .ok_or("browser_protocol")?;
+    if bodies.iter().map(String::len).sum::<usize>() > BodyKind::WebClassJson.limit() {
+        return Err("contents_response_limit");
+    }
+    let groups = bodies
+        .iter()
+        .zip(&selected.ids)
+        .map(|(body, group)| parse_contents(body, group))
+        .collect::<Result<_, _>>()?;
+    Ok(WebClassAcquisition::new(
+        vec![WebClassAcquisitionAttempt {
+            course_list: Some(selected.list),
+            groups,
+            result: Ok(()),
+        }],
+        Ok(()),
+    ))
 }
 
 fn browser_executable() -> Result<PathBuf, &'static str> {
@@ -404,7 +500,10 @@ pub fn check_local_dependencies() -> Result<(), &'static str> {
         .ok_or("browser_runtime_unavailable")
 }
 
-fn launch(mode: ProfileMode, course_id: Option<&str>) -> Result<DriverResult, &'static str> {
+fn launch(
+    mode: ProfileMode,
+    request: Option<RequestedCourses<'_>>,
+) -> Result<DriverResult, &'static str> {
     let executable = browser_executable()?;
     let profile = BrowserProfile::open(mode)?;
     let config = BrowserConfig {
@@ -418,11 +517,11 @@ fn launch(mode: ProfileMode, course_id: Option<&str>) -> Result<DriverResult, &'
         contents_path: CONTENTS_PATH,
         dashboard_path: DASHBOARD_PATH,
         sso_post_path: WEBCLASS_SSO_POST_PATH,
-        select_contents: course_id.is_some(),
+        select_contents: request.is_some(),
         max_bytes: BodyKind::WebClassJson.limit(),
         login_millis: 5 * 60 * 1000,
     };
-    let mut report = run_driver(&config, &profile, course_id);
+    let mut report = run_driver(&config, &profile, request);
     if profile.close().is_err() {
         match &mut report {
             Ok(report) => report.reply.reason = "profile_cleanup_failed".into(),
@@ -434,10 +533,10 @@ fn launch(mode: ProfileMode, course_id: Option<&str>) -> Result<DriverResult, &'
 
 fn check<T>(
     mode: ProfileMode,
-    course_id: Option<&str>,
+    request: Option<RequestedCourses<'_>>,
     parse: impl FnOnce(DriverResult) -> Result<T, &'static str>,
 ) -> BrowserCheck<T> {
-    match launch(mode, course_id) {
+    match launch(mode, request) {
         Ok(driver) => BrowserCheck {
             courses_get: driver.reply.courses_get,
             contents_get: driver.reply.contents_get,
@@ -467,7 +566,24 @@ pub fn run_for_course(
     mode: ProfileMode,
     course_id: &str,
 ) -> BrowserCheck<BrowserCourseAssignments> {
-    check(mode, Some(course_id), parse_assignments)
+    check(
+        mode,
+        Some(RequestedCourses::Single(course_id)),
+        parse_assignments,
+    )
+}
+
+/// Read each confirmed group at most once, within one isolated Chrome session.
+pub fn run_for_confirmed_courses(
+    mode: ProfileMode,
+    groups: &BTreeMap<String, String>,
+) -> BrowserCheck<WebClassAcquisition> {
+    debug_assert!(MAX_COURSES <= usize::from(u8::MAX));
+    check(
+        mode,
+        Some(RequestedCourses::Confirmed(groups)),
+        parse_batches,
+    )
 }
 
 #[cfg(test)]
@@ -534,6 +650,7 @@ mod tests {
             lms_reached: true,
             navigation: None,
             body: Some(body),
+            bodies: None,
         };
         let courses = parse_courses(reply(COURSES.into()).checked_body(0).unwrap()).unwrap();
         assert_eq!(courses.records().len(), 3);
@@ -563,6 +680,14 @@ mod tests {
         course_id: &str,
         finish: serde_json::Value,
     ) -> (DriverResult, serde_json::Value) {
+        synthetic_exchange_with(courses, RequestedCourses::Single(course_id), finish)
+    }
+
+    fn synthetic_exchange_with(
+        courses: &str,
+        requested: RequestedCourses<'_>,
+        finish: serde_json::Value,
+    ) -> (DriverResult, serde_json::Value) {
         let config = BrowserConfig {
             executable: Path::new("fixture-browser"),
             profile: Path::new("fixture-profile"),
@@ -590,7 +715,7 @@ mod tests {
             &mut replies.as_bytes(),
             &mut commands,
             &config,
-            Some(course_id),
+            Some(requested),
         )
         .unwrap();
         let commands = std::str::from_utf8(&commands)
@@ -599,6 +724,43 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(commands.len(), 2);
         (driver, serde_json::from_str(commands[1]).unwrap())
+    }
+
+    #[test]
+    fn browser_batch_requires_exact_groups_and_terms_and_rejects_incomplete_results() {
+        let groups = BTreeMap::from([
+            ("fixture-course-001".into(), "2026:2".into()),
+            (SELECTED.into(), "2026:2".into()),
+            ("fixture-course-003".into(), "2026:1".into()),
+            ("absent-course".into(), "2026:2".into()),
+        ]);
+        let request = RequestedCourses::Confirmed(&groups);
+        let reply = |bodies| {
+            json!({
+                "reason": "ok", "courses_get": 1, "contents_get": 2, "lms_reached": true,
+                "bodies": bodies,
+            })
+        };
+        let (driver, targets) =
+            synthetic_exchange_with(COURSES, request, reply(vec!["[]", CONTENTS]));
+        assert_eq!(
+            targets,
+            json!([
+                format!("{CONTENTS_PATH}?group_id=fixture-course-001"),
+                format!("{CONTENTS_PATH}?group_id={SELECTED}"),
+            ])
+        );
+        let acquired = parse_batches(driver).unwrap();
+        let batches = acquired.attempts()[0].groups();
+        assert!(batches[0].batch().as_slice().is_empty());
+        assert_eq!(batches[1].batch().as_slice().len(), 3);
+        for (bodies, diagnostic) in [
+            (vec!["[]"], "browser_protocol"),
+            (vec![CONTENTS, "[]"], "invalid_contents_group_or_identity"),
+        ] {
+            let (driver, _) = synthetic_exchange_with(COURSES, request, reply(bodies));
+            assert_eq!(parse_batches(driver).err(), Some(diagnostic));
+        }
     }
 
     #[test]

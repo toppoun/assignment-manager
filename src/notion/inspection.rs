@@ -8,12 +8,16 @@ use std::{
 use serde_json::{Map, Value};
 
 use super::{
-    CourseMapping, DryRunReport, NotionAssignment, NotionClient, NotionError, NotionTarget,
-    SyncInput,
+    CourseMapping, CourseRuleSummary, DryRunReport, NotionAssignment, NotionClient, NotionError,
+    NotionTarget, SyncInput,
+    apply::reconcile_snapshot,
+    course_rules::{CourseRules, VerificationCourse, VerificationCourseRule},
+    live_assignment_read_target,
+    state::StateSummary,
     trial::MANAGED_PROPERTIES,
     wire::{
-        Schema, checked_page_id, data_source_parent, page_relations, relation_targets,
-        source_options, uuid,
+        Schema, checked_page_id, data_source_parent, page_property, page_relations,
+        relation_targets, source_options, text, uuid,
     },
 };
 
@@ -59,7 +63,11 @@ pub struct InspectionReport {
     pub assignment_samples: usize,
     pub sample_relation_entries: usize,
     pub mapped_course_pages: usize,
+    pub course_rules_configured: bool,
+    pub course_rules: Option<CourseRuleSummary>,
     pub snapshot: Option<SnapshotSummary>,
+    pub recoverable_creates: usize,
+    pub unresolved_creates: usize,
     pub error: Option<NotionError>,
 }
 
@@ -101,6 +109,22 @@ impl fmt::Display for InspectionReport {
             "assignment_samples={} sample_relation_entries={} mapped_course_pages={}",
             self.assignment_samples, self.sample_relation_entries, self.mapped_course_pages
         )?;
+        if let Some(rules) = &self.course_rules {
+            write!(
+                f,
+                "\ncourse_rules=complete rows={} confirmed={} unset={} excluded={} duplicate_keys={} invalid_rows={} invalid_relations={} unverified_terms={}",
+                rules.rows,
+                rules.confirmed,
+                rules.unset,
+                rules.excluded,
+                rules.duplicate_keys,
+                rules.invalid_rows,
+                rules.invalid_relations,
+                rules.unverified_terms
+            )?;
+        } else if self.course_rules_configured {
+            write!(f, "\ncourse_rules=unavailable")?;
+        }
         match &self.snapshot {
             Some(snapshot) => write!(
                 f,
@@ -113,6 +137,52 @@ impl fmt::Display for InspectionReport {
 }
 
 impl NotionClient {
+    /// Build the live dry run and its course diagnostics from the same validated rules.
+    pub fn inspect_live_assignment_dry_run(
+        &self,
+        input: &SyncInput,
+        target: &NotionTarget,
+        assignment_samples: &[String],
+        mut state: StateSummary,
+        production: bool,
+    ) -> Result<(InspectionReport, DryRunReport, Vec<VerificationCourseRule>), NotionError> {
+        live_assignment_read_target(target, production)?;
+        let mut inspection = InspectionReport::default();
+        let (schema, rows, rules) =
+            self.inspect_snapshot(target, assignment_samples, &[], &mut inspection)?;
+        let rules = rules.ok_or(NotionError::Configuration)?;
+        let mut plan = Self::plan_from_course_rules(input, &schema, &rows, &rules)?;
+        inspection.recoverable_creates = reconcile_snapshot(&mut state, &rows).len();
+        inspection.unresolved_creates = state.pending;
+        plan.defer_unreconciled(&state);
+        let titles = self.query_course_pages(&schema, &["title"], |_, page| {
+            text(page_property(page, "title", "title")?)
+        })?;
+        let report = rules
+            .by_key
+            .into_iter()
+            .map(|(key, rule)| {
+                let destination = match rule.resolution {
+                    Ok(course) => Ok(VerificationCourse {
+                        title: titles
+                            .get(&course.page_id)
+                            .ok_or(NotionError::IncompleteSnapshot)?
+                            .clone(),
+                        term: course.term,
+                        page_id: course.page_id,
+                    }),
+                    Err(problem) => Err(problem),
+                };
+                Ok(VerificationCourseRule {
+                    key,
+                    source_name: rule.name,
+                    destination,
+                })
+            })
+            .collect::<Result<_, NotionError>>()?;
+        Ok((inspection, plan, report))
+    }
+
     /// Audit the schema and selected pages, then read the complete assignment list.
     pub fn inspect(
         &self,
@@ -138,7 +208,10 @@ impl NotionClient {
         let mut inspection = InspectionReport::default();
         let result = self
             .inspect_snapshot(target, assignment_samples, mappings, &mut inspection)
-            .and_then(|(schema, rows)| self.plan_from_rows(input, &schema, &rows, mappings));
+            .and_then(|(schema, rows, rules)| match rules {
+                Some(rules) => Self::plan_from_course_rules(input, &schema, &rows, &rules),
+                None => self.plan_from_rows(input, &schema, &rows, mappings),
+            });
         let plan = result.unwrap_or_else(|error| {
             inspection.error = Some(error);
             DryRunReport::incomplete(input, error)
@@ -152,9 +225,25 @@ impl NotionClient {
         assignment_samples: &[String],
         mappings: &[CourseMapping],
         report: &mut InspectionReport,
-    ) -> Result<(Schema, Vec<NotionAssignment>), NotionError> {
+    ) -> Result<(Schema, Vec<NotionAssignment>, Option<CourseRules>), NotionError> {
+        report.course_rules_configured = target.course_rules.is_some();
+        let mappings = if report.course_rules_configured {
+            &[]
+        } else {
+            mappings
+        };
         let schema = self.inspect_schema(target, assignment_samples, mappings, report)?;
-        let rows = self.query_assignments(&schema, None)?;
+        let rules = target
+            .course_rules
+            .as_ref()
+            .map(|config| self.read_course_rules(config, &schema))
+            .transpose()?;
+        report.course_rules = rules.as_ref().map(|rules| rules.summary);
+        let rows = if rules.is_some() {
+            self.query_assignments_with_manual_fields(&schema)?
+        } else {
+            self.query_assignments(&schema, None)?
+        };
         let mut keys = HashSet::new();
         let mut duplicates = HashSet::new();
         let mut managed = 0;
@@ -169,7 +258,7 @@ impl NotionClient {
             manual: rows.len() - managed,
             duplicate_keys: duplicates.len(),
         });
-        Ok((schema, rows))
+        Ok((schema, rows, rules))
     }
 
     fn inspect_schema(

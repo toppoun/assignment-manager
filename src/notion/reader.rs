@@ -9,9 +9,12 @@ use serde_json::{Value, json};
 
 use super::{
     CourseMapping, DeferredReason, NotionAssignment, NotionClient, NotionError, NotionSnapshot,
-    NotionTarget, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, plan_sync,
+    NotionTarget, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey,
+    course_rules::CourseRules,
+    plan::plan_sync_with_rules,
+    plan_sync,
     state::{BindingStatus, StateSummary},
-    wire::{Schema, checked_page_id, relation_id, uuid},
+    wire::{Schema, checked_page_id, notion_deadline_matches, relation_id, uuid},
 };
 
 const MAX_LIST_PAGES: usize = 200;
@@ -27,6 +30,34 @@ pub struct DryRunCounts {
     pub deferred: usize,
     #[serde(default)]
     pub course_relation_mismatch: usize,
+    #[serde(default)]
+    pub course_rules: CoursePlanCounts,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoursePlanCounts {
+    pub unconfigured: usize,
+    pub duplicates: usize,
+    pub invalid: usize,
+    pub invalid_relation: usize,
+    pub unverified_term: usize,
+    pub excluded: usize,
+}
+
+impl fmt::Display for CoursePlanCounts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "course_rule_unconfigured={} course_rule_duplicate={} course_rule_invalid={} course_rule_invalid_relation={} course_rule_unverified_term={} course_rule_excluded={}",
+            self.unconfigured,
+            self.duplicates,
+            self.invalid,
+            self.invalid_relation,
+            self.unverified_term,
+            self.excluded
+        )
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -91,16 +122,43 @@ impl DryRunReport {
         self.counts_where(|key| input.assignments().contains_key(key))
     }
 
+    pub(super) fn retain_input(&mut self, input: &SyncInput) {
+        self.plan
+            .retain(|entry| input.assignments().contains_key(&entry.key));
+        self.requests
+            .retain(|request| input.assignments().contains_key(request.key()));
+    }
+
     pub(super) fn counts_where(&self, include: impl Fn(&SyncKey) -> bool) -> DryRunCounts {
         let mut counts = DryRunCounts::default();
         for entry in self.plan.iter().filter(|entry| include(&entry.key)) {
             counts.course_relation_mismatch += usize::from(entry.course_relation_mismatch);
+            match entry.action {
+                PlanAction::Deferred(DeferredReason::CourseUnconfigured) => {
+                    counts.course_rules.unconfigured += 1
+                }
+                PlanAction::Deferred(DeferredReason::CourseRuleDuplicate) => {
+                    counts.course_rules.duplicates += 1
+                }
+                PlanAction::Deferred(DeferredReason::CourseRuleInvalid) => {
+                    counts.course_rules.invalid += 1
+                }
+                PlanAction::Deferred(DeferredReason::CourseRuleInvalidRelation) => {
+                    counts.course_rules.invalid_relation += 1
+                }
+                PlanAction::Deferred(DeferredReason::CourseTermUnverified) => {
+                    counts.course_rules.unverified_term += 1
+                }
+                PlanAction::Excluded => counts.course_rules.excluded += 1,
+                _ => {}
+            }
             *match entry.action {
                 PlanAction::Create { .. } => &mut counts.create,
                 PlanAction::Update { .. } => &mut counts.update,
                 PlanAction::Unchanged { .. } => &mut counts.unchanged,
                 PlanAction::Conflict(_) => &mut counts.conflict,
                 PlanAction::Deferred(_) => &mut counts.deferred,
+                PlanAction::Excluded => continue,
             } += 1;
         }
         counts
@@ -125,7 +183,9 @@ impl DryRunReport {
                 matches.extend(
                     pages
                         .iter()
-                        .filter(|page| page.deadline == assignment.deadline)
+                        .filter(|page| {
+                            notion_deadline_matches(&page.deadline, &assignment.deadline)
+                        })
                         .map(|page| (row.key.clone(), page.page_id.clone())),
                 );
             }
@@ -183,6 +243,11 @@ impl NotionClient {
         mappings: &[CourseMapping],
     ) -> Result<DryRunReport, NotionError> {
         let schema = self.retrieve_schema(target)?;
+        if let Some(config) = &target.course_rules {
+            let rules = self.read_course_rules(config, &schema)?;
+            let rows = self.query_assignments_with_manual_fields(&schema)?;
+            return Self::plan_from_course_rules(input, &schema, &rows, &rules);
+        }
         let rows = self.query_assignments(&schema, None)?;
         self.plan_from_rows(input, &schema, &rows, mappings)
     }
@@ -216,7 +281,6 @@ impl NotionClient {
         }
         let plan = plan_sync(input, NotionSnapshot::Complete(rows), mappings);
         let mut verified = HashSet::new();
-        let mut requests = Vec::new();
         for entry in &plan {
             let relation = match &entry.action {
                 PlanAction::Create { course_page_id, .. } => course_page_id.as_deref(),
@@ -226,6 +290,28 @@ impl NotionClient {
             if let Some(id) = relation.filter(|id| verified.insert(*id)) {
                 verify_course(id)?;
             }
+        }
+        Self::prepare_report(schema, plan)
+    }
+
+    pub(super) fn plan_from_course_rules(
+        input: &SyncInput,
+        schema: &Schema,
+        rows: &[NotionAssignment],
+        rules: &CourseRules,
+    ) -> Result<DryRunReport, NotionError> {
+        let plan = plan_sync_with_rules(input, NotionSnapshot::Complete(rows), rules);
+        let mut report = Self::prepare_report(schema, plan)?;
+        report.defer_manual_candidates(rows);
+        Ok(report)
+    }
+
+    fn prepare_report(
+        schema: &Schema,
+        plan: Vec<PlannedAssignment>,
+    ) -> Result<DryRunReport, NotionError> {
+        let mut requests = Vec::new();
+        for entry in &plan {
             if let Some(request) = schema.prepare(entry)? {
                 requests.push(request);
             }
@@ -268,12 +354,51 @@ impl NotionClient {
         self.query_assignment_pages(schema, key, |_, row| Ok(row))
     }
 
+    pub(super) fn query_assignments_with_manual_fields(
+        &self,
+        schema: &Schema,
+    ) -> Result<Vec<NotionAssignment>, NotionError> {
+        self.query_assignment_pages(schema, None, |page, mut row| {
+            if row.sync_key.is_none() {
+                (row.title, row.deadline) = schema.manual_title_deadline(page)?;
+            }
+            Ok(row)
+        })
+    }
+
     pub(super) fn query_course_pages<T>(
         &self,
         schema: &Schema,
+        projection: &[&str],
         observe: impl Fn(&str, &Value) -> Result<T, NotionError>,
     ) -> Result<HashMap<String, T>, NotionError> {
-        let path = format!("/v1/data_sources/{}/query", schema.courses_id);
+        self.query_data_source_pages(
+            &schema.courses_id,
+            &schema.courses_database,
+            projection,
+            observe,
+        )
+    }
+
+    pub(super) fn query_data_source_pages<T>(
+        &self,
+        id: &str,
+        database: &str,
+        projection: &[&str],
+        observe: impl Fn(&str, &Value) -> Result<T, NotionError>,
+    ) -> Result<HashMap<String, T>, NotionError> {
+        self.query_filtered_data_source_pages(id, database, projection, None, observe)
+    }
+
+    pub(super) fn query_filtered_data_source_pages<T>(
+        &self,
+        id: &str,
+        database: &str,
+        projection: &[&str],
+        filter: Option<&Value>,
+        observe: impl Fn(&str, &Value) -> Result<T, NotionError>,
+    ) -> Result<HashMap<String, T>, NotionError> {
+        let path = format!("/v1/data_sources/{id}/query");
         let mut pages = HashMap::new();
         paginate(
             |cursor| {
@@ -281,13 +406,16 @@ impl NotionClient {
                 if let Some(cursor) = cursor {
                     body["start_cursor"] = json!(cursor);
                 }
+                if let Some(filter) = filter {
+                    body["filter"] = filter.clone();
+                }
                 self.read(|| {
-                    self.request(Method::POST, &path, &property_filters(&["title"]))
+                    self.request(Method::POST, &path, &property_filters(projection))
                         .json(&body)
                 })
             },
             |page| {
-                let id = checked_page_id(page, &schema.courses_id, &schema.courses_database)?;
+                let id = checked_page_id(page, id, database)?;
                 let observed = observe(&id, page)?;
                 if pages.insert(id, observed).is_some() {
                     return Err(NotionError::IncompleteSnapshot);
@@ -411,11 +539,11 @@ impl NotionClient {
     }
 }
 
-fn property_filters<'a>(ids: &[&'a str]) -> Vec<(&'static str, &'a str)> {
+pub(super) fn property_filters<'a>(ids: &[&'a str]) -> Vec<(&'static str, &'a str)> {
     ids.iter().map(|id| ("filter_properties", *id)).collect()
 }
 
-fn paginate<T>(
+pub(super) fn paginate<T>(
     mut fetch: impl FnMut(Option<&str>) -> Result<Value, NotionError>,
     mut convert: impl FnMut(&Value) -> Result<T, NotionError>,
 ) -> Result<Vec<T>, NotionError> {

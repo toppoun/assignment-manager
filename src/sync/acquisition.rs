@@ -11,7 +11,10 @@ use crate::{
     import::{
         AssignmentCandidateBatch, DEFAULT_COURSE_SOURCE_SCOPE, ExternalRecordKey, OriginKind,
     },
-    moodle::{MoodleEventKind, classify_event, map_events, parse_calendar, single_course_category},
+    moodle::{
+        MoodleEvent, MoodleEventKind, classify_event, map_events, parse_calendar,
+        single_course_category,
+    },
     moodle_http::{MoodleClient, MoodleDiagnostic, MoodleFeed},
     observation::{
         AssignmentObservation, ObservationValidationError, SyncScope, WebClassCourseListObservation,
@@ -181,32 +184,9 @@ pub(super) fn visit_moodle(
         Option<SourceCourse>,
     ) -> Result<(), MoodleSyncError>,
 ) -> Result<AcquiredAssignments, MoodleAcquisitionError> {
-    let raw = client
-        .fetch_calendar_with_diagnostic(feed)
-        .map_err(|(_, diagnostic)| MoodleAcquisitionError {
-            kind: MoodleSyncError::Fetch,
-            diagnostic,
-        })?;
-    let events = parse_calendar(&raw)
-        .map_err(|_| acquired_response_error(MoodleSyncError::Parse, "ics_parse"))?;
+    let (events, observation) = fetch_validated_calendar(client, feed)?;
     let limit = acquired_response_error(MoodleSyncError::Validation, "candidate_limit");
     let validation = acquired_response_error(MoodleSyncError::Validation, "candidate_validation");
-    client.check_sync_records(events.len()).map_err(|_| limit)?;
-    let key_for = |id: &str| ExternalRecordKey {
-        origin: OriginKind::Moodle,
-        scope: feed.scope().to_owned(),
-        id: id.to_owned(),
-    };
-    let observation = AssignmentObservation::try_new(
-        SyncScope::MoodleFeed(feed.scope().to_owned()),
-        events.iter().map(|event| key_for(&event.uid)).collect(),
-    )
-    .map_err(|error| match error {
-        ObservationValidationError::DuplicateIdentity => {
-            acquired_response_error(MoodleSyncError::Validation, "moodle_uid_duplicate")
-        }
-        _ => validation,
-    })?;
     let batch = AssignmentCandidateBatch::try_new(map_events(&events, feed.scope()))
         .map_err(|_| validation)?;
     let assignments = AcquiredAssignments::try_new(batch, observation).map_err(|_| validation)?;
@@ -220,12 +200,12 @@ pub(super) fn visit_moodle(
         client.check_sync_records(0).map_err(|_| {
             acquired_response_error(MoodleSyncError::Fetch, "course_processing_limit")
         })?;
-        let key = key_for(&event.uid);
+        let key = moodle_key(feed, &event.uid);
         if !candidate_keys.contains(&key) {
             continue;
         }
         let course = single_course_category(event, feed).map(|category| SourceCourse {
-            external_key: key_for(category),
+            external_key: moodle_key(feed, category),
             name: category.to_owned(),
         });
         visit_candidate(key, classify_event(event), course)
@@ -235,6 +215,53 @@ pub(super) fn visit_moodle(
         .check_sync_records(assignments.batch().as_slice().len())
         .map_err(|_| limit)?;
     Ok(assignments)
+}
+
+/// Fetch the identity-validated export, including events without task candidates.
+pub fn acquire_moodle_calendar(
+    client: &MoodleClient,
+    feed: &MoodleFeed,
+) -> Result<Vec<MoodleEvent>, MoodleAcquisitionError> {
+    fetch_validated_calendar(client, feed).map(|(events, _)| events)
+}
+
+fn moodle_key(feed: &MoodleFeed, id: &str) -> ExternalRecordKey {
+    ExternalRecordKey {
+        origin: OriginKind::Moodle,
+        scope: feed.scope().to_owned(),
+        id: id.to_owned(),
+    }
+}
+
+fn fetch_validated_calendar(
+    client: &MoodleClient,
+    feed: &MoodleFeed,
+) -> Result<(Vec<MoodleEvent>, AssignmentObservation), MoodleAcquisitionError> {
+    let raw = client
+        .fetch_calendar_with_diagnostic(feed)
+        .map_err(|(_, diagnostic)| MoodleAcquisitionError {
+            kind: MoodleSyncError::Fetch,
+            diagnostic,
+        })?;
+    let events = parse_calendar(&raw)
+        .map_err(|_| acquired_response_error(MoodleSyncError::Parse, "ics_parse"))?;
+    let limit = acquired_response_error(MoodleSyncError::Validation, "candidate_limit");
+    let validation = acquired_response_error(MoodleSyncError::Validation, "candidate_validation");
+    client.check_sync_records(events.len()).map_err(|_| limit)?;
+    let observation = AssignmentObservation::try_new(
+        SyncScope::MoodleFeed(feed.scope().to_owned()),
+        events
+            .iter()
+            .map(|event| moodle_key(feed, &event.uid))
+            .collect(),
+    )
+    .map_err(|error| match error {
+        ObservationValidationError::DuplicateIdentity => {
+            acquired_response_error(MoodleSyncError::Validation, "moodle_uid_duplicate")
+        }
+        _ => validation,
+    })?;
+    Ok((events, observation))
 }
 
 /// Validated WebClass course discovery. Successful discovery says nothing about

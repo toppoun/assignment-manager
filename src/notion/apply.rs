@@ -11,6 +11,11 @@ mod moodle_create;
 #[cfg(feature = "synthetic-https-fixture")]
 pub use moodle_create::MoodleCreatePreview;
 mod moodle_integration;
+mod verification_assignments;
+pub use verification_assignments::{
+    AssignmentReadback, ProductionAssignmentWriter, ProductionWriterCheckError,
+    ProtectedManualAssignment,
+};
 #[cfg(any(windows, test))]
 mod moodle_live_create;
 pub use moodle_integration::{
@@ -81,6 +86,12 @@ impl ApplyPreview<'_> {
 pub(super) enum WriteAccess<'a> {
     #[cfg(any(test, feature = "synthetic-https-fixture"))]
     Mock,
+    CourseSetup(super::course_setup::ApprovedCourseSetup<'a>),
+    VerificationAssignments {
+        writer: &'a NotionClient,
+        properties: &'a super::NotionPropertyIds,
+    },
+    ProductionFirstSync(verification_assignments::ApprovedProductionCreates<'a>),
     Trial(ApprovedTrial<'a>),
     #[cfg(any(windows, test, feature = "synthetic-https-fixture"))]
     MoodleCreate {
@@ -282,13 +293,8 @@ impl NotionClient {
             Observation::new(&schema, page, row)
         })?;
         pages.sort_unstable_by(|a, b| a.row.page_id.cmp(&b.row.page_id));
-        let recovered = recoverable_intents(&state, &pages);
-        for (key, page) in &recovered {
-            let binding = state.bindings.get_mut(key).expect("known intent");
-            binding.status = BindingStatus::Linked;
-            binding.page_id = Some(page.clone());
-        }
         let rows: Vec<_> = pages.iter().map(|page| page.row.clone()).collect();
+        let recovered = reconcile_snapshot(&mut state, &rows);
         let mut deltas = build(&schema, &rows)?;
         let manual_candidates = deltas.defer_manual_candidates(&rows);
         deltas.defer_unreconciled(&state);
@@ -303,7 +309,7 @@ impl NotionClient {
             pages,
             deltas,
             manual_candidates,
-            pending: state.pending - recovered.len(),
+            pending: state.pending,
             recovered,
             missing_bindings,
         })
@@ -340,6 +346,7 @@ impl NotionClient {
             report.counts.course_relation_mismatch += usize::from(entry.course_relation_mismatch);
             let action = &entry.action;
             let outcome = match action {
+                PlanAction::Excluded => continue,
                 PlanAction::Deferred(_) => WriteOutcome::Deferred(None),
                 PlanAction::Conflict(_) => WriteOutcome::Conflict,
                 PlanAction::Unchanged { page_id } => {
@@ -474,7 +481,16 @@ impl NotionClient {
             {
                 return false;
             }
-            !(more_relation && patch.course_page_id.is_some()) && patch_matches(patch, row)
+            let minute_precision = matches!(access, WriteAccess::VerificationAssignments { .. });
+            if minute_precision
+                && (more_relation
+                    || row.source != baseline.row.source
+                    || row.course_page_ids != baseline.row.course_page_ids)
+            {
+                return false;
+            }
+            !(more_relation && patch.course_page_id.is_some())
+                && patch_matches(patch, row, minute_precision)
         };
         let verify = || -> Result<Observation, NotionError> {
             let page = self.retrieve_page(
@@ -516,15 +532,15 @@ impl NotionClient {
     }
 }
 
-fn recoverable_intents(state: &StateSummary, pages: &[Observation]) -> Vec<(SyncKey, String)> {
+pub(super) fn reconcile_snapshot(
+    state: &mut StateSummary,
+    pages: &[NotionAssignment],
+) -> Vec<(SyncKey, String)> {
     let known_pages = state.page_owners();
     let mut matches: HashMap<_, Vec<_>> = HashMap::new();
     for page in pages {
-        if let Some(key) = &page.row.sync_key {
-            matches
-                .entry(key)
-                .or_default()
-                .push(page.row.page_id.as_str());
+        if let Some(key) = &page.sync_key {
+            matches.entry(key).or_default().push(page.page_id.as_str());
         }
     }
     let mut recovered = Vec::new();
@@ -536,10 +552,16 @@ fn recoverable_intents(state: &StateSummary, pages: &[Observation]) -> Vec<(Sync
             && binding.page_id.as_deref().is_none_or(|known| known == *id)
             && known_pages.get(id).is_none_or(|owner| *owner == key)
         {
-            recovered.push((key.clone(), (*id).into()));
+            recovered.push((key.clone(), (*id).to_owned()));
         }
     }
     recovered.sort_unstable();
+    for (key, page) in &recovered {
+        let binding = state.bindings.get_mut(key).expect("known intent");
+        binding.status = BindingStatus::Linked;
+        binding.page_id = Some(page.clone());
+    }
+    state.pending -= recovered.len();
     recovered
 }
 
@@ -561,15 +583,22 @@ fn unavailable(input: &SyncInput, state: &StateSummary, error: NotionError) -> A
     }
 }
 
-fn patch_matches(patch: &AssignmentPatch, current: &NotionAssignment) -> bool {
+fn patch_matches(
+    patch: &AssignmentPatch,
+    current: &NotionAssignment,
+    minute_precision: bool,
+) -> bool {
     patch
         .title
         .as_ref()
         .is_none_or(|title| title == &current.title)
-        && patch
-            .deadline
-            .as_ref()
-            .is_none_or(|deadline| deadline == &current.deadline)
+        && patch.deadline.as_ref().is_none_or(|deadline| {
+            if minute_precision {
+                super::wire::notion_deadline_matches(&current.deadline, deadline)
+            } else {
+                deadline == &current.deadline
+            }
+        })
         && patch
             .source
             .is_none_or(|source| Some(source) == current.source)
@@ -579,7 +608,7 @@ fn patch_matches(patch: &AssignmentPatch, current: &NotionAssignment) -> bool {
             .is_none_or(|id| current.course_page_ids.as_slice() == std::slice::from_ref(id))
 }
 
-fn explicitly_rejected(error: NotionError) -> bool {
+pub(super) fn explicitly_rejected(error: NotionError) -> bool {
     matches!(
         error,
         NotionError::Authentication

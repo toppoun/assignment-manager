@@ -65,7 +65,7 @@ impl fmt::Display for NotionError {
 
 impl Error for NotionError {}
 
-/// The regular API exposes only reads. Mutations require an approved trial or a loopback fixture.
+/// The regular API exposes reads. Mutations require a scoped, approved write path.
 pub struct NotionClient {
     http: Client,
     base: Url,
@@ -74,6 +74,10 @@ pub struct NotionClient {
     pacing: Mutex<Pacing>,
     read_operations: AtomicUsize,
     read_retries: AtomicUsize,
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) verification_writes: AtomicUsize,
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) lose_verification_ack: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "synthetic-https-fixture"))]
     mock_writes: bool,
 }
@@ -148,6 +152,10 @@ impl NotionClient {
             }),
             read_operations: AtomicUsize::new(0),
             read_retries: AtomicUsize::new(0),
+            #[cfg(all(test, target_os = "macos"))]
+            verification_writes: AtomicUsize::new(0),
+            #[cfg(all(test, target_os = "macos"))]
+            lose_verification_ack: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "synthetic-https-fixture"))]
             mock_writes: false,
         })
@@ -249,6 +257,45 @@ impl NotionClient {
         match access {
             #[cfg(any(test, feature = "synthetic-https-fixture"))]
             WriteAccess::Mock => self.require_mock_writes()?,
+            WriteAccess::CourseSetup(approval) => {
+                self.require_course_setup_origin()?;
+                if !approval.permits(self, request) {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
+            WriteAccess::VerificationAssignments { writer, properties } => {
+                self.require_course_setup_origin()?;
+                let allowed = match *request.method() {
+                    Method::POST => request.body()["parent"]["type"] == "data_source_id",
+                    Method::PATCH => {
+                        request
+                            .body()
+                            .as_object()
+                            .is_some_and(|body| body.len() == 1)
+                            && request.body()["properties"]
+                                .as_object()
+                                .is_some_and(|fields| {
+                                    !fields.is_empty()
+                                        && fields.keys().all(|id| {
+                                            id == &properties.title || id == &properties.deadline
+                                        })
+                                })
+                    }
+                    _ => false,
+                };
+                if !std::ptr::eq(self, *writer)
+                    || request.target_id != super::trial::MOODLE_VERIFICATION_ASSIGNMENTS
+                    || !allowed
+                {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
+            WriteAccess::ProductionFirstSync(approval) => {
+                self.require_course_setup_origin()?;
+                if !approval.permits(self, request) {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
             WriteAccess::Trial(approval) => {
                 self.require_trial_destination(request, approval.target())?
             }
@@ -286,7 +333,8 @@ impl NotionClient {
                 }
             }
         }
-        if PRODUCTION_DATA_SOURCES.contains(&request.target_id.as_str())
+        if (PRODUCTION_DATA_SOURCES.contains(&request.target_id.as_str())
+            && !matches!(access, WriteAccess::ProductionFirstSync(_)))
             || (request.method() == Method::POST
                 && request.body()["parent"]["data_source_id"] != request.target_id)
         {
@@ -309,6 +357,15 @@ impl NotionClient {
         if url.origin() != self.base.origin() || url.query().is_some() || !valid_path {
             return Err(NotionError::MethodDisabled);
         }
+        #[cfg(all(test, target_os = "macos"))]
+        if matches!(access, WriteAccess::VerificationAssignments { .. }) {
+            self.verification_writes.fetch_add(1, Ordering::Relaxed);
+            let result = self.execute(request).map_err(|failure| failure.error);
+            if result.is_ok() && self.lose_verification_ack.swap(false, Ordering::Relaxed) {
+                return Err(NotionError::Timeout);
+            }
+            return result;
+        }
         self.execute(request).map_err(|failure| failure.error)
     }
 
@@ -324,6 +381,17 @@ impl NotionClient {
             return Err(NotionError::MethodDisabled);
         }
         Ok(())
+    }
+
+    pub(super) fn require_course_setup_origin(&self) -> Result<(), NotionError> {
+        if self.base.origin() == Url::parse(BASE).expect("fixed URL").origin() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.require_mock_writes().is_ok() {
+            return Ok(());
+        }
+        Err(NotionError::MethodDisabled)
     }
 
     #[cfg(feature = "synthetic-https-fixture")]

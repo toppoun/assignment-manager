@@ -122,10 +122,13 @@ pub(super) use native::{
 
 #[cfg(windows)]
 pub(super) use native::trial_client;
+#[cfg(target_os = "macos")]
+pub(super) use native::{
+    course_setup_writer, production_writer, register_production_writer, register_trial,
+    trial_client,
+};
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
 pub(super) use native::{moodle_trial_writer_present, register_moodle_trial_writer};
-#[cfg(target_os = "macos")]
-pub(super) use native::{register_trial, trial_client};
 
 #[cfg(any(windows, target_os = "macos"))]
 mod native {
@@ -200,6 +203,50 @@ mod native {
         client_from_secret(read_secret(&service_name(target), Kind::Notion.code())?)
     }
 
+    #[cfg(target_os = "macos")]
+    const PRODUCTION_WRITER_ACCOUNT: &str = "notion-writer";
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::cli) fn production_writer(
+        target: &str,
+    ) -> Result<NotionClient, CredentialStatus> {
+        client_from_secret(read_secret(
+            &service_name(target),
+            PRODUCTION_WRITER_ACCOUNT,
+        )?)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::cli) fn register_production_writer(
+        config: &Config,
+    ) -> Result<(), super::super::CliError> {
+        use super::super::{CliError, ConfigError, display_production_writer_errors};
+        let target = assignment_manager::notion::live_assignment_read_target(&config.notion, true)
+            .map_err(|_| ConfigError::Invalid)?;
+        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            return Err(CliError::Credential(CredentialStatus::Unavailable));
+        }
+        let service = service_name(&target);
+        let registration = super::macos::Registration::open(&service, PRODUCTION_WRITER_ACCOUNT)
+            .map_err(CliError::Credential)?;
+        confirm_replace(registration.exists()).map_err(CliError::Credential)?;
+        let token =
+            prompt("Notion production writer token (hidden): ").map_err(CliError::Credential)?;
+        let writer = NotionClient::new(&token)
+            .map_err(|_| CliError::Credential(CredentialStatus::Invalid))?;
+        let bot = writer
+            .production_assignment_writer_bot_id(&config.notion)
+            .map_err(|errors| {
+                display_production_writer_errors(&errors);
+                CliError::Credential(CredentialStatus::Invalid)
+            })?;
+        registration
+            .save(token.as_bytes())
+            .map_err(|_| CliError::Credential(CredentialStatus::Unavailable))?;
+        println!("production_writer=stored bot_id={bot} schema=verified");
+        Ok(())
+    }
+
     pub(in crate::cli) fn moodle_url(target: &str) -> Result<Zeroizing<String>, CredentialStatus> {
         let bytes = read_secret(&service_name(target), Kind::Moodle.code())?;
         let url = std::str::from_utf8(&bytes).map_err(|_| CredentialStatus::Invalid)?;
@@ -232,17 +279,33 @@ mod native {
         target: &assignment_manager::notion::TrialTarget,
         role: assignment_manager::notion::TrialRole,
     ) -> (String, &'static str) {
+        trial_item_for(target.assignment_id(), target.bot_id(role), role)
+    }
+
+    fn trial_item_for(
+        assignments_id: &str,
+        bot_id: &str,
+        role: assignment_manager::notion::TrialRole,
+    ) -> (String, &'static str) {
         use assignment_manager::notion::TrialRole;
-        let service = format!(
-            "io.assignment-manager.notion-trial.v1.{}.{}",
-            target.assignment_id(),
-            target.bot_id(role)
-        );
+        let service = format!("io.assignment-manager.notion-trial.v1.{assignments_id}.{bot_id}");
         let account = match role {
             TrialRole::Read => "trial-read",
             TrialRole::Write => "trial-write",
         };
         (service, account)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::cli) fn course_setup_writer(
+        target: &assignment_manager::notion::CourseSetupVerification,
+    ) -> Result<NotionClient, CredentialStatus> {
+        let (service, account) = trial_item_for(
+            target.assignments_id(),
+            target.writer_bot_id(),
+            assignment_manager::notion::TrialRole::Write,
+        );
+        client_from_secret(read_secret(&service, account)?)
     }
 
     pub(in crate::cli) fn trial_client(

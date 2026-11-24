@@ -14,17 +14,18 @@ use super::{
     wire::{Schema, object_id, property_id, uuid},
 };
 
-// Production「大学課題管理」and its course data source. Apply this list to
-// both roles in the pair, independent of the caller's local configuration.
-pub(super) const PRODUCTION_DATA_SOURCES: [&str; 2] = [
-    "41d85934-7e84-811c-a9bb-000b8b646c3f",
-    "41d85934-7e84-815d-bab8-000b9dbad959",
-];
+// Production assignments, courses and rules. Only the first-sync create
+// authorization may write to the production assignments data source.
+pub(super) const PRODUCTION_ASSIGNMENTS: &str = "41d85934-7e84-811c-a9bb-000b8b646c3f";
+pub(super) const PRODUCTION_COURSES: &str = "41d85934-7e84-815d-bab8-000b9dbad959";
+pub(super) const PRODUCTION_RULES: &str = "42285934-7e84-8183-8e04-000ba36d1080";
+pub(super) const PRODUCTION_READER: &str = "41e85934-7e84-818d-ad61-0027bbaa6387";
+pub(super) const PRODUCTION_DATA_SOURCES: [&str; 3] =
+    [PRODUCTION_ASSIGNMENTS, PRODUCTION_COURSES, PRODUCTION_RULES];
 
-const MOODLE_VERIFICATION_ASSIGNMENTS: &str = "41e85934-7e84-817e-b1d2-000b68726503";
+pub(super) const MOODLE_VERIFICATION_ASSIGNMENTS: &str = "41e85934-7e84-817e-b1d2-000b68726503";
 pub(super) const MOODLE_VERIFICATION_COURSES: &str = "41e85934-7e84-81df-902b-000bbece9bf7";
-const MOODLE_VERIFICATION_READER: &str = "41e85934-7e84-81d8-9891-00275cb3050f";
-#[cfg(any(windows, test, feature = "synthetic-https-fixture"))]
+pub(super) const MOODLE_VERIFICATION_READER: &str = "41e85934-7e84-81d8-9891-00275cb3050f";
 pub(super) const MOODLE_VERIFICATION_WRITER: &str = "41e85934-7e84-81b1-a761-002702fbd8d2";
 pub(super) const MOODLE_TRIAL_COURSES: [(&str, &str); 2] = [
     ("照合用の授業", "41e85934-7e84-81c4-8ae6-ec4fcaea84d0"),
@@ -215,18 +216,24 @@ impl NotionClient {
         self.verify_bot(target.bot_id(role))
     }
 
-    fn verify_bot(&self, expected: &str) -> Result<(), NotionError> {
+    pub(super) fn verify_bot(&self, expected: &str) -> Result<(), NotionError> {
+        if self.workspace_bot_id()? != expected {
+            return Err(NotionError::CredentialMismatch);
+        }
+        Ok(())
+    }
+
+    pub(super) fn workspace_bot_id(&self) -> Result<String, NotionError> {
         let user: Value = self.read(|| self.request(Method::GET, "/v1/users/me", &[]))?;
         let owner = &user["bot"]["owner"];
         if user["object"] != "user"
             || user["type"] != "bot"
             || owner["type"] != "workspace"
             || owner["workspace"] != true
-            || object_id(&user, "id").as_deref() != Some(expected)
         {
             return Err(NotionError::CredentialMismatch);
         }
-        Ok(())
+        object_id(&user, "id").ok_or(NotionError::CredentialMismatch)
     }
 }
 
@@ -276,6 +283,7 @@ impl TrialAssignment {
                 },
                 UniversitySource::Moodle,
                 mappings.first().map(|mapping| &mapping.course_key),
+                None,
             )
             .map_err(|_| NotionError::Configuration)?;
         Ok((input, mappings))

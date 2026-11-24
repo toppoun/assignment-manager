@@ -6,7 +6,8 @@ use std::{
 use crate::{domain::Deadline, import::ExternalRecordKey};
 use serde::{Deserialize, Serialize};
 
-use super::wire::uuid;
+use super::course_rules::CourseRules;
+use super::wire::{notion_deadline_matches, uuid};
 use super::{SyncAssignment, SyncInput, SyncKey, UniversitySource};
 
 /// The read projection needed to compare source-owned properties. A row with
@@ -82,6 +83,13 @@ pub enum DeferredReason {
     EarlierAttempt,
     /// The run has no current candidate. Includes failed, skipped, filtered and absent records.
     NoValidatedCandidate,
+    CourseUnconfigured,
+    CourseRuleDuplicate,
+    CourseRuleInvalid,
+    CourseRuleInvalidRelation,
+    CourseTermUnverified,
+    CourseRelationMismatch,
+    CourseExcluded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +107,7 @@ pub enum PlanAction {
     },
     Conflict(ConflictReason),
     Deferred(DeferredReason),
+    Excluded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +125,54 @@ pub fn plan_sync(
     input: &SyncInput,
     snapshot: NotionSnapshot<'_>,
     course_mappings: &[CourseMapping],
+) -> Vec<PlannedAssignment> {
+    let mut pages_by_course = HashMap::<_, BTreeSet<_>>::new();
+    for mapping in course_mappings {
+        pages_by_course
+            .entry(&mapping.course_key)
+            .or_default()
+            .insert(uuid(&mapping.page_id));
+    }
+    plan_assignments(input, snapshot, false, |assignment| {
+        match assignment
+            .course_key
+            .as_ref()
+            .and_then(|key| pages_by_course.get(key))
+        {
+            None => CourseResolution::Unmapped,
+            Some(pages) => match pages.first().filter(|_| pages.len() == 1) {
+                Some(Some(id)) => CourseResolution::Mapped(id),
+                _ => CourseResolution::AmbiguousLegacyMapping,
+            },
+        }
+    })
+}
+
+pub(super) fn plan_sync_with_rules(
+    input: &SyncInput,
+    snapshot: NotionSnapshot<'_>,
+    rules: &CourseRules,
+) -> Vec<PlannedAssignment> {
+    plan_assignments(input, snapshot, true, |assignment| {
+        match rules.resolve(assignment) {
+            Ok(id) => CourseResolution::Mapped(id),
+            Err(reason) => CourseResolution::Deferred(reason),
+        }
+    })
+}
+
+enum CourseResolution<'a> {
+    Unmapped,
+    Mapped(&'a str),
+    AmbiguousLegacyMapping,
+    Deferred(DeferredReason),
+}
+
+fn plan_assignments<'a>(
+    input: &SyncInput,
+    snapshot: NotionSnapshot<'_>,
+    use_course_rules: bool,
+    resolve_course: impl Fn(&SyncAssignment) -> CourseResolution<'a>,
 ) -> Vec<PlannedAssignment> {
     let mut keys: BTreeSet<_> = input
         .assignments
@@ -146,14 +203,6 @@ pub fn plan_sync(
         }
     }
 
-    let mut pages_by_course = HashMap::<_, BTreeSet<_>>::new();
-    for mapping in course_mappings {
-        pages_by_course
-            .entry(&mapping.course_key)
-            .or_default()
-            .insert(uuid(&mapping.page_id));
-    }
-
     keys.into_iter()
         .map(|key| {
             let (action, course_relation_mismatch) = plan_assignment(
@@ -161,7 +210,8 @@ pub fn plan_sync(
                 input.earlier_attempt.contains(key),
                 pages_by_key.get(key).map_or(&[], Vec::as_slice),
                 &repeated_page_ids,
-                &pages_by_course,
+                use_course_rules,
+                &resolve_course,
             );
             PlannedAssignment {
                 key: key.clone(),
@@ -172,12 +222,13 @@ pub fn plan_sync(
         .collect()
 }
 
-fn plan_assignment(
+fn plan_assignment<'a>(
     assignment: Option<&SyncAssignment>,
     earlier_attempt: bool,
     matches: &[&NotionAssignment],
     repeated_page_ids: &HashSet<&str>,
-    pages_by_course: &HashMap<&ExternalRecordKey, BTreeSet<Option<String>>>,
+    use_course_rules: bool,
+    resolve_course: impl Fn(&SyncAssignment) -> CourseResolution<'a>,
 ) -> (PlanAction, bool) {
     let page = match matches {
         [] => None,
@@ -209,27 +260,25 @@ fn plan_assignment(
         return (PlanAction::Deferred(reason), false);
     };
 
-    let course_page_id = match assignment
-        .course_key
-        .as_ref()
-        .and_then(|key| pages_by_course.get(key))
-    {
-        None => None,
-        Some(pages) => {
-            let Some(Some(id)) = pages.first().filter(|_| pages.len() == 1) else {
-                return (
-                    PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping),
-                    false,
-                );
-            };
-            Some(id)
+    let course_page_id = match resolve_course(assignment) {
+        CourseResolution::Unmapped => None,
+        CourseResolution::Mapped(id) => Some(id),
+        CourseResolution::AmbiguousLegacyMapping => {
+            return (
+                PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping),
+                false,
+            );
         }
+        CourseResolution::Deferred(DeferredReason::CourseExcluded) => {
+            return (PlanAction::Excluded, false);
+        }
+        CourseResolution::Deferred(reason) => return (PlanAction::Deferred(reason), false),
     };
     let Some(page) = page else {
         return (
             PlanAction::Create {
                 assignment: assignment.clone(),
-                course_page_id: course_page_id.cloned(),
+                course_page_id: course_page_id.map(str::to_owned),
             },
             false,
         );
@@ -237,14 +286,25 @@ fn plan_assignment(
 
     let (course_page_id, course_relation_mismatch) =
         match (course_page_id, page.course_page_ids.as_slice()) {
-            (id, []) => (id.cloned(), false),
-            (Some(id), [current]) if uuid(current).as_ref() == Some(id) => (None, false),
+            (id, []) => (id.map(str::to_owned), false),
+            (Some(id), [current]) if uuid(current).as_deref() == Some(id) => (None, false),
             (id, _) => (None, id.is_some()),
         };
+    if course_relation_mismatch && use_course_rules {
+        return (
+            PlanAction::Deferred(DeferredReason::CourseRelationMismatch),
+            true,
+        );
+    }
+    let deadline_matches = if use_course_rules {
+        notion_deadline_matches(&page.deadline, &assignment.deadline)
+    } else {
+        page.deadline == assignment.deadline
+    };
     let patch = AssignmentPatch {
         source: (page.source != Some(assignment.source)).then_some(assignment.source),
         title: (page.title != assignment.title).then(|| assignment.title.clone()),
-        deadline: (page.deadline != assignment.deadline).then(|| assignment.deadline.clone()),
+        deadline: (!deadline_matches).then(|| assignment.deadline.clone()),
         course_page_id,
     };
     let action = if patch == AssignmentPatch::default() {

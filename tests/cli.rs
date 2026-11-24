@@ -119,6 +119,114 @@ fn config(temp: &tempfile::TempDir) {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn live_course_setup_requires_read_flags_and_rejects_apply_before_opening_local_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = [
+        "--config",
+        "missing.json",
+        "sync",
+        "--setup-courses",
+        "--term",
+        "2026:2",
+    ];
+    for flags in [
+        &["--allow-university-read"][..],
+        &["--allow-notion-read"][..],
+        &["--allow-university-read", "--allow-notion-read", "--apply"][..],
+        &[
+            "--allow-university-read",
+            "--allow-notion-read",
+            "--apply",
+            "--allow-notion-write",
+        ][..],
+    ] {
+        let result = call(&temp, &[prefix.as_slice(), flags].concat());
+        assert_eq!(result.status.code(), Some(2));
+        assert!(stderr(&result).contains("invalid_arguments"));
+    }
+    let read = ["--allow-university-read", "--allow-notion-read"];
+    let result = call(&temp, &[prefix.as_slice(), &read].concat());
+    assert_eq!(result.status.code(), Some(2));
+    assert!(stderr(&result).contains("configuration_missing"));
+
+    let config_path = temp.path().join("verification.json");
+    fs::write(&config_path, serde_json::json!({
+        "notion":{
+            "assignments_data_source_id":TARGET,
+            "courses_data_source_id":"00000000-0000-4000-8000-000000000002",
+            "properties":{"title":"title","deadline":"date","course":"course","submission_url":"url","sync_key":"sync","source":"source"},
+            "course_rules":{
+                "data_source_id":"00000000-0000-4000-8000-000000000003",
+                "source":"origin","scope":"scope","external_id":"external","term":"term","course":"destination","status":"status",
+                "course_term":"course-term","setup":{"group_id":"group"}
+            }
+        },
+        "webclass":true
+    }).to_string()).unwrap();
+    let mut prefix = prefix;
+    prefix[1] = config_path.to_str().unwrap();
+    let result = call(&temp, &[prefix.as_slice(), &read].concat());
+    assert_eq!(result.status.code(), Some(2));
+    assert!(stdout(&result).contains("moodle=disabled"));
+    assert!(stderr(&result).contains("source_disabled"));
+    let id = "a".repeat(64);
+    let apply = [
+        "--allow-university-read",
+        "--allow-notion-read",
+        "--apply",
+        "--allow-notion-write",
+        "--expect-plan",
+        &id,
+    ];
+    let result = call(&temp, &[prefix.as_slice(), &apply].concat());
+    assert_eq!(result.status.code(), Some(2));
+    assert!(stdout(&result).contains("course_setup diagnostic=request_not_allowed"));
+    assert!(!local_root(&temp).exists());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn live_dry_run_requires_both_read_flags_and_rejects_other_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("other-target.json");
+    fs::write(&path, serde_json::json!({
+        "notion": {
+            "assignments_data_source_id": TARGET,
+            "courses_data_source_id": "00000000-0000-4000-8000-000000000002",
+            "properties": {"title":"title","deadline":"date","course":"course","submission_url":"url","sync_key":"sync","source":"source"},
+            "course_rules": {
+                "data_source_id": "00000000-0000-4000-8000-000000000003",
+                "source":"origin","scope":"scope","external_id":"external","term":"term","course":"destination","status":"status",
+                "course_term":"course-term","setup":{"group_id":"group"}
+            }
+        },
+        "webclass": true
+    }).to_string()).unwrap();
+    let prefix = ["--config", path.to_str().unwrap(), "sync", "--dry-run"];
+    for flags in [
+        &["--allow-university-read"][..],
+        &["--allow-notion-read"][..],
+        &["--allow-university-read", "--allow-notion-read", "--apply"][..],
+    ] {
+        let result = call(&temp, &[prefix.as_slice(), flags].concat());
+        assert_eq!(result.status.code(), Some(2));
+        assert!(stderr(&result).contains("invalid_arguments"));
+    }
+    let result = call(
+        &temp,
+        &[
+            prefix.as_slice(),
+            &["--allow-university-read", "--allow-notion-read"],
+        ]
+        .concat(),
+    );
+    assert_eq!(result.status.code(), Some(2));
+    assert!(stdout(&result).contains("verification_target diagnostic=request_not_allowed"));
+    assert!(!local_root(&temp).exists());
+}
+
+#[test]
 fn invalid_arguments_and_configuration_are_reported_without_echoing_secrets() {
     let temp = tempfile::tempdir().unwrap();
     let output = call(&temp, &["sync", "--token", "synthetic-secret-marker"]);
@@ -582,6 +690,30 @@ fn cli_fixture_apply_creates_then_resyncs_and_leaves_existing_state_alone() {
 
 #[cfg(feature = "synthetic-https-fixture")]
 #[test]
+fn cli_course_setup_previews_then_applies_only_to_the_loopback_fixture() {
+    let temp = tempfile::tempdir().unwrap();
+    let args = ["sync", "--setup-courses", "--fixture", "--term", "2026:2"];
+    let preview = call(&temp, &args);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    assert!(stdout(&preview).contains(
+        "pass=preview create_courses=12 create_rules=18 reuse_courses=0 reuse_rules=0 held=0"
+    ));
+    let apply = call(&temp, &[args.as_slice(), &["--apply"]].concat());
+    assert!(apply.status.success(), "{}", stderr(&apply));
+    assert!(stdout(&apply).contains("pass=initial create_courses=12 create_rules=18"));
+    assert!(stdout(&apply).contains(
+        "pass=repeat create_courses=0 create_rules=0 reuse_courses=0 reuse_rules=18 held=0"
+    ));
+    assert!(!local_root(&temp).exists());
+    let real = call(
+        &temp,
+        &["sync", "--setup-courses", "--term", "2026:2", "--apply"],
+    );
+    assert_eq!(real.status.code(), Some(2));
+}
+
+#[cfg(feature = "synthetic-https-fixture")]
+#[test]
 fn cli_fixture_exercises_both_sources_and_never_changes_the_state_database() {
     use assignment_manager::notion::{SyncKey, fixture, state::StateStore};
     let temp = tempfile::tempdir().unwrap();
@@ -593,6 +725,7 @@ fn cli_fixture_exercises_both_sources_and_never_changes_the_state_database() {
     for line in [
         "moodle=success",
         "webclass=success",
+        "course_rules=complete rows=4 confirmed=4",
         "Create=10 Update=0 Unchanged=0 Conflict=0 Deferred=0",
         "course_relation_mismatch=0",
         "result=success",

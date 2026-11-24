@@ -47,6 +47,7 @@ fn data(count: usize) -> (SyncInput, Vec<CourseMapping>) {
                 &row,
                 UniversitySource::Moodle,
                 Some(&entries[index % entries.len()].course_key),
+                None,
             )
             .unwrap();
     }

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat};
 use reqwest::Method;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::domain::Deadline;
@@ -11,7 +11,7 @@ use super::{
     NotionAssignment, NotionError, PlanAction, PlannedAssignment, SyncKey, UniversitySource,
 };
 
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// Property IDs returned by the API for the preconfigured assignment schema.
 /// Renaming a column does not change these IDs.
@@ -38,9 +38,64 @@ pub struct NotionTarget {
     pub assignments_data_source_id: String,
     pub courses_data_source_id: String,
     pub properties: NotionPropertyIds,
+    #[serde(default)]
+    pub course_rules: Option<CourseRulesTarget>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CourseRulesTarget {
+    pub data_source_id: String,
+    /// Academic term property on the existing courses data source.
+    pub course_term: String,
+    pub source: String,
+    pub scope: String,
+    pub external_id: String,
+    pub term: String,
+    pub course: String,
+    pub status: String,
+    #[serde(default)]
+    pub setup: Option<CourseSetupProperties>,
+}
+
+/// Properties on the existing courses data source used for course setup.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CourseSetupProperties {
+    pub group_id: String,
+    pub year: Option<String>,
+    pub day: Option<String>,
+    pub period: Option<String>,
+}
+
+impl CourseSetupProperties {
+    fn fields(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        [
+            (Some(self.group_id.as_str()), "rich_text"),
+            (self.year.as_deref(), "number"),
+            (self.day.as_deref(), "rich_text"),
+            (self.period.as_deref(), "rich_text"),
+        ]
+        .into_iter()
+        .filter_map(|(id, kind)| id.map(|id| (id, kind)))
+    }
+}
+
+impl CourseRulesTarget {
+    pub(super) fn fields(&self) -> [(&str, &'static str); 7] {
+        [
+            ("title", "title"),
+            (&self.source, "select"),
+            (&self.scope, "rich_text"),
+            (&self.external_id, "rich_text"),
+            (&self.term, "rich_text"),
+            (&self.course, "relation"),
+            (&self.status, "select"),
+        ]
+    }
+}
+
+#[derive(PartialEq, Eq, Serialize)]
 pub(super) struct Schema {
     pub assignments_id: String,
     pub assignments_database: String,
@@ -151,6 +206,30 @@ impl NotionTarget {
         if assignments == courses {
             return Err(NotionError::Configuration);
         }
+        if let Some(rules) = &self.course_rules {
+            let id = uuid(&rules.data_source_id).ok_or(NotionError::Configuration)?;
+            let mut seen = HashSet::new();
+            if id == assignments
+                || id == courses
+                || rules.course_term == "title"
+                || !property_id(&rules.course_term)
+                || rules
+                    .fields()
+                    .into_iter()
+                    .any(|(id, _)| !property_id(id) || !seen.insert(id))
+            {
+                return Err(NotionError::Configuration);
+            }
+            if let Some(setup) = &rules.setup {
+                let mut seen = HashSet::from(["title", rules.course_term.as_str()]);
+                if setup
+                    .fields()
+                    .any(|(id, _)| !property_id(id) || !seen.insert(id))
+                {
+                    return Err(NotionError::Configuration);
+                }
+            }
+        }
         Ok((assignments, courses))
     }
 }
@@ -170,7 +249,11 @@ pub(super) fn data_source_parent(data: &Value, id: &str) -> Result<String, Notio
     object_id(&data["parent"], "database_id").ok_or(NotionError::SchemaMismatch)
 }
 
-fn property<'a>(properties: &'a Map<String, Value>, id: &str, kind: &str) -> Option<&'a Value> {
+pub(super) fn property<'a>(
+    properties: &'a Map<String, Value>,
+    id: &str,
+    kind: &str,
+) -> Option<&'a Value> {
     let mut matches = properties
         .values()
         .filter(|prop| prop["id"].as_str() == Some(id));
@@ -188,12 +271,19 @@ pub(super) fn relation_targets(relation: &Value, courses: &str, database: &str) 
 }
 
 pub(super) fn source_options(select: &Value) -> Result<(String, String), NotionError> {
+    let [moodle, webclass] = select_option_ids(select, ["Moodle", "WebClass"])?;
+    Ok((moodle.to_owned(), webclass.to_owned()))
+}
+
+pub(super) fn select_option_ids<'a, const N: usize>(
+    select: &'a Value,
+    names: [&str; N],
+) -> Result<[&'a str; N], NotionError> {
     let options = select["options"]
         .as_array()
         .ok_or(NotionError::SchemaMismatch)?;
     let mut option_ids = HashSet::new();
-    let mut moodle = None;
-    let mut webclass = None;
+    let mut required = [""; N];
     for option in options {
         let id = option["id"]
             .as_str()
@@ -202,16 +292,21 @@ pub(super) fn source_options(select: &Value) -> Result<(String, String), NotionE
         if !option_ids.insert(id) {
             return Err(NotionError::SchemaMismatch);
         }
-        let slot = match option["name"].as_str() {
-            Some("Moodle") => &mut moodle,
-            Some("WebClass") => &mut webclass,
-            _ => continue,
-        };
-        if slot.replace(id.to_owned()).is_some() {
-            return Err(NotionError::SchemaMismatch);
+        if let Some(index) = names
+            .iter()
+            .position(|name| Some(*name) == option["name"].as_str())
+        {
+            if !required[index].is_empty() {
+                return Err(NotionError::SchemaMismatch);
+            }
+            required[index] = id;
         }
     }
-    moodle.zip(webclass).ok_or(NotionError::SchemaMismatch)
+    required
+        .iter()
+        .all(|id| !id.is_empty())
+        .then_some(required)
+        .ok_or(NotionError::SchemaMismatch)
 }
 
 pub(super) fn page_relations(page: &Value, id: &str) -> Result<(Vec<String>, bool), NotionError> {
@@ -239,6 +334,23 @@ impl Schema {
         let (assignments_id, courses_id) = ids;
         let assignments_database = data_source_parent(data, &assignments_id)?;
         let courses_database = data_source_parent(related, &courses_id)?;
+        if let Some(rules) = &target.course_rules {
+            let properties = related["properties"]
+                .as_object()
+                .ok_or(NotionError::SchemaMismatch)?;
+            if !property(properties, &rules.course_term, "rich_text")
+                .is_some_and(|prop| prop["rich_text"].is_object())
+            {
+                return Err(NotionError::SchemaMismatch);
+            }
+            if let Some(setup) = &rules.setup {
+                for (id, kind) in [("title", "title")].into_iter().chain(setup.fields()) {
+                    if !property(properties, id, kind).is_some_and(|prop| prop[kind].is_object()) {
+                        return Err(NotionError::SchemaMismatch);
+                    }
+                }
+            }
+        }
         let properties = data["properties"]
             .as_object()
             .ok_or(NotionError::SchemaMismatch)?;
@@ -466,11 +578,22 @@ fn read_deadline(value: &Value) -> Result<Option<Deadline>, NotionError> {
     Ok(Some(Deadline::DateTime(instant.to_utc())))
 }
 
+/// The Notion Date property may round a time down to minute precision.
+pub(super) fn notion_deadline_matches(
+    stored: &Option<Deadline>,
+    source: &Option<Deadline>,
+) -> bool {
+    stored == source
+        || matches!((stored, source), (Some(Deadline::DateTime(stored)), Some(Deadline::DateTime(source)))
+            if stored.timestamp_subsec_nanos() == 0
+                && stored.timestamp() == source.timestamp().div_euclid(60) * 60)
+}
+
 pub(super) fn relation_id(value: &Value) -> Result<String, NotionError> {
     object_id(value, "id").ok_or(NotionError::InvalidResponse)
 }
 
-fn text_item(text: &str) -> Value {
+pub(super) fn text_item(text: &str) -> Value {
     json!({"type":"text", "text":{"content":text}})
 }
 
@@ -492,7 +615,7 @@ fn date_value(deadline: Option<&Deadline>) -> Value {
     json!({"date":date})
 }
 
-fn relation_value(id: &str) -> Result<Value, NotionError> {
+pub(super) fn relation_value(id: &str) -> Result<Value, NotionError> {
     let id = uuid(id).ok_or(NotionError::InvalidWrite)?;
     Ok(json!({"relation":[{"id":id}]}))
 }
@@ -508,6 +631,16 @@ pub struct PreparedWrite {
 }
 
 impl PreparedWrite {
+    pub(super) fn create_page(target_id: &str, key: SyncKey, properties: Value) -> Self {
+        Self {
+            target_id: target_id.to_owned(),
+            key,
+            method: Method::POST,
+            path: "/v1/pages".into(),
+            body: json!({"parent":{"type":"data_source_id","data_source_id":target_id},"properties":properties}),
+        }
+    }
+
     pub fn key(&self) -> &SyncKey {
         &self.key
     }

@@ -200,7 +200,7 @@ impl NotionClient {
             .iter()
             .map(|(key, page)| (page.as_str(), key.id.as_str()))
             .collect();
-        let course_pages = self.query_course_pages(&schema, |id, page| {
+        let course_pages = self.query_course_pages(&schema, &["title"], |id, page| {
             if verify_titles
                 && let Some(expected) = expected_titles.get(id)
                 && text(page_property(page, "title", "title")?)? != *expected

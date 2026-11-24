@@ -429,8 +429,11 @@ export async function runBrowser(config, fixture, selectContents, signal) {
         if (reading || isGuardedApi(url, config)) {
           allowed = armed && (resourceType === "XHR" || resourceType === "Fetch") && method === "GET" &&
             session === armed.session && frameId === armed.frame.id && mainFrame === armed.frame &&
-            url.href === config.lms + armed.target && requests[armed.kind] === 0;
-          if (allowed) requests[armed.kind]++;
+            url.href === config.lms + armed.target && !armed.used;
+          if (allowed) {
+            armed.used = true;
+            requests[armed.kind]++;
+          }
         } else if (method !== "GET" && method !== "HEAD") {
           // A CSSO form can include a query on this fixed endpoint.
           allowed = document && method === "POST" && url.pathname === config.ssoPostPath;
@@ -560,12 +563,32 @@ export async function runBrowser(config, fixture, selectContents, signal) {
           if (stopped || requests.course !== 1 || candidate.frame !== frame) return { reason: "auth_expired" };
           const target = await selectContents(courses.body);
           if (target === null) return { reason: "course_selection_stopped" };
-          const url = parseUrl(config.lms + target);
-          if (url?.origin !== config.lms || url.pathname !== config.contentsPath || url.hash ||
-              url.searchParams.size !== 1 || !url.searchParams.get("group_id")) {
+          const batch = Array.isArray(target);
+          const targets = batch ? target : [target];
+          const groups = new Set();
+          if (targets.length > 128 || !targets.every((path) => {
+            if (typeof path !== "string") return false;
+            const url = parseUrl(config.lms + path);
+            if (url?.origin !== config.lms || url.pathname !== config.contentsPath || url.hash ||
+                url.searchParams.size !== 1 || !url.searchParams.get("group_id")) return false;
+            const group = url.searchParams.get("group_id");
+            if (groups.has(group)) return false;
+            groups.add(group);
+            return true;
+          })) {
             return { reason: "browser_protocol" };
           }
-          return read("contents", target, config.lms + config.dashboardPath);
+          if (!batch) return read("contents", target, config.lms + config.dashboardPath);
+          const bodies = [];
+          let bytes = 0;
+          for (const path of targets) {
+            const reply = await read("contents", path, config.lms + config.dashboardPath);
+            if (reply.reason !== "ok") return reply;
+            bytes += Buffer.byteLength(reply.body, "utf8");
+            if (bytes > config.maxBytes) return { reason: "contents_response_limit" };
+            bodies.push(reply.body);
+          }
+          return { reason: "ok", bodies };
         }
         await delay(250);
       }

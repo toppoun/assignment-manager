@@ -1,5 +1,8 @@
 //! Fixed loopback Notion fixture for the explicit CLI fixture build.
 
+mod course_setup;
+pub use course_setup::{CourseSetupCounts, exercise_course_setup};
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream},
@@ -21,8 +24,8 @@ use crate::{
 
 pub use super::apply::{ApplyError, ApplyReport};
 use super::{
-    CourseMapping, NOTION_VERSION, NotionClient, NotionError, NotionPropertyIds, NotionTarget,
-    SyncInput, VerificationTarget,
+    CourseMapping, CourseRulesTarget, NOTION_VERSION, NotionClient, NotionError, NotionPropertyIds,
+    NotionTarget, SyncInput, VerificationTarget,
     state::{StateError, StateStore, TargetLock},
 };
 
@@ -30,6 +33,14 @@ const ASSIGNMENTS: &str = "00000000-0000-4000-8000-000000000101";
 const ASSIGNMENTS_DB: &str = "00000000-0000-4000-8000-000000000102";
 const COURSES: &str = "00000000-0000-4000-8000-000000000103";
 const COURSES_DB: &str = "00000000-0000-4000-8000-000000000104";
+const RULES: &str = "00000000-0000-4000-8000-000000000110";
+const RULES_DB: &str = "00000000-0000-4000-8000-000000000111";
+const HOPPII_GROUPS: [&str; 3] = [
+    "fixture-course-001",
+    "fixture-course-002",
+    "fixture-course-003",
+];
+const FIXTURE_TERM: &str = "2026:2";
 const READER: &str = "00000000-0000-4000-8000-000000000105";
 const MOODLE_COURSES: [(&str, &str); 2] = [
     ("照合用の授業", "00000000-0000-4000-8000-000000000106"),
@@ -42,6 +53,7 @@ pub fn target() -> NotionTarget {
     NotionTarget {
         assignments_data_source_id: ASSIGNMENTS.into(),
         courses_data_source_id: COURSES.into(),
+        course_rules: None,
         properties: NotionPropertyIds {
             title: "title".into(),
             deadline: "due".into(),
@@ -51,6 +63,22 @@ pub fn target() -> NotionTarget {
             source: "source".into(),
         },
     }
+}
+
+pub fn course_rules_target() -> NotionTarget {
+    let mut target = target();
+    target.course_rules = Some(CourseRulesTarget {
+        data_source_id: RULES.into(),
+        course_term: "term".into(),
+        source: "source".into(),
+        scope: "scope".into(),
+        external_id: "external".into(),
+        term: "term".into(),
+        course: "course".into(),
+        status: "status".into(),
+        setup: None,
+    });
+    target
 }
 
 pub fn verification_target() -> VerificationTarget {
@@ -193,6 +221,35 @@ fn university_keys_reconcile_the_same_notion_pages_with_independent_state() {
 }
 
 fn start_server(writable: bool) -> std::io::Result<(NotionClient, FixtureServer)> {
+    start_server_with_setup(writable, Vec::new(), None)
+}
+
+#[derive(Default)]
+struct SetupFixture {
+    courses: Vec<Value>,
+    rules: Vec<Value>,
+    #[cfg(test)]
+    fail_next: Option<SetupFault>,
+    #[cfg(test)]
+    verification: bool,
+    #[cfg(test)]
+    late_rule: Option<Value>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum SetupFault {
+    RejectRule,
+    DropCourseBeforeCommit,
+    DropCourseResponse,
+    DropRuleResponse,
+}
+
+fn start_server_with_setup(
+    writable: bool,
+    mut pages: Vec<Value>,
+    mut setup: Option<SetupFixture>,
+) -> std::io::Result<(NotionClient, FixtureServer)> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     listener.set_nonblocking(true)?;
     let client = NotionClient::for_mock(listener.local_addr()?, TOKEN, Duration::from_secs(3))
@@ -202,11 +259,10 @@ fn start_server(writable: bool) -> std::io::Result<(NotionClient, FixtureServer)
     let worker = thread::Builder::new()
         .name("notion-fixture".into())
         .spawn(move || {
-            let mut pages = Vec::new();
             while !done.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = handle(stream, &mut pages, writable);
+                        let _ = handle(stream, &mut pages, writable, setup.as_mut());
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5))
@@ -233,7 +289,12 @@ impl Drop for FixtureServer {
     }
 }
 
-fn handle(mut stream: TcpStream, pages: &mut Vec<Value>, writable: bool) -> std::io::Result<()> {
+fn handle(
+    mut stream: TcpStream,
+    pages: &mut Vec<Value>,
+    writable: bool,
+    setup: Option<&mut SetupFixture>,
+) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -276,13 +337,24 @@ fn handle(mut stream: TcpStream, pages: &mut Vec<Value>, writable: bool) -> std:
     }
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload)?;
+    let [assignments_id, courses_id, rules_id] = setup
+        .as_ref()
+        .map_or([ASSIGNMENTS, COURSES, RULES], |setup| setup.source_ids());
+    #[cfg(test)]
+    let reader_id = if setup.as_ref().is_some_and(|setup| setup.verification) {
+        super::trial::MOODLE_VERIFICATION_WRITER
+    } else {
+        READER
+    };
+    #[cfg(not(test))]
+    let reader_id = READER;
 
     let (status, body) = if !auth || !version {
         (401, json!({"code":"unauthorized"}))
     } else if method == "GET" && path == "/v1/users/me" {
         (
             200,
-            json!({"object":"user","id":READER,"type":"bot","bot":{"owner":{
+            json!({"object":"user","id":reader_id,"type":"bot","bot":{"owner":{
                 "type":"workspace","workspace":true
             }}}),
         )
@@ -296,17 +368,17 @@ fn handle(mut stream: TcpStream, pages: &mut Vec<Value>, writable: bool) -> std:
                 "type":"data_source_id","data_source_id":COURSES,"database_id":COURSES_DB
             }}),
         )
-    } else if method == "GET" && path.strip_prefix("/v1/data_sources/") == Some(ASSIGNMENTS) {
+    } else if method == "GET" && path.strip_prefix("/v1/data_sources/") == Some(assignments_id) {
         (
             200,
             data_source(
-                ASSIGNMENTS,
+                assignments_id,
                 ASSIGNMENTS_DB,
                 json!({
                     "Title":{"id":"title","type":"title","title":{}},
                     "Deadline":{"id":"due","type":"date","date":{}},
                     "Course":{"id":"course","type":"relation","relation":{
-                        "type":"single_property","database_id":COURSES_DB,"data_source_id":COURSES
+                        "type":"single_property","database_id":COURSES_DB,"data_source_id":courses_id
                     }},
                     "Submission":{"id":"url","type":"url","url":{}},
                     "Sync key":{"id":"sync","type":"rich_text","rich_text":{}},
@@ -322,13 +394,93 @@ fn handle(mut stream: TcpStream, pages: &mut Vec<Value>, writable: bool) -> std:
                 }),
             ),
         )
-    } else if method == "GET" && path.strip_prefix("/v1/data_sources/") == Some(COURSES) {
-        (200, data_source(COURSES, COURSES_DB, json!({})))
+    } else if method == "GET" && path.strip_prefix("/v1/data_sources/") == Some(courses_id) {
+        (
+            200,
+            data_source(
+                courses_id,
+                COURSES_DB,
+                json!({
+                    "Title":{"id":"title","type":"title","title":{}},
+                    "Term":{"id":"term","type":"rich_text","rich_text":{}},
+                    "Group":{"id":"group","type":"rich_text","rich_text":{}},
+                    "Year":{"id":"year","type":"number","number":{}},
+                    "Day":{"id":"day","type":"rich_text","rich_text":{}},
+                    "Period":{"id":"period","type":"rich_text","rich_text":{}}
+                }),
+            ),
+        )
+    } else if method == "GET" && path.strip_prefix("/v1/data_sources/") == Some(rules_id) {
+        (
+            200,
+            data_source(
+                rules_id,
+                RULES_DB,
+                json!({
+                    "Title":{"id":"title","type":"title","title":{}},
+                    "Source":{"id":"source","type":"select","select":{"options":[
+                        {"id":"hoppii","name":"HOPPII"},{"id":"moodle","name":"Moodle"}
+                    ]}},
+                    "Scope":{"id":"scope","type":"rich_text","rich_text":{}},
+                    "External ID":{"id":"external","type":"rich_text","rich_text":{}},
+                    "Term":{"id":"term","type":"rich_text","rich_text":{}},
+                    "Course":{"id":"course","type":"relation","relation":{
+                        "type":"single_property","data_source_id":courses_id,"database_id":COURSES_DB
+                    }},
+                    "Status":{"id":"status","type":"select","select":{"options":[
+                        {"id":"unset","name":"未設定"},{"id":"confirmed","name":"確定"},{"id":"excluded","name":"対象外"}
+                    ]}}
+                }),
+            ),
+        )
+    } else if method == "POST" && path == format!("/v1/data_sources/{rules_id}/query") {
+        if let Some(setup) = setup {
+            #[cfg(test)]
+            if setup.late_rule.is_some() {
+                let query: Value = serde_json::from_slice(&payload)?;
+                if query.get("filter").is_some()
+                    && let Some(rule) = setup.late_rule.take()
+                {
+                    setup.rules.push(rule);
+                }
+            }
+            (200, fixture_list(&setup.rules))
+        } else {
+            let groups = HOPPII_GROUPS.into_iter().enumerate().map(|(index, group)| {
+                rule_page(
+                    index,
+                    "hoppii",
+                    crate::import::DEFAULT_COURSE_SOURCE_SCOPE,
+                    group,
+                    index,
+                )
+            });
+            let rules: Vec<_> = groups
+                .chain([rule_page(3, "moodle", MOODLE_SCOPE, "Java2-2026", 0)])
+                .collect();
+            (200, fixture_list(&rules))
+        }
+    } else if method == "POST" && path == format!("/v1/data_sources/{courses_id}/query") {
+        if let Some(setup) = setup {
+            (200, fixture_list(&setup.courses))
+        } else {
+            let courses: Vec<_> = (0..HOPPII_GROUPS.len())
+                .map(|index| {
+                    fixture_page(
+                        0x120 + index,
+                        COURSES,
+                        COURSES_DB,
+                        json!({"Term": rich("term", FIXTURE_TERM)}),
+                    )
+                })
+                .collect();
+            (200, fixture_list(&courses))
+        }
     } else if method == "POST"
         && path
             .strip_prefix("/v1/data_sources/")
             .and_then(|suffix| suffix.strip_suffix("/query"))
-            == Some(ASSIGNMENTS)
+            == Some(assignments_id)
     {
         let query: Value = serde_json::from_slice(&payload)?;
         let key = query["filter"]["rich_text"]["equals"].as_str();
@@ -346,7 +498,12 @@ fn handle(mut stream: TcpStream, pages: &mut Vec<Value>, writable: bool) -> std:
         )
     } else if writable && method == "POST" && path == "/v1/pages" {
         let request: Value = serde_json::from_slice(&payload)?;
-        if request["parent"]["data_source_id"] != ASSIGNMENTS {
+        if let Some(setup) = setup {
+            let Some(response) = setup.create(&request) else {
+                return Ok(()); // Simulate a committed POST whose response was lost.
+            };
+            response
+        } else if request["parent"]["data_source_id"] != ASSIGNMENTS {
             (400, json!({"code":"validation_error"}))
         } else {
             let page = created_page(&request, pages.len());
@@ -361,6 +518,104 @@ fn handle(mut stream: TcpStream, pages: &mut Vec<Value>, writable: bool) -> std:
         stream,
         "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
+    )
+}
+
+impl SetupFixture {
+    fn source_ids(&self) -> [&'static str; 3] {
+        #[cfg(test)]
+        if self.verification {
+            return [
+                super::trial::MOODLE_VERIFICATION_ASSIGNMENTS,
+                super::trial::MOODLE_VERIFICATION_COURSES,
+                super::course_setup::VERIFICATION_RULES,
+            ];
+        }
+        [ASSIGNMENTS, COURSES, RULES]
+    }
+
+    fn create(&mut self, request: &Value) -> Option<(u16, Value)> {
+        let target = request["parent"]["data_source_id"].as_str();
+        let [_, courses, rules] = self.source_ids();
+        #[cfg(test)]
+        let drop_response = match (&self.fail_next, target) {
+            (Some(SetupFault::RejectRule), id) if id == Some(rules) => {
+                self.fail_next = None;
+                return Some((400, json!({"code":"validation_error"})));
+            }
+            (Some(SetupFault::DropCourseBeforeCommit), id) if id == Some(courses) => {
+                self.fail_next = None;
+                return None;
+            }
+            (Some(SetupFault::DropCourseResponse), id)
+            | (Some(SetupFault::DropRuleResponse), id)
+                if id
+                    == Some(match self.fail_next {
+                        Some(SetupFault::DropCourseResponse) => courses,
+                        _ => rules,
+                    }) =>
+            {
+                self.fail_next = None;
+                true
+            }
+            _ => false,
+        };
+        #[cfg(not(test))]
+        let drop_response = false;
+        let (rows, base, id, database) = match target {
+            Some(id) if id == courses => (&mut self.courses, 0x2000, courses, COURSES_DB),
+            Some(id) if id == rules => (&mut self.rules, 0x4000, rules, RULES_DB),
+            _ => return Some((400, json!({"code":"validation_error"}))),
+        };
+        let mut properties = json!({});
+        for (id, property) in request["properties"].as_object()? {
+            let (kind, value) = property.as_object()?.iter().next()?;
+            properties[id] = json!({"id":id,"type":kind,(kind):value});
+        }
+        if target == Some(rules) {
+            if properties.get("course").is_none() {
+                properties["course"] = json!({"id":"course","type":"relation","relation":[]});
+            }
+            properties["course"]["has_more"] = json!(false);
+        }
+        let page = fixture_page(base + rows.len(), id, database, properties);
+        rows.push(page.clone());
+        (!drop_response).then_some((200, page))
+    }
+}
+
+fn fixture_list(pages: &[Value]) -> Value {
+    json!({"object":"list","results":pages,"has_more":false,"next_cursor":null})
+}
+
+fn fixture_id(index: usize) -> String {
+    format!("00000000-0000-4000-8000-{index:012x}")
+}
+
+fn fixture_page(index: usize, source: &str, database: &str, properties: Value) -> Value {
+    json!({"object":"page","id":fixture_id(index),"in_trash":false,"properties":properties,"parent":{
+        "type":"data_source_id","data_source_id":source,"database_id":database
+    }})
+}
+
+fn rich(id: &str, text: &str) -> Value {
+    json!({"id":id,"type":"rich_text","rich_text":[{"type":"text","text":{"content":text}}]})
+}
+
+fn rule_page(index: usize, source: &str, scope: &str, external: &str, course: usize) -> Value {
+    fixture_page(
+        0x140 + index,
+        RULES,
+        RULES_DB,
+        json!({
+            "Title":{"id":"title","type":"title","title":[{"type":"text","text":{"content":external}}]},
+            "Source":{"id":"source","type":"select","select":{"id":source}},
+            "Scope":rich("scope", scope),
+            "External ID":rich("external", external),
+            "Term":rich("term", FIXTURE_TERM),
+            "Course":{"id":"course","type":"relation","relation":[{"id":fixture_id(0x120 + course)}],"has_more":false},
+            "Status":{"id":"status","type":"select","select":{"id":"confirmed"}}
+        }),
     )
 }
 

@@ -5,6 +5,102 @@ fn parse(words: &[&str]) -> Result<Arguments, CliError> {
     Arguments::parse(&words.iter().map(|word| (*word).into()).collect::<Vec<_>>())
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn production_assignment_dry_run_requires_explicit_read_only_route() {
+    let args = [
+        "--config",
+        "production.json",
+        "sync",
+        "--dry-run",
+        "--allow-university-read",
+        "--allow-notion-read",
+        "--production-read-only",
+    ];
+    assert_eq!(parse(&args).unwrap().command, Command::ProductionDryRun);
+    assert!(parse(&args[2..]).is_err());
+    assert!(parse(&[args.as_slice(), &["--allow-notion-write"]].concat()).is_err());
+    let mut apply = args;
+    apply[3] = "--apply";
+    assert!(parse(&apply).is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn production_first_sync_requires_its_explicit_route_and_writer() {
+    let mut args = [
+        "--config",
+        "production.json",
+        "sync",
+        "--apply",
+        "--allow-university-read",
+        "--allow-notion-read",
+        "--allow-notion-write",
+        "--production-first-sync",
+        "--writer",
+        "writer-id",
+    ];
+    assert_eq!(
+        parse(&args).unwrap().command,
+        Command::ProductionFirstSync {
+            writer: "writer-id".into(),
+            create: 35,
+        }
+    );
+    assert_eq!(
+        parse(&[args.as_slice(), &["--expect-create", "34"]].concat())
+            .unwrap()
+            .command,
+        Command::ProductionFirstSync {
+            writer: "writer-id".into(),
+            create: 34,
+        },
+    );
+    assert!(parse(&[args.as_slice(), &["--expect-create", "0"]].concat()).is_err());
+    assert!(parse(&args[..8]).is_err());
+    assert!(parse(&args[2..]).is_err());
+    assert!(parse(&[args.as_slice(), &["--yes"]].concat()).is_err());
+    args[6] = "--production-read-only";
+    assert!(parse(&args).is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn verification_assignment_updates_require_an_explicit_expected_count() {
+    let args = [
+        "--config",
+        "verification.json",
+        "sync",
+        "--apply",
+        "--allow-university-read",
+        "--allow-notion-read",
+        "--allow-notion-write",
+        "--expect-create",
+        "0",
+        "--expect-unchanged",
+        "1",
+    ];
+    assert_eq!(
+        parse(&args).unwrap().command,
+        Command::VerificationApply {
+            create: 0,
+            update: 0,
+            unchanged: 1
+        },
+    );
+    assert_eq!(
+        parse(&[args.as_slice(), &["--expect-update", "2"]].concat())
+            .unwrap()
+            .command,
+        Command::VerificationApply {
+            create: 0,
+            update: 2,
+            unchanged: 1
+        },
+    );
+    assert!(parse(&[args.as_slice(), &["--expect-update", "-1"]].concat()).is_err());
+}
+
 #[test]
 fn webclass_defaults_to_temporary_edge_and_retention_requires_an_explicit_flag() {
     let base = [
@@ -449,7 +545,7 @@ fn reads_dry_run_receipts_written_before_course_relation_diagnostics() {
 #[test]
 fn complete_cli_dry_run_uses_mock_and_leaves_state_unchanged() {
     let mut config = config();
-    config.notion = assignment_manager::notion::fixture::target();
+    config.notion = assignment_manager::notion::fixture::course_rules_target();
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().to_path_buf();
     #[cfg(target_os = "macos")]
