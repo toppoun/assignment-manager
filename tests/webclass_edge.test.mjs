@@ -12,7 +12,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import { runBrowser, startProxy } from "../src/webclass_browser.mjs";
 
-const run = process.platform === "win32" && process.env.ASSIGNMENT_MANAGER_TEST_EDGE === "1";
+const isMac = process.platform === "darwin";
+const browserName = isMac ? "Chrome" : "Edge";
+const run = (isMac && process.env.ASSIGNMENT_MANAGER_TEST_CHROME === "1") ||
+  (process.platform === "win32" && process.env.ASSIGNMENT_MANAGER_TEST_EDGE === "1");
 
 test("the loopback proxy rejects an unlisted CONNECT before dialing", async () => {
   let dialed = false;
@@ -30,8 +33,8 @@ test("the loopback proxy rejects an unlisted CONNECT before dialing", async () =
   }
 });
 
-test("isolated Edge reads only the requested WebClass API endpoints over synthetic HTTPS", { skip: !run, timeout: 120000 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "webclass-edge-fixture-"));
+test(`isolated ${browserName} reads only the requested WebClass API endpoints over synthetic HTTPS`, { skip: !run, timeout: 180000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "webclass-browser-fixture-"));
   const readFixture = (path, encoding) => readFile(new URL(path, import.meta.url), encoding);
   const [courses, contents, certDer, keyDer, driver, cssoForm] = await Promise.all([
     readFixture("../fixtures/webclass/courses_basic.json", "utf8"),
@@ -64,7 +67,6 @@ test("isolated Edge reads only the requested WebClass API endpoints over synthet
   const failedNavigation = "/disconnected?state=fixture-private-navigation";
   let resultMode = "ok";
   let initialCookieSeen = false;
-  let checkingAssignments = false;
   let handoffOrigin;
   const usesPortalCsso = () => resultMode === "csso-query" || resultMode === "csso-unapproved-post";
 
@@ -151,11 +153,11 @@ test("isolated Edge reads only the requested WebClass API endpoints over synthet
         }
         const loggedIn = '<a href="/webclass/logout.php">ログアウト</a>';
         const blockedPosts = resultMode === "csso-query" ? ["/webclass/submit", ssoPostPath + cssoQuery] : ["/webclass/submit"];
-        const loginIndicator = checkingAssignments ?
+        const loginIndicator =
           '<script>const worker = new Worker("/webclass/guard-worker.js");' +
           'Promise.all([new Promise(resolve => worker.onmessage = resolve),' +
           '...' + JSON.stringify(blockedPosts) + '.map(path => fetch(path, { method: "POST" }).catch(()=>{}))]).then(() =>' +
-          'document.body.insertAdjacentHTML("afterbegin", ' + JSON.stringify(loggedIn) + '));</script>' : loggedIn;
+          'document.body.insertAdjacentHTML("afterbegin", ' + JSON.stringify(loggedIn) + '));</script>';
         html(response, loginIndicator +
           '<script>for (const path of ' + JSON.stringify([contentsPath, selectPath("fixture-course-003"),
             contentsPath.replace("contents", "%63ontents") + "?group_id=fixture-course-003", coursesPath, coursesPath]) +
@@ -218,11 +220,12 @@ test("isolated Edge reads only the requested WebClass API endpoints over synthet
     const certificateFlag = "--ignore-certificate-errors-spki-list=" + pin;
     const flags = [certificateFlag,
       "--proxy-bypass-list=<-loopback>;" + [portal, idp, lms].map((url) => new URL(url).host).join(";")];
-    const edge = join(process.env["ProgramFiles(x86)"], "Microsoft", "Edge", "Application", "msedge.exe");
+    const executable = isMac ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" :
+      join(process.env["ProgramFiles(x86)"], "Microsoft", "Edge", "Application", "msedge.exe");
 
     function config(profile, options = {}) {
       return {
-        edge, profile: join(root, profile), entry: portal + "/portal",
+        executable, profile: join(root, profile), entry: portal + "/portal",
         origins: [portal, idp, lms], lms, coursesPath, contentsPath, dashboardPath, ssoPostPath,
         maxBytes: 1024 * 1024, loginMillis: 6000, ...options,
       };
@@ -233,7 +236,6 @@ test("isolated Edge reads only the requested WebClass API endpoints over synthet
     }
 
     async function checkSelected(profile, group, interact, browserFlags = flags) {
-      checkingAssignments = true;
       const options = `{ flags: ${JSON.stringify(browserFlags)}, interact: ${interact?.toString() ?? "undefined"} }`;
       const child = spawn(process.execPath, ["--input-type=module", "--eval", driver + "\nawait runDriver(" + options + ");"],
         { stdio: ["pipe", "pipe", "inherit"] });
@@ -259,7 +261,6 @@ test("isolated Edge reads only the requested WebClass API endpoints over synthet
         assert.deepEqual(await exit, [0, null]);
         return done.reply;
       } finally {
-        checkingAssignments = false;
         child.stdin.end();
         output.close();
         await exit;
@@ -292,7 +293,8 @@ test("isolated Edge reads only the requested WebClass API endpoints over synthet
     assert.equal(counters.consent, 1);
 
     resultMode = "reauth";
-    const interrupted = await testRun("confirmed", (_pipe, _session, terminate) => terminate());
+    const interrupted = await testRun("confirmed", (_pipe, _session, terminate) =>
+      terminate(isMac ? "SIGKILL" : "SIGTERM"));
     assert.equal(interrupted.reason, "browser_closed");
     assert.equal(interrupted.courses_get, 0);
     const renewed = await testRun("confirmed", clickFixtureConsent);
@@ -497,6 +499,18 @@ test("isolated Edge reads only the requested WebClass API endpoints over synthet
     };
     await failedHandoff(lms, "proxy_failure", "dns_failure", { dial: dialWithLookup(rejectLookup) });
     await failedHandoff(lms, "proxy_failure", "timeout", { dial: dialWithLookup(() => {}), connectMillis: 350 });
+
+    if (isMac) {
+      handoffOrigin = undefined;
+      let interrupted;
+      const unaffected = await testRun("other-running-chrome", async (pipe, session) => {
+        interrupted = await testRun("interrupted-chrome", (_pipe, _session, terminate) => terminate("SIGKILL"));
+        await clickFixtureConsent(pipe, session);
+      });
+      assert.equal(unaffected.reason, "ok");
+      assert.equal(unaffected.courses_get, 1);
+      assert.equal(interrupted?.reason, "browser_closed");
+    }
   } finally {
     await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

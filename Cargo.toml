@@ -36,4 +36,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
+libc = "0.2"
 security-framework = "3.7"

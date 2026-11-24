@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { connect } from "node:net";
 import { createInterface } from "node:readline";
@@ -7,13 +8,13 @@ import { setTimeout as delay } from "node:timers/promises";
 
 // DevTools uses inherited pipes. No local or remote debugging port is opened.
 class BrowserPipe {
-  constructor(edge, maxBytes) {
-    this.input = edge.stdio[3];
+  constructor(browser, maxBytes) {
+    this.input = browser.stdio[3];
     this.pending = new Map();
     this.nextId = 0;
     this.buffer = "";
     this.onEvent = () => {};
-    edge.stdio[4].setEncoding("utf8").on("data", (chunk) => {
+    browser.stdio[4].setEncoding("utf8").on("data", (chunk) => {
       try {
         this.buffer += chunk;
         if (this.buffer.length > maxBytes) throw new Error();
@@ -36,8 +37,8 @@ class BrowserPipe {
         this.close();
       }
     });
-    for (const stream of [edge.stdio[4], this.input]) stream.on("error", () => this.close());
-    edge.once("exit", () => this.close());
+    for (const stream of [browser.stdio[4], this.input]) stream.on("error", () => this.close());
+    browser.once("exit", () => this.close());
   }
 
   send(method, params = {}, sessionId, timeout = 5000) {
@@ -64,7 +65,7 @@ class BrowserPipe {
   }
 }
 
-// HTTPS tunnels stay opaque and use Edge's normal certificate validation.
+// HTTPS tunnels stay opaque and use the browser's normal certificate validation.
 export async function startProxy(origins, dial = connect, connectMillis = 15000) {
   const targets = new Map(origins.map((origin) => {
     const url = new URL(origin);
@@ -295,12 +296,12 @@ async function configureEmbedded(pipe, session, config, type) {
   await pipe.send("Runtime.runIfWaitingForDebugger", {}, session);
 }
 
-async function configurePage(pipe, session, page, config, guardEmbedded, onFrame) {
+async function configurePage(pipe, session, page, config, onFrame) {
   await guardTarget(pipe, session, config);
-  if (guardEmbedded) await attachTargets(pipe, embeddedTargetTypes, session);
+  await attachTargets(pipe, embeddedTargetTypes, session);
   await pipe.send("Runtime.runIfWaitingForDebugger", {}, session);
   await pipe.send("Network.setBypassServiceWorker", { bypass: true }, session);
-  // Diagnostics are optional on Edge versions that cannot enable this domain here.
+  // Diagnostics are optional on browser versions that cannot enable this domain here.
   await pipe.send("Network.enable", { maxPostDataSize: 0, maxTotalBufferSize: 0, maxResourceBufferSize: 0 }, session)
     .catch(() => {});
   await pipe.send("Page.enable", {}, session);
@@ -310,10 +311,13 @@ async function configurePage(pipe, session, page, config, guardEmbedded, onFrame
   page.configured = true;
 }
 
-export async function runBrowser(config, fixture, selectContents) {
-  let edge;
-  let edgeExited;
+export async function runBrowser(config, fixture, selectContents, signal) {
+  let browser;
+  let browserExited;
+  let browserReady = false;
   let proxy;
+  const isMac = process.platform === "darwin";
+  const startupFailure = isMac ? "chrome_start_failed" : "edge_start_failed";
   let stopped = false;
   let lmsReached = false;
   const requests = { course: 0, contents: 0 };
@@ -324,11 +328,15 @@ export async function runBrowser(config, fixture, selectContents) {
     stopped = true;
     finish(Promise.resolve(navigation).then((navigation) => ({ reason, navigation })));
   };
+  const interrupted = () => stop("browser_closed");
+  signal?.addEventListener("abort", interrupted, { once: true });
+  if (signal?.aborted) interrupted();
   const timeout = setTimeout(() => stop("login_timeout"), config.loginMillis);
   let outcome;
   try {
     proxy = await startProxy(config.origins.filter((origin) => new URL(origin).protocol === "https:"),
       fixture?.dial, fixture?.connectMillis);
+    if (stopped) throw new Error();
     const flags = [
       "--no-startup-window", "--remote-debugging-pipe", "--user-data-dir=" + config.profile,
       "--no-first-run", "--no-default-browser-check", "--disable-sync", "--disable-extensions",
@@ -339,12 +347,20 @@ export async function runBrowser(config, fixture, selectContents) {
       "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
     ];
     if (fixture) flags.push("--headless=new", ...fixture.flags);
-    edge = spawn(config.edge, flags, { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
-    edgeExited = new Promise((resolve) => {
-      edge.once("exit", () => { stop("browser_closed"); resolve(); });
-      edge.once("error", () => { stop("edge_start_failed"); resolve(); });
+    browser = spawn(config.executable, flags, { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
+    browserExited = new Promise((resolve) => {
+      browser.once("exit", () => {
+        stop(isMac && !browserReady ? startupFailure : "browser_closed");
+        resolve(true);
+      });
+      browser.once("error", () => {
+        if (browser.pid === undefined) {
+          stop(startupFailure);
+          resolve(true);
+        }
+      });
     });
-    const pipe = new BrowserPipe(edge, config.maxBytes * 6 + 65536);
+    const pipe = new BrowserPipe(browser, config.maxBytes * 6 + 65536);
     const pages = new Map();
     const embedded = new Set();
     let armed;
@@ -415,7 +431,7 @@ export async function runBrowser(config, fixture, selectContents) {
             session === armed.session && frameId === armed.frame.id && mainFrame === armed.frame &&
             url.href === config.lms + armed.target && requests[armed.kind] === 0;
           if (allowed) requests[armed.kind]++;
-        } else if (selectContents && method !== "GET" && method !== "HEAD") {
+        } else if (method !== "GET" && method !== "HEAD") {
           // A CSSO form can include a query on this fixed endpoint.
           allowed = document && method === "POST" && url.pathname === config.ssoPostPath;
         }
@@ -444,7 +460,7 @@ export async function runBrowser(config, fixture, selectContents) {
         const opener = [...pages.values()].find(({ target }) => target === openerId);
         const page = { target: targetId, stage: opener?.stage ?? "startup", initialNavigations: new Map(), documents: new Map() };
         pages.set(params.sessionId, page);
-        page.ready = configurePage(pipe, params.sessionId, page, config, Boolean(selectContents), recordFrame);
+        page.ready = configurePage(pipe, params.sessionId, page, config, recordFrame);
         void page.ready.catch(() => { if (pages.has(params.sessionId)) stop("browser_protocol"); });
       } else if (method === "Target.attachedToTarget" && embeddedTargetTypes.includes(params.targetInfo.type)) {
         const child = params.sessionId;
@@ -501,12 +517,13 @@ export async function runBrowser(config, fixture, selectContents) {
 
     async function interact() {
       await pipe.send("Browser.setDownloadBehavior", { behavior: "deny" });
+      browserReady = true;
       // Even a retained profile must start a new, guarded tab after an interrupted run.
       const { targetInfos } = await pipe.send("Target.getTargets");
       if (targetInfos.some(({ type }) => type === "page")) {
         return { reason: "profile_startup_tabs" };
       }
-      await attachTargets(pipe, selectContents ? ["page", "shared_worker", "service_worker"] : ["page"]);
+      await attachTargets(pipe, ["page", "shared_worker", "service_worker"]);
       const { targetId } = await pipe.send("Target.createTarget", { url: "about:blank" });
       const [session, page] = [...pages].find(([, candidate]) => candidate.target === targetId) ?? [];
       if (!page) return { reason: "browser_protocol" };
@@ -514,7 +531,7 @@ export async function runBrowser(config, fixture, selectContents) {
       if (stopped) return stoppedResult;
       await pipe.send("Page.navigate", { url: config.entry }, session);
       if (stopped) return stoppedResult;
-      if (fixture?.interact) await fixture.interact(pipe, session, () => edge.kill());
+      if (fixture?.interact) await fixture.interact(pipe, session, (signal) => browser.kill(signal));
       while (!stopped) {
         for (const [tab, candidate] of pages) {
           const frame = candidate.frame;
@@ -524,7 +541,7 @@ export async function runBrowser(config, fixture, selectContents) {
           const context = await isolatedWorld(pipe, tab, frame.id).catch(() => undefined);
           const ready = context !== undefined && await evaluate(pipe, tab, context, verify).catch(() => false);
           if (!ready || stopped || candidate.frame !== frame) continue;
-          reading = Boolean(selectContents);
+          reading = true;
           async function read(kind, target, referrer = null) {
             if (stopped || candidate.frame !== frame) return { reason: "auth_expired" };
             armed = { session: tab, frame, kind, target };
@@ -556,20 +573,29 @@ export async function runBrowser(config, fixture, selectContents) {
     }
 
     outcome = await Promise.race([
-      stoppedResult, interact().catch(() => ({ reason: "browser_protocol" })),
+      stoppedResult, interact().catch(() => ({ reason: isMac && !browserReady ? startupFailure : "browser_protocol" })),
     ]);
     if (stopped) outcome = await stoppedResult;
     stopped = true;
     await pipe.send("Browser.close", {}, undefined, 2500).catch(() => {});
   } catch {
-    outcome = { reason: proxy ? "edge_start_failed" : "proxy_failure" };
+    outcome = stopped ? await stoppedResult : { reason: proxy ? startupFailure : "proxy_failure" };
   } finally {
     clearTimeout(timeout);
-    if (edgeExited) {
-      const exited = await Promise.race([edgeExited.then(() => true), delay(3000, false, { ref: false })]);
+    signal?.removeEventListener("abort", interrupted);
+    if (browserExited) {
+      const exited = await Promise.race([browserExited, delay(3000, false, { ref: false })]);
       if (!exited) {
-        edge.kill();
-        await Promise.race([edgeExited, delay(1500)]);
+        browser.kill();
+        const terminated = await Promise.race([browserExited, delay(1500, false)]);
+        if (isMac && !terminated) {
+          browser.kill("SIGKILL");
+          if (!await Promise.race([browserExited, delay(1500, false)])) {
+            outcome = { reason: "profile_cleanup_failed" };
+            for (const stream of browser.stdio) stream?.destroy();
+            browser.unref();
+          }
+        }
       }
     }
     await proxy?.close();
@@ -581,16 +607,35 @@ async function runDriver(fixture) {
   const input = createInterface({ input: process.stdin });
   const lines = input[Symbol.asyncIterator]();
   const write = (message) => process.stdout.write(JSON.stringify(message) + "\n");
+  const isMac = process.platform === "darwin";
+  const parent = new AbortController();
+  const interrupt = () => parent.abort();
+  if (isMac) {
+    // The CLI's pipe closes even when it is killed before it can run destructors.
+    input.once("close", interrupt);
+    process.stdout.on("error", interrupt);
+    process.on("SIGTERM", interrupt);
+    process.on("SIGINT", interrupt);
+  }
   try {
-    const config = JSON.parse((await lines.next()).value);
+    const { value, done } = await lines.next();
+    if (done) return;
+    const config = JSON.parse(value);
     const selectContents = config.selectContents ? async (body) => {
       write({ stage: "courses", body });
       const { value, done } = await lines.next();
       return done ? null : JSON.parse(value);
     } : undefined;
-    const reply = await runBrowser(config, fixture, selectContents);
-    write({ stage: "finished", reply });
+    const reply = await runBrowser(config, fixture, selectContents, isMac ? parent.signal : undefined);
+    if (parent.signal.aborted && config.temporaryProfile && reply.reason !== "profile_cleanup_failed") {
+      await rm(config.profile, { recursive: true, force: true });
+    }
+    if (!process.stdout.destroyed) write({ stage: "finished", reply });
   } finally {
+    if (isMac) {
+      process.off("SIGTERM", interrupt);
+      process.off("SIGINT", interrupt);
+    }
     input.close();
     process.stdin.destroy();
   }

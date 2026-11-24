@@ -40,7 +40,7 @@ fn credential_namespace(bytes: &[u8]) -> Result<String, CliError> {
     Ok(config.target_id()?)
 }
 
-pub(in crate::cli) fn check_local(path: &Path) -> Result<u8, CliError> {
+pub(in crate::cli) fn check_http_local(path: &Path) -> Result<u8, CliError> {
     let target = credential_namespace(&config::read_bytes(path)?)?;
     credentials::check_webclass_entry(&target).map_err(CliError::Credential)?;
     println!("webclass configuration=ready credential_entry=present network=disabled");
@@ -66,16 +66,39 @@ pub(in crate::cli) fn check_browser_config(explicit: Option<&Path>) -> Result<()
     }
 }
 
-#[cfg(windows)]
+pub(in crate::cli) fn check_browser_local(explicit: Option<&Path>) -> Result<u8, CliError> {
+    check_browser_config(explicit)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let dependencies = assignment_manager::webclass_browser::check_local_dependencies();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let dependencies = Err("windows_or_macos_required");
+    match dependencies {
+        Ok(()) => {
+            println!("webclass configuration=ready browser=present node=present network=disabled");
+            Ok(finish(true))
+        }
+        Err(reason) => {
+            println!("webclass configuration=ready network=disabled diagnostic={reason}");
+            Ok(finish(false))
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8 {
     use assignment_manager::webclass_browser::{self, ProfileMode};
 
+    #[cfg(windows)]
     if !crate::cli::windows_dialog::interactive_station() {
         println!("webclass browser diagnostic=interactive_windows_session_required");
         return finish(false);
     }
+    #[cfg(windows)]
+    let browser = "Edge";
+    #[cfg(target_os = "macos")]
+    let browser = "Chrome";
     println!(
-        "Edgeの大学公式画面で認証し、HOPPIIのWebClassリンクを開いてください。中止する場合は専用のEdgeを閉じてください。"
+        "{browser}の大学公式画面で認証し、HOPPIIのWebClassリンクを開いてください。中止する場合は専用の{browser}を閉じてください。"
     );
     let (mode, profile) = if keep_profile {
         (ProfileMode::Retained, "retained")
@@ -168,7 +191,7 @@ pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn report_browser_navigation(
     navigation: Option<assignment_manager::webclass_browser::BrowserNavigation>,
 ) {
@@ -180,13 +203,13 @@ fn report_browser_navigation(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(in crate::cli) fn browser(_keep_profile: bool, _course_id: Option<&str>) -> u8 {
-    println!("webclass browser diagnostic=windows_required");
+    println!("webclass browser diagnostic=windows_or_macos_required");
     finish(false)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn course_period_counts(
     records: &[assignment_manager::webclass::WebClassCourse],
 ) -> std::collections::BTreeMap<(i32, &str), usize> {
@@ -199,7 +222,7 @@ fn course_period_counts(
     counts
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 #[test]
 fn course_summary_counts_source_periods_without_normalizing_them() {
     let raw = include_str!("../../../fixtures/webclass/courses_basic.json");

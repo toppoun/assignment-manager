@@ -46,6 +46,9 @@ fn call(temp: &tempfile::TempDir, args: &[&str]) -> Output {
             command.env(variable, temp.path());
         }
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    // Isolate the Node.js lookup and keep production browsers from starting.
+    command.env("PATH", test_home(temp));
     command
         .env(variable, test_home(temp))
         .args(args)
@@ -356,11 +359,12 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("source_disabled"));
     assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
-    assert!(
-        !test_home(&temp)
-            .join("AssignmentManagerWebClassEdge")
-            .exists()
-    );
+    #[cfg(windows)]
+    let browser_profile = "AssignmentManagerWebClassEdge";
+    #[cfg(target_os = "macos")]
+    let browser_profile = "Library/Application Support/AssignmentManagerWebClassChrome";
+    #[cfg(any(windows, target_os = "macos"))]
+    assert!(!test_home(&temp).join(browser_profile).exists());
 }
 
 #[cfg(feature = "synthetic-https-fixture")]
@@ -400,21 +404,79 @@ fn webclass_local_check_rejects_extra_config_fields_without_echoing_them() {
             .to_string(),
     )
     .unwrap();
-    let output = call(
-        &temp,
-        &[
-            "--config",
-            path.to_str().unwrap(),
-            "university-check",
-            "webclass",
-            "--courses-only",
-            "--check-local",
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("configuration_invalid"));
-    assert!(!stderr(&output).contains("synthetic-private-value"));
+    let base = [
+        "--config",
+        path.to_str().unwrap(),
+        "university-check",
+        "webclass",
+        "--courses-only",
+        "--check-local",
+    ];
+    for flags in [&[][..], &["--http-probe"][..]] {
+        let output = call(&temp, &[base.as_slice(), flags].concat());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains("configuration_invalid"));
+        assert!(!stderr(&output).contains("synthetic-private-value"));
+    }
     assert!(!local_root(&temp).exists());
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn webclass_browser_local_check_looks_for_executables_without_running_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let args = [
+        "university-check",
+        "webclass",
+        "--courses-only",
+        "--check-local",
+    ];
+    config(&temp);
+
+    #[cfg(windows)]
+    {
+        let result = call(&temp, &args);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(stdout(&result).contains("diagnostic=edge_unavailable"));
+        let edge = test_home(&temp).join("Microsoft/Edge/Application/msedge.exe");
+        fs::create_dir_all(edge.parent().unwrap()).unwrap();
+        fs::write(edge, "synthetic browser executable path").unwrap();
+    }
+
+    let result = call(&temp, &args);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(stderr(&result).is_empty());
+    let status = stdout(&result);
+    #[cfg(target_os = "macos")]
+    if status.contains("diagnostic=chrome_unavailable") {
+        return;
+    }
+    assert!(status.contains("network=disabled diagnostic=browser_runtime_unavailable"));
+
+    #[cfg(windows)]
+    let node = test_home(&temp).join("node.exe");
+    #[cfg(target_os = "macos")]
+    let node = test_home(&temp).join("node");
+    fs::write(&node, "synthetic Node.js executable path").unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = call(&temp, &args);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(stdout(&result).contains("diagnostic=browser_runtime_unavailable"));
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let result = call(&temp, &args);
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert_eq!(
+        stdout(&result).lines().collect::<Vec<_>>(),
+        [
+            "webclass configuration=ready browser=present node=present network=disabled",
+            "result=success",
+        ]
+    );
+    assert_eq!(fs::read_dir(local_root(&temp)).unwrap().count(), 1);
 }
 
 #[cfg(windows)]

@@ -20,7 +20,7 @@ use acquisition::{
     WebClassEvent, acquire_webclass_courses, run_with_webclass_reauth, visit_moodle,
     visit_webclass_groups,
 };
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) use acquisition::{validate_webclass_contents_json, validate_webclass_courses_json};
 
 use crate::moodle_http::{MoodleClient, MoodleFeed};

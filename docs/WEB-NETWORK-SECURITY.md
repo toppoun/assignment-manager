@@ -115,7 +115,7 @@ OS getaddrinfoに委譲したlookupは待機を5秒で終了するが、OS内の
 
 ## WebClass授業一覧専用CLI
 
-Windowsの授業一覧取得は専用Edgeを既定とする。以下は `--http-probe` を明示したときの
+授業一覧の取得は、Windowsでは専用Edge、macOSでは専用Chromeを既定とする。以下は `--http-probe` を明示したときの
 HTTP診断の通信制限。既存のTLS検証に加えてHTTPS 443の2ホストに限定し、合計最大7件で停止する。
 
 | ホスト | 許可する本番パスとメソッド | GET / POST 上限 |
@@ -195,21 +195,29 @@ URL、Cookie、トークン、資格情報、SAML本文を出力・保存しな�
 再要求を説明できる。大学の製品・設定と、本人の同意選択の適用範囲は未確認。
 [OSSTech OpenAM 14 SAML設定ガイド 7.1.1・7.2](https://www.osstech.co.jp/download/updates/docs/openam/OSTD-OpenAM14-SAML-SetupGuide.pdf#page=28)
 
-Windowsでは、授業一覧と1授業の課題確認CLIの `--allow-university-read` がMicrosoft Edgeを一時プロファイルで
-起動する。Edgeは標準のインストール先から探し、同梱ドライバーはPATH上のNode.jsで動く。
-WebClassが既存設定で無効な場合はEdge起動前に終了する。
+授業一覧と1授業の課題確認CLIの `--allow-university-read` は、一時プロファイルでWindowsのMicrosoft Edge
+またはmacOSのGoogle Chromeを起動する。Windowsでは標準のEdgeインストール先を探して `node.exe` を起動する。
+macOSでは `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` とPATH上の `node` を使う。
+WebClassが既存設定で無効な場合はブラウザ起動前に終了する。
+`--check-local` は同じ設定チェックに加え、対象ブラウザとPATH上のNode.jsの実行ファイルを確認する。
+ブラウザ経路の事前確認は設定の読み取りとファイルの検出だけで完結する。
+`--check-local --http-probe` はHTTP経路の設定とOS資格情報項目をローカルで確認する。
 ユーザーは大学公式のHOPPIIで認証と同意を行い、WebClassリンクを開く。SAMLフォームの送信と
 セッション確立は大学のページが担う。中止は専用ブラウザを閉じる。待機上限は5分。
-通常終了時にはWindowsのジョブで子プロセスを終了し、一時プロファイルを削除する。
-`--keep-profile` の指定時だけ、`%LOCALAPPDATA%\AssignmentManagerWebClassEdge` を使う。
-アプリの所有マーカーを検証し、パス上の再解析ポイントを拒否する。OSの排他ロックは
-Edgeの終了まで保持し、保持プロファイルの削除・初期化は行わない。認証と同意の保持期間は
-大学とEdgeの設定に従う。異常終了後も新しいタブから開始し、復元タブがあれば停止する。
+Windowsは終了時にジョブで子プロセスを終了し、Rustが一時プロファイルを削除する。
+macOSはCLIとのパイプ切断時もNodeがCDPで専用Chromeを閉じ、必要な場合は自分で起動した
+Chromeプロセスに終了シグナルを送り、その終了を待って一時プロファイルを削除する。
+`--keep-profile` で指定する専用 `--user-data-dir` は、Windowsでは
+`%LOCALAPPDATA%\AssignmentManagerWebClassEdge`、macOSでは
+`~/Library/Application Support/AssignmentManagerWebClassChrome`。
+アプリの所有マーカーを必須とし、パス上の再解析ポイントとシンボリックリンクを拒否する。
+macOSではユーザー所有と専用ディレクトリの権限も確認し、CLIとのパイプが切れてもNodeがOSの排他ロックを保持する。
+認証と同意の保持期間は大学とブラウザの設定に従う。異常終了後も新しいタブから開始し、復元タブがあれば停止する。
 `courses` または `contents` が401または403の場合はその試行を終了し、再認証は次回の本人操作に委ねる。
 
-Edgeの制御には継承したDevToolsパイプを使い、デバッグ用のTCPポートを開かない。
+ブラウザの制御は継承したDevToolsパイプに限定する。
 専用のループバックプロキシはHOPPII、IdP、WebClassのHTTPS `CONNECT` のみ転送する。
-TLS証明書はEdgeが検証する。許可済みオリジン内のリダイレクトと新規タブを処理し、
+TLS証明書はブラウザが検証する。許可済みオリジン内のリダイレクトと新規タブを処理し、
 未知のトップレベルオリジンでは終了する。ダウンロードを拒否し、WebClass取得の前にService Workerを
 バイパスする。
 
@@ -217,7 +225,7 @@ TLS証明書はEdgeが検証する。許可済みオリジン内のリダイレ�
 `startup`、HOPPIIの `hoppii`、認証側の `idp`、WebClassへのSSO引き渡しの `webclass_sso`、
 WebClassの `webclass` のいずれか。未知の遷移要求では、そのタブで最後に確認した段階を表示する。
 `kind=top_level_request` はトップレベルの遷移要求、`top_level_commit` は表示先が切り替わった時点、
-`browser_internal_page` はブラウザ内部ページを表す。Edgeが通信失敗を示すページをトップレベルに
+`browser_internal_page` はブラウザ内部ページを表す。ブラウザが通信失敗を示すページをトップレベルに
 表示した場合は `browser_navigation_failed` と `kind=browser_error_page` を返す。iframeで拒否された
 遷移やサブリソースの拒否だけでは認証を中断しない。URL、クエリ、Cookie、トークン、ブラウザの
 エラー原文は診断に含めない。
@@ -227,7 +235,7 @@ WebClassの `webclass` のいずれか。未知の遷移要求では、そのタ
 `proxy_failure`、`timeout`、`navigation_blocked`、`unknown_network_failure` のいずれかを出す。
 照合できたリクエストの `request_method` は `get` または `post` で、送信の試行を表す。
 同じ許可先へのCONNECT失敗をプロキシが観測した場合は `proxy_connect_observed` を併記する。
-これはEdgeがトンネル確立失敗を報告した遷移中の観測であり、個々のHTTPSリクエストとCONNECTの
+これはブラウザがトンネル確立失敗を報告した遷移中の観測であり、個々のHTTPSリクエストとCONNECTの
 対応までは確定できない。複数の異なる失敗が観測された場合は省略する。通信の証拠を照合できない
 場合は `unknown_network_failure` とし、ログイン待ち時間切れや、取得APIの `auth_expired` と区別する。
 
@@ -238,14 +246,14 @@ Cookieやローカルストレージはブラウザ内で管理する。Rust側�
 授業IDの検証、件数上限を共用し、授業の取得値と年度・学期別件数を端末に表示する。
 
 `--course-id ID` を指定した場合、Rustで検証した授業一覧に完全一致する `group_id` がある場合だけ、
-既存HTTPクライアントと同じ形式の `contents?group_id=…` を組み立てる。同じEdgeタブの同じフレームに
+既存HTTPクライアントと同じ形式の `contents?group_id=…` を組み立てる。ブラウザタブ内で授業一覧を取得したフレームに
 限定して1回のGETを許可する。埋め込みフレームにもリクエスト制限を適用し、ワーカーからWebClassへの
 通信を拒否する。
-このモードでWebClassに送るPOSTは認証中の `/webclass/singlesignon.php` への画面遷移に限る。
+授業一覧・課題取得のどちらでも、WebClass宛てのPOSTは認証中の `/webclass/singlesignon.php` への画面遷移に限る。
 フォームの送信先にクエリが付いていても、許可済みのHTTPSオリジンと完全一致するパスで判定する。
 応答全体を既存の
 `parse_contents` と授業グループ・課題IDの検証、`map_contents_for_group` に渡し、検証を通った課題の
-取得値を端末に表示する。認証情報はEdgeのプロファイル内で管理する。
+取得値を端末に表示する。認証情報はブラウザのプロファイル内で管理する。
 
 ブラウザ経路から従来の固定 `ASK_IF_CHANGE` を送るHTTP同意処理を呼び出さない。
 既存のデスクトップ・Web同期は `HoseiAuthenticator` とHTTPセッションの再認証を利用中。
@@ -254,23 +262,28 @@ Cookieやローカルストレージはブラウザ内で管理する。Rust側�
 同意APIを外部クライアントから利用する契約は、大学について未確認。
 [OSSTech OpenAM 14 SAML設定ガイド 7.5](https://www.osstech.co.jp/download/updates/docs/openam/OSTD-OpenAM14-SAML-SetupGuide.pdf#page=36)
 
-合成検証ではWindows EdgeとループバックのHTTPSのIdP・SPを使う。テスト専用の操作でSAML遷移を開始し、
+合成検証ではWindows EdgeまたはmacOS ChromeとループバックのHTTPSのIdP・SPを使う。テスト専用の操作でSAML遷移を開始し、
 同じブラウザから授業と指定した1グループの課題のfixtureを取得する。プロファイルの再利用と分離、
 異常終了後の再認証、未知の遷移先、ブラウザ終了、認証失効、リダイレクト、ページやワーカーからの
 余分なGETとSSO以外のPOSTの拒否を確認する。IdPとWebClassのSSOでの通信失敗をブラウザエラーページと
 して報告し、iframeや画像で通信が拒否されても正常なSSOを継続できることも確認する。CONNECT拒否、
 切断、TLS失敗にはループバックのソケットを使い、名前解決失敗と接続タイムアウトは合成ダイヤルで
-再現する。テストでは一時作成したEdgeプロファイルとループバックのサービスだけを使う。
+再現する。テストでは一時作成した専用プロファイルとループバックのサービスだけを使う。
 
 ```powershell
 $env:ASSIGNMENT_MANAGER_TEST_EDGE = '1'
 node --test tests/webclass_edge.test.mjs
 ```
 
+```sh
+ASSIGNMENT_MANAGER_TEST_CHROME=1 node --test tests/webclass_edge.test.mjs
+cargo test --locked --offline chrome_driver_cleans_up_when_the_cli_disconnects -- --ignored
+```
+
 Edgeを既定にした際、従来の無効設定をEdge起動前に確認していなかったため、通常・全機能の
 CLI回帰テストで実Edgeが計2件起動した。プロセスは停止し、テスト用の一時プロファイルを
 削除した。大学へのHTTP送信の有無と件数は不明。再発防止として、無効設定を起動前に拒否し、
-CLI回帰テストは実Edgeのインストール先を参照できない環境で無効設定の各モードを確認する。
+CLI回帰テストはブラウザを起動できない環境で無効設定の各モードを確認する。
 
 ### 授業の分類と連携
 

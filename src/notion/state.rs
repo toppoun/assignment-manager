@@ -64,6 +64,11 @@ pub struct TargetLock {
 }
 
 impl TargetLock {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self._file)
+    }
+
     pub fn acquire(directory: &Path) -> Result<Self, StateError> {
         check_path(directory)?;
         fs::create_dir_all(directory).map_err(|_| StateError::Io)?;

@@ -105,6 +105,32 @@ fn webclass_one_course_requires_an_exact_id_and_explicit_edge_read_permission() 
     }
 }
 
+#[test]
+fn webclass_local_checks_select_the_path_without_accepting_network_permission() {
+    let base = ["university-check", "webclass", "--courses-only"];
+    for (flags, mode) in [
+        (&["--check-local"][..], WebClassCheckMode::LocalBrowser),
+        (
+            &["--check-local", "--http-probe"][..],
+            WebClassCheckMode::LocalHttp,
+        ),
+        (
+            &["--http-probe", "--check-local"][..],
+            WebClassCheckMode::LocalHttp,
+        ),
+    ] {
+        assert_eq!(
+            parse(&[base.as_slice(), flags].concat()).unwrap().command,
+            Command::UniversityWebClass {
+                mode,
+                review_local: false,
+            }
+        );
+        assert!(parse(&[base.as_slice(), &["--allow-university-read"], flags].concat()).is_err());
+        assert!(parse(&[base.as_slice(), flags, &["--allow-university-read"]].concat()).is_err());
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn integration_cli_requires_explicit_dual_read_permissions_and_network_route() {

@@ -1,26 +1,13 @@
-//! Windows Edge adapter for read-only WebClass checks.
+//! Isolated browser adapter for read-only WebClass checks.
 
 use std::{
-    env, fs, io,
+    env, io,
     io::{BufRead, BufReader, Read, Write},
-    os::windows::{
-        io::{AsRawHandle, FromRawHandle, OwnedHandle},
-        process::CommandExt,
-    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    ptr,
 };
 
 use serde::{Deserialize, Serialize};
-use windows_sys::Win32::System::{
-    JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
-    },
-    Threading::CREATE_NO_WINDOW,
-};
 
 use crate::{
     notion::state::{StateError, TargetLock, check_path},
@@ -34,8 +21,16 @@ use crate::{
     webclass_http::{CONTENTS_PATH, COURSES_PATH, DASHBOARD_PATH, contents_url},
 };
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as platform;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as platform;
+
 const DRIVER: &str = concat!(include_str!("webclass_browser.mjs"), "\nawait runDriver();");
-const PROFILE_DIRECTORY: &str = "AssignmentManagerWebClassEdge";
 const PROFILE_OWNER_MARKER: &str = "assignment-manager-webclass-profile-v1";
 
 #[derive(Clone, Copy)]
@@ -44,44 +39,45 @@ pub enum ProfileMode {
     Retained,
 }
 
-enum EdgeProfile {
+enum BrowserProfile {
     Temporary(tempfile::TempDir),
     Retained { path: PathBuf, _lock: TargetLock },
 }
 
-impl EdgeProfile {
+impl BrowserProfile {
     fn open(mode: ProfileMode) -> Result<Self, &'static str> {
         match mode {
-            ProfileMode::Temporary => tempfile::Builder::new()
-                .prefix("assignment-manager-webclass-")
-                .tempdir()
-                .map(Self::Temporary)
-                .map_err(|_| "browser_setup"),
-            ProfileMode::Retained => {
-                let local = env::var_os("LOCALAPPDATA")
-                    .map(PathBuf::from)
-                    .ok_or("profile_path_unavailable")?;
-                Self::retained(&local)
+            ProfileMode::Temporary => {
+                let base = std::env::temp_dir();
+                #[cfg(target_os = "macos")]
+                let base = base.canonicalize().map_err(|_| "browser_setup")?;
+                if !base.is_absolute() {
+                    return Err("profile_path_unavailable");
+                }
+                tempfile::Builder::new()
+                    .prefix("assignment-manager-webclass-")
+                    .tempdir_in(base)
+                    .map(Self::Temporary)
+                    .map_err(|_| "browser_setup")
             }
+            ProfileMode::Retained => Self::retained(&platform::retained_base()?),
         }
     }
 
     fn retained(local: &Path) -> Result<Self, &'static str> {
-        let path = local.join(PROFILE_DIRECTORY);
+        let path = local.join(platform::PROFILE_DIRECTORY);
         let marker = path.join(PROFILE_OWNER_MARKER);
         check_path(&marker).map_err(|_| "profile_path_unavailable")?;
         if !local.is_dir() {
             return Err("profile_path_unavailable");
         }
         // Claim only a new directory. Never initialize any pre-existing profile in place.
-        match fs::create_dir(&path) {
-            Ok(()) => fs::create_dir(&marker).map_err(|_| "profile_setup")?,
+        match platform::create_private_dir(&path) {
+            Ok(()) => platform::create_private_dir(&marker).map_err(|_| "profile_setup")?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err("profile_setup"),
         }
-        if !marker.is_dir() {
-            return Err("profile_not_managed");
-        }
+        platform::verify_profile_owner(&path, &marker)?;
         let _lock = TargetLock::acquire(&path).map_err(|error| match error {
             StateError::Busy => "profile_in_use",
             StateError::InvalidPath => "profile_path_unavailable",
@@ -176,8 +172,9 @@ pub struct BrowserCourseAssignments {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserConfig<'a> {
-    edge: &'a Path,
+    executable: &'a Path,
     profile: &'a Path,
+    temporary_profile: bool,
     entry: String,
     origins: [&'a str; 3],
     lms: &'a str,
@@ -213,50 +210,10 @@ struct DriverResult {
     selection: Option<Result<WebClassCourse, &'static str>>,
 }
 
-struct BrowserJob(OwnedHandle);
-
-impl BrowserJob {
-    fn new() -> Option<Self> {
-        // The kill-on-close job also closes the isolated browser if the CLI is interrupted.
-        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if handle.is_null() {
-            return None;
-        }
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                ptr::from_ref(&limits).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        (configured != 0).then_some(Self(handle))
-    }
-
-    fn add(&self, child: &std::process::Child) -> bool {
-        unsafe { AssignProcessToJobObject(self.0.as_raw_handle(), child.as_raw_handle()) != 0 }
-    }
-}
-
-fn find_edge() -> Option<PathBuf> {
-    ["ProgramFiles(x86)", "ProgramW6432", "ProgramFiles"]
-        .iter()
-        .filter_map(env::var_os)
-        .map(|base| PathBuf::from(base).join("Microsoft/Edge/Application/msedge.exe"))
-        .find(|path| path.is_absolute() && path.is_file())
-}
-
-fn run_driver(
-    config: &BrowserConfig<'_>,
-    course_id: Option<&str>,
-) -> Result<DriverResult, &'static str> {
-    let job = BrowserJob::new().ok_or("browser_setup")?;
-    let mut child = Command::new("node.exe")
+fn driver_command(profile: &BrowserProfile) -> Command {
+    let mut command = platform::node_command(profile);
+    command
         .args(["--input-type=module", "--eval", DRIVER])
-        .creation_flags(CREATE_NO_WINDOW)
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_DEBUG")
         .env_remove("NODE_DEBUG_NATIVE")
@@ -264,9 +221,21 @@ fn run_driver(
         .env_remove("CHROME_LOG_FILE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn run_driver(
+    config: &BrowserConfig<'_>,
+    profile: &BrowserProfile,
+    course_id: Option<&str>,
+) -> Result<DriverResult, &'static str> {
+    #[cfg(windows)]
+    let job = platform::BrowserJob::new().ok_or("browser_setup")?;
+    let mut child = driver_command(profile)
         .spawn()
         .map_err(|_| "browser_runtime_unavailable")?;
+    #[cfg(windows)]
     if !job.add(&child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -276,17 +245,20 @@ fn run_driver(
     let stdin = child.stdin.take().expect("piped browser driver");
     let result = exchange_driver(&mut stdout, stdin, config, course_id);
     drop(stdout);
+    #[cfg(windows)]
     if result.is_err() {
         drop(job);
         let _ = child.wait();
         return result;
     }
     let status = child.wait().map_err(|_| "browser_closed")?;
+    #[cfg(windows)]
     drop(job);
+    let result = result?;
     if !status.success() {
         return Err("browser_protocol");
     }
-    result
+    Ok(result)
 }
 
 fn exchange_driver(
@@ -370,6 +342,7 @@ impl BrowserReply {
             "contents_request_failed" => Err("contents_request_failed"),
             "contents_response_limit" => Err("contents_response_limit"),
             "edge_start_failed" => Err("edge_start_failed"),
+            "chrome_start_failed" => Err("chrome_start_failed"),
             "invalid_course_response" => Err("invalid_course_response"),
             "invalid_contents_response" => Err("invalid_contents_response"),
             "login_timeout" => Err("login_timeout"),
@@ -417,12 +390,27 @@ fn parse_assignments(driver: DriverResult) -> Result<BrowserCourseAssignments, &
     })
 }
 
+fn browser_executable() -> Result<PathBuf, &'static str> {
+    platform::find_browser().ok_or(platform::UNAVAILABLE)
+}
+
+/// Checks the executable paths without starting the browser or Node.js.
+pub fn check_local_dependencies() -> Result<(), &'static str> {
+    browser_executable()?;
+    let path = env::var_os("PATH").ok_or("browser_runtime_unavailable")?;
+    env::split_paths(&path)
+        .any(|directory| platform::is_executable(&directory.join(platform::NODE_EXECUTABLE)))
+        .then_some(())
+        .ok_or("browser_runtime_unavailable")
+}
+
 fn launch(mode: ProfileMode, course_id: Option<&str>) -> Result<DriverResult, &'static str> {
-    let edge = find_edge().ok_or("edge_unavailable")?;
-    let profile = EdgeProfile::open(mode)?;
+    let executable = browser_executable()?;
+    let profile = BrowserProfile::open(mode)?;
     let config = BrowserConfig {
-        edge: &edge,
+        executable: &executable,
         profile: profile.path(),
+        temporary_profile: matches!(mode, ProfileMode::Temporary),
         entry: format!("{HOPPII_ORIGIN}{USER_PAGE}"),
         origins: [HOPPII_ORIGIN, IDP_ORIGIN, WEBCLASS_ORIGIN],
         lms: WEBCLASS_ORIGIN,
@@ -434,7 +422,7 @@ fn launch(mode: ProfileMode, course_id: Option<&str>) -> Result<DriverResult, &'
         max_bytes: BodyKind::WebClassJson.limit(),
         login_millis: 5 * 60 * 1000,
     };
-    let mut report = run_driver(&config, course_id);
+    let mut report = run_driver(&config, &profile, course_id);
     if profile.close().is_err() {
         match &mut report {
             Ok(report) => report.reply.reason = "profile_cleanup_failed".into(),
@@ -467,7 +455,7 @@ fn check<T>(
     }
 }
 
-/// Opens the official site in an app-owned Edge profile and reads only the courses API.
+/// Opens the official site in an app-owned browser profile and reads only the courses API.
 pub fn run(mode: ProfileMode) -> BrowserCourseCheck {
     check(mode, None, |driver| {
         parse_courses(driver.reply.checked_body(0)?)
@@ -486,6 +474,7 @@ pub fn run_for_course(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     const COURSES: &str = include_str!("../fixtures/webclass/courses_basic.json");
     const CONTENTS: &str = include_str!("../fixtures/webclass/contents_basic.json");
@@ -494,35 +483,43 @@ mod tests {
     #[test]
     fn retained_profile_survives_close_and_locks_exclusively() {
         let local = tempfile::tempdir().unwrap();
-        let first = EdgeProfile::retained(local.path()).unwrap();
+        #[cfg(target_os = "macos")]
+        let base = local.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        let base = local.path().to_owned();
+        let first = BrowserProfile::retained(&base).unwrap();
         let path = first.path().to_owned();
-        let browser_file = path.join("edge-owned-fixture");
-        fs::write(&browser_file, "synthetic Edge-owned state").unwrap();
+        let browser_file = path.join("browser-owned-fixture");
+        fs::write(&browser_file, "synthetic browser state").unwrap();
         assert_eq!(
-            EdgeProfile::retained(local.path()).err(),
+            BrowserProfile::retained(&base).err(),
             Some("profile_in_use")
         );
         first.close().unwrap();
-        let reopened = EdgeProfile::retained(local.path()).unwrap();
+        let reopened = BrowserProfile::retained(&base).unwrap();
         assert_eq!(reopened.path(), path);
         assert_eq!(
             fs::read_to_string(browser_file).unwrap(),
-            "synthetic Edge-owned state"
+            "synthetic browser state"
         );
     }
 
     #[test]
     fn retained_profile_rejects_unmanaged_path_and_temporary_profile_is_removed() {
         let local = tempfile::tempdir().unwrap();
-        let foreign = local.path().join(PROFILE_DIRECTORY);
+        #[cfg(target_os = "macos")]
+        let base = local.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        let base = local.path().to_owned();
+        let foreign = base.join(platform::PROFILE_DIRECTORY);
         fs::create_dir(&foreign).unwrap();
         fs::write(foreign.join("test-fixture"), "unmanaged").unwrap();
         assert_eq!(
-            EdgeProfile::retained(local.path()).err(),
+            BrowserProfile::retained(&base).err(),
             Some("profile_not_managed")
         );
         assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1);
-        let temporary = EdgeProfile::open(ProfileMode::Temporary).unwrap();
+        let temporary = BrowserProfile::open(ProfileMode::Temporary).unwrap();
         let path = temporary.path().to_owned();
         temporary.close().unwrap();
         assert!(!path.exists());
@@ -567,8 +564,9 @@ mod tests {
         finish: serde_json::Value,
     ) -> (DriverResult, serde_json::Value) {
         let config = BrowserConfig {
-            edge: Path::new("fixture-edge.exe"),
+            executable: Path::new("fixture-browser"),
             profile: Path::new("fixture-profile"),
+            temporary_profile: true,
             entry: "https://hoppii.synthetic.invalid/portal".into(),
             origins: [
                 "https://hoppii.synthetic.invalid",

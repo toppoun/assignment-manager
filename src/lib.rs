@@ -11,7 +11,7 @@ pub mod sync;
 pub mod university_network;
 pub mod webclass;
 pub mod webclass_auth;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod webclass_browser;
 pub mod webclass_http;
 #[cfg(windows)]

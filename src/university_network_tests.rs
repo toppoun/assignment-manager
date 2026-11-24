@@ -556,10 +556,11 @@ fn moodle_diagnostics_identify_dns_failures_and_tcp_refusal_before_http() {
         assert_eq!(lookup.calls.load(Ordering::SeqCst), 1);
     }
 
-    // Hold the port without listening so a different process cannot claim it.
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let peer = socket.local_addr().unwrap();
+    // A bound socket that never listens can time out on macOS. Close an actual
+    // loopback listener so the connection attempt receives a refusal.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = listener.local_addr().unwrap();
+    drop(listener);
     let lookup = Arc::new(FakeLookup::new(vec![vec![peer]]));
     let client = MoodleClient::for_web(tls_policy(peer, lookup.clone())).unwrap();
     assert_moodle_diagnostic(&client, URL, MoodleSyncError::Fetch, "tcp_connect", None);

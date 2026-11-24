@@ -62,35 +62,52 @@ Moodleの実データ読み取り手順、WebClassの認証上の制約、両OS�
 
 ### WebClassの授業一覧と1授業の課題を確認する
 
-Windowsでは、授業一覧の標準経路は専用Edgeです。Edge、PATH上のNode.js、Windowsのデスクトップセッション、
-大学への接続が必要です。実通信を承認した場合は次を実行します。
+授業一覧と1授業の課題の確認には、WindowsではMicrosoft Edge、macOSではGoogle Chromeを使います。
+PATH上のNode.jsと、ブラウザを操作できるデスクトップセッションが必要です。実通信は、別途承認を得てから実行します。
 
-```powershell
+```sh
 cargo run --locked --offline -- university-check webclass --courses-only --allow-university-read
 ```
 
-専用Edgeで大学公式の認証と属性提供の判断を本人が行い、HOPPIIのWebClassリンクを開きます。
+専用ブラウザで大学公式の認証と属性提供の判断を本人が行い、HOPPIIのWebClassリンクを開きます。
 同じコンテキストから授業一覧を1回取得し、授業ID・名称・年度・学期・曜日・時限と、
 年度・学期ごとの件数を端末に表示します。表示できる授業が現在履修中かどうかは別途確認します。
-中止するときは専用Edgeを閉じます。
+中止するときは専用ブラウザを閉じます。
 
 一時プロファイルが既定です。認証・同意状態を再利用する場合に限り、末尾に `--keep-profile` を付けます。
-Edgeのデータは現在のWindowsユーザーの `%LOCALAPPDATA%\AssignmentManagerWebClassEdge` に保持されます。
-このプロファイルを同時に使うCLIがある場合は終了します。状態の期限が切れたら、次の明示的な実行で
+Windowsでは `%LOCALAPPDATA%\AssignmentManagerWebClassEdge`、macOSでは
+`~/Library/Application Support/AssignmentManagerWebClassChrome` に保持されます。
+どちらも専用の `--user-data-dir` を使用し、一時プロファイルは実行ごとに作成して終了時に削除します。
+保持プロファイルを使用中に別のCLIから起動すると `profile_in_use` で終了します。状態の期限が切れたら、次の明示的な実行で
 公式画面から認証を行います。`--browser` は従来のコマンドとの互換のため利用できます。
-設定ファイルがある場合はWebClassの有効・無効を確認します。Edgeでの認証に登録済み資格情報は不要です。
+設定ファイルがある場合はWebClassの有効・無効を確認します。ブラウザでの認証に登録済み資格情報は不要です。
 [ブラウザ経路の通信と制約](docs/WEB-NETWORK-SECURITY.md#webclassのブラウザ認証)
+
+#### macOSでの準備と合成テスト
+
+Google Chromeを `/Applications` にインストールし、ログイン中のMacのターミナルから実行します。
+CLIは `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` を直接起動します。
+`chrome_unavailable` が表示された場合はインストール先と実行権限を確認してください。
+`chrome_start_failed` の場合は、Chromeが起動できることと、専用プロファイルが使用中でないことを確認してください。
+ソースからの実行にはRust/Cargoと取得済みの依存関係が必要です。Node.js 22で動作を確認しています。
+
+本番通信の承認前に、ループバックの合成SSOで認証、授業取得、プロファイル再利用と異常終了を確認できます。
+
+```sh
+ASSIGNMENT_MANAGER_TEST_CHROME=1 node --test tests/webclass_edge.test.mjs
+cargo test --locked --offline chrome_driver_cleans_up_when_the_cli_disconnects -- --ignored
+```
 
 #### 1授業の課題を確認する
 
 授業一覧で表示された対象の `group_id` を指定します。本番の読み取りが承認された場合に実行します。
 
-```powershell
+```sh
 cargo run --locked --offline -- university-check webclass --course-id 'GROUP_ID' --allow-university-read
 ```
 
 一時プロファイルが既定で、末尾に `--keep-profile` を付けると専用プロファイルを再利用します。
-毎回、取得した一覧でIDが完全一致したときだけ、同じEdgeタブから対象授業の課題を1回取得します。
+毎回、取得した一覧でIDが完全一致したときだけ、取得に使ったブラウザタブから対象授業の課題を1回取得します。
 取得対象には提出済みの課題も含まれます。この確認コマンドでは完了状態の判定や更新は行いません。
 表示項目は授業名とID、課題名とID、期限（日本時間）、提出先URLです。期限がない場合や、取得データから
 提出先URLを確認できない場合は `null` と表示します。表示できる課題が0件の場合も取得と検証が成功すれば
@@ -107,12 +124,21 @@ cargo run --locked --offline --features synthetic-https-fixture -- university-ch
 cargo run --locked --offline --features synthetic-https-fixture -- university-check webclass --courses-only --fixture --review-local
 ```
 
-旧HTTP方式のSSO観測には、登録済み資格情報を使う `--http-probe` を明示します。
-`--check-local` で設定と資格情報項目の有無を通信なしで確認できます。専用設定には
-`credential_namespace` だけを指定できます。
+`--check-local` はブラウザ経路の事前確認です。通常のブラウザ実行と同じ設定チェックを行い、
+WindowsではEdgeとPATH上の `node.exe`、macOSではChromeとPATH上の `node` を探します。
+確認はローカルの設定と実行ファイルの検出だけで完結します。
+別の設定を確認する場合は、`university-check` の前に `--config PATH` を指定します。
 
-```powershell
-cargo run --locked --offline -- --config PATH university-check webclass --courses-only --check-local
+```sh
+cargo run --locked --offline -- university-check webclass --courses-only --check-local
+```
+
+旧HTTP方式のSSO観測には、登録済みのOS資格情報を使う `--http-probe` を指定します。
+`--check-local --http-probe` を組み合わせると、HTTP経路の設定と資格情報項目の有無をオフラインで確認できます。
+HTTP診断用の設定には `credential_namespace` だけを指定できます。
+
+```sh
+cargo run --locked --offline -- --config PATH university-check webclass --courses-only --check-local --http-probe
 cargo run --locked --offline -- --config PATH university-check webclass --courses-only --allow-university-read --http-probe
 ```
 

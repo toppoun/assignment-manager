@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError};
 use credentials::{CredentialStatus, Kind};
 
-const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nWebClass (Windows Edge): university-check webclass (--courses-only | --course-id ID) --allow-university-read [--keep-profile]\nWebClass HTTP diagnostics: university-check webclass --courses-only --allow-university-read --http-probe [--stop-before-consent]\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], university-check webclass --courses-only --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
+const USAGE: &str = "assignment-manager [--config PATH] <doctor | init-state | status | credentials set KIND | notion-check --allow-notion-read | sync --dry-run | university-check moodle --allow-university-read [--require-windows-vpn [--review-local]]>\nWebClass (Windows Edge / macOS Chrome): university-check webclass (--courses-only | --course-id ID) --allow-university-read [--keep-profile]\nWebClass HTTP diagnostics: university-check webclass --courses-only --allow-university-read --http-probe [--stop-before-consent]\nKIND: moodle, webclass, notion\nmacOS: notion-trial --target ID [--dry-run | --allow-notion-write | init-state | status | credentials set read|write]\nFixture build: university-check --fixture [--review-local], university-check webclass --courses-only --fixture [--review-local], sync --dry-run --fixture [--allow-notion-read], init-state --fixture, status --fixture";
 #[cfg(feature = "synthetic-https-fixture")]
 const APPLY_USAGE: &str = "Fixture build: fixture-apply (local synthetic HTTP only)\nMoodle plan: sync moodle --dry-run --fixture\nNotion verification preview: --config PATH sync moodle --dry-run --fixture --allow-notion-read --target ASSIGNMENTS_ID --courses COURSES_ID --reader BOT_ID";
 
@@ -102,7 +102,8 @@ enum WebClassCheckMode {
         stop_before_consent: bool,
     },
     Fixture,
-    Local,
+    LocalBrowser,
+    LocalHttp,
 }
 
 impl Command {
@@ -327,15 +328,23 @@ impl Arguments {
                 mode: WebClassCheckMode::Fixture,
                 review_local: !rest.is_empty(),
             },
-            [
-                "university-check",
-                "webclass",
-                "--courses-only",
-                "--check-local",
-            ] => Command::UniversityWebClass {
-                mode: WebClassCheckMode::Local,
-                review_local: false,
-            },
+            ["university-check", "webclass", "--courses-only", flags @ ..]
+                if matches!(
+                    flags,
+                    ["--check-local"]
+                        | ["--check-local", "--http-probe"]
+                        | ["--http-probe", "--check-local"]
+                ) =>
+            {
+                Command::UniversityWebClass {
+                    mode: if flags.len() == 1 {
+                        WebClassCheckMode::LocalBrowser
+                    } else {
+                        WebClassCheckMode::LocalHttp
+                    },
+                    review_local: false,
+                }
+            }
             ["sync", "--dry-run", "--fixture", "--allow-notion-read"] => {
                 Command::NotionFixturePreview
             }
@@ -807,7 +816,7 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
     if args.command == Command::Help {
         println!("{USAGE}");
         println!(
-            "Offline WebClass preflight: --config PATH university-check webclass --courses-only --check-local"
+            "Offline WebClass preflight: university-check webclass --courses-only --check-local [--http-probe]"
         );
         #[cfg(windows)]
         println!(
@@ -923,6 +932,9 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
                 course_id.as_deref(),
             ));
         }
+        if mode == WebClassCheckMode::LocalBrowser {
+            return university::webclass::check_browser_local(args.config.as_deref());
+        }
         #[cfg(feature = "synthetic-https-fixture")]
         if mode == WebClassCheckMode::Fixture {
             return Ok(university::webclass::fixture(review_local));
@@ -932,7 +944,7 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             None => config::root()?.join("config.json"),
         };
         return match mode {
-            WebClassCheckMode::Local => university::webclass::check_local(&path),
+            WebClassCheckMode::LocalHttp => university::webclass::check_http_local(&path),
             WebClassCheckMode::HttpProbe {
                 stop_before_consent,
             } => university::webclass::http_probe(&path, review_local, stop_before_consent),
