@@ -4,6 +4,14 @@ use assignment_manager::webclass_auth::HoseiCredentials;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
+pub(super) fn unattended<T>(
+    read: impl FnOnce() -> Result<T, CredentialStatus>,
+) -> Result<T, CredentialStatus> {
+    let _no_ui = macos::suppress_interaction_if(true)?;
+    read()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     Moodle,

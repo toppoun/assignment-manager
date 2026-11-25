@@ -296,6 +296,26 @@ impl NotionClient {
                     return Err(NotionError::MethodDisabled);
                 }
             }
+            WriteAccess::ProductionRecurring(approval) => {
+                self.require_course_setup_origin()?;
+                if !approval.permits(self, request) {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
+            #[cfg(all(test, target_os = "macos"))]
+            WriteAccess::VerificationRecurring(approval, sample) => {
+                self.require_course_setup_origin()?;
+                if !approval.permits_verification(self, request, sample) {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
+            #[cfg(all(test, target_os = "macos"))]
+            WriteAccess::VerificationSeed(seed) => {
+                self.require_course_setup_origin()?;
+                if !seed.permits(self, request) {
+                    return Err(NotionError::MethodDisabled);
+                }
+            }
             WriteAccess::Trial(approval) => {
                 self.require_trial_destination(request, approval.target())?
             }
@@ -334,7 +354,10 @@ impl NotionClient {
             }
         }
         if (PRODUCTION_DATA_SOURCES.contains(&request.target_id.as_str())
-            && !matches!(access, WriteAccess::ProductionFirstSync(_)))
+            && !matches!(
+                access,
+                WriteAccess::ProductionFirstSync(_) | WriteAccess::ProductionRecurring(_)
+            ))
             || (request.method() == Method::POST
                 && request.body()["parent"]["data_source_id"] != request.target_id)
         {

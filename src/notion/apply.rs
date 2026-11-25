@@ -11,6 +11,10 @@ mod moodle_create;
 #[cfg(feature = "synthetic-https-fixture")]
 pub use moodle_create::MoodleCreatePreview;
 mod moodle_integration;
+pub(super) mod recurring;
+pub use recurring::{
+    ChangeLimits, RecurringInputs, RecurringMode, RecurringPolicy, RecurringReport,
+};
 mod verification_assignments;
 pub use verification_assignments::{
     AssignmentReadback, ProductionAssignmentWriter, ProductionWriterCheckError,
@@ -92,6 +96,11 @@ pub(super) enum WriteAccess<'a> {
         properties: &'a super::NotionPropertyIds,
     },
     ProductionFirstSync(verification_assignments::ApprovedProductionCreates<'a>),
+    ProductionRecurring(recurring::ApprovedRecurring<'a>),
+    #[cfg(all(test, target_os = "macos"))]
+    VerificationRecurring(recurring::ApprovedRecurring<'a>, &'a SyncKey),
+    #[cfg(all(test, target_os = "macos"))]
+    VerificationSeed(recurring::VerificationSeed<'a>),
     Trial(ApprovedTrial<'a>),
     #[cfg(any(windows, test, feature = "synthetic-https-fixture"))]
     MoodleCreate {
@@ -105,6 +114,17 @@ pub(super) enum WriteAccess<'a> {
         page_id: &'a str,
         properties: [&'a str; 2],
     },
+}
+
+impl<'a> WriteAccess<'a> {
+    fn recurring(&self) -> Option<&recurring::ApprovedRecurring<'a>> {
+        match self {
+            Self::ProductionRecurring(approval) => Some(approval),
+            #[cfg(all(test, target_os = "macos"))]
+            Self::VerificationRecurring(approval, _) => Some(approval),
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct ApprovedTrial<'a>(&'a TrialTarget);
@@ -123,6 +143,7 @@ struct PreparedApply {
     manual_candidates: Vec<(SyncKey, String)>,
     recovered: Vec<(SyncKey, String)>,
     pending: usize,
+    unresolved_keys: Vec<SyncKey>,
     missing_bindings: usize,
 }
 
@@ -140,7 +161,7 @@ impl PreparedApply {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Observation {
     row: NotionAssignment,
     edited_at: Option<DateTime<Utc>>,
@@ -242,7 +263,7 @@ impl NotionClient {
         if fresh != plan {
             return Err(ApplyError::PlanChanged);
         }
-        self.execute_apply(fresh, &store, &WriteAccess::Trial(ApprovedTrial(trial)))
+        self.execute_apply(&fresh, &store, &WriteAccess::Trial(ApprovedTrial(trial)))
             .map(Some)
     }
 
@@ -266,7 +287,7 @@ impl NotionClient {
             }
         };
         match plan {
-            Ok(plan) => self.execute_apply(plan, &store, &WriteAccess::Mock),
+            Ok(plan) => self.execute_apply(&plan, &store, &WriteAccess::Mock),
             Err(error) => Ok(unavailable(input, &store.summary()?, error)),
         }
     }
@@ -295,6 +316,13 @@ impl NotionClient {
         pages.sort_unstable_by(|a, b| a.row.page_id.cmp(&b.row.page_id));
         let rows: Vec<_> = pages.iter().map(|page| page.row.clone()).collect();
         let recovered = reconcile_snapshot(&mut state, &rows);
+        let mut unresolved_keys: Vec<_> = state
+            .bindings
+            .iter()
+            .filter(|(_, binding)| binding.status != BindingStatus::Linked)
+            .map(|(key, _)| key.clone())
+            .collect();
+        unresolved_keys.sort_unstable();
         let mut deltas = build(&schema, &rows)?;
         let manual_candidates = deltas.defer_manual_candidates(&rows);
         deltas.defer_unreconciled(&state);
@@ -310,6 +338,7 @@ impl NotionClient {
             deltas,
             manual_candidates,
             pending: state.pending,
+            unresolved_keys,
             recovered,
             missing_bindings,
         })
@@ -317,7 +346,7 @@ impl NotionClient {
 
     fn execute_apply(
         &self,
-        plan: PreparedApply,
+        plan: &PreparedApply,
         store: &StateStore,
         access: &WriteAccess<'_>,
     ) -> Result<ApplyReport, ApplyError> {
@@ -378,8 +407,13 @@ impl NotionClient {
                 WriteOutcome::Deferred(error) => {
                     report.counts.deferred += 1;
                     if let Some(error) = error {
-                        report.error.get_or_insert(error);
-                        stop_writes |= stops_writes(error);
+                        let shared = must_stop_writes(access, error);
+                        if shared && access.recurring().is_some() {
+                            report.error = Some(error);
+                        } else {
+                            report.error.get_or_insert(error);
+                        }
+                        stop_writes |= shared;
                     }
                 }
             }
@@ -401,6 +435,11 @@ impl NotionClient {
         // The full snapshot remains a prerequisite for reaching this path.
         let matches = match self.query_assignments(schema, Some(key)) {
             Ok(matches) => matches,
+            Err(NotionError::NotFound) if access.recurring().is_some() => {
+                return Ok(WriteOutcome::Deferred(Some(
+                    NotionError::IncompleteSnapshot,
+                )));
+            }
             Err(error) => return Ok(WriteOutcome::Deferred(Some(error))),
         };
         match matches.as_slice() {
@@ -425,7 +464,11 @@ impl NotionClient {
         access: &WriteAccess<'_>,
     ) -> Result<WriteOutcome, StateError> {
         let key = request.key();
-        if !store.reserve_create(key)? {
+        let reserved = match access.recurring() {
+            Some(approval) => store.reserve_recurring_create(key, approval.source())?,
+            None => store.reserve_create(key)?,
+        };
+        if !reserved {
             return Ok(WriteOutcome::Deferred(None));
         }
         #[cfg(test)]
@@ -481,7 +524,8 @@ impl NotionClient {
             {
                 return false;
             }
-            let minute_precision = matches!(access, WriteAccess::VerificationAssignments { .. });
+            let minute_precision = matches!(access, WriteAccess::VerificationAssignments { .. })
+                || access.recurring().is_some();
             if minute_precision
                 && (more_relation
                     || row.source != baseline.row.source
@@ -625,4 +669,9 @@ fn stops_writes(error: NotionError) -> bool {
         error,
         NotionError::Conflict | NotionError::NotFound | NotionError::IncompleteSnapshot
     )
+}
+
+fn must_stop_writes(access: &WriteAccess<'_>, error: NotionError) -> bool {
+    stops_writes(error)
+        || (access.recurring().is_some() && error == NotionError::IncompleteSnapshot)
 }

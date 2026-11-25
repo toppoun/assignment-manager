@@ -60,7 +60,7 @@ impl fmt::Display for CoursePlanCounts {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct DryRunReport {
     plan: Vec<PlannedAssignment>,
     requests: Vec<PreparedWrite>,
@@ -127,6 +127,11 @@ impl DryRunReport {
             .retain(|entry| input.assignments().contains_key(&entry.key));
         self.requests
             .retain(|request| input.assignments().contains_key(request.key()));
+    }
+
+    pub(super) fn append(&mut self, mut other: Self) {
+        self.plan.append(&mut other.plan);
+        self.requests.append(&mut other.requests);
     }
 
     pub(super) fn counts_where(&self, include: impl Fn(&SyncKey) -> bool) -> DryRunCounts {
@@ -306,7 +311,7 @@ impl NotionClient {
         Ok(report)
     }
 
-    fn prepare_report(
+    pub(super) fn prepare_report(
         schema: &Schema,
         plan: Vec<PlannedAssignment>,
     ) -> Result<DryRunReport, NotionError> {

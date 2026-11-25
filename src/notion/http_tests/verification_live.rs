@@ -1,4 +1,6 @@
 //! Explicit, opt-in smoke test against the account's verification data source.
+mod recurring;
+
 use std::{collections::BTreeMap, env, fs, path::PathBuf, sync::atomic::Ordering};
 
 use apple_native_keyring_store::keychain::Store;
@@ -41,13 +43,21 @@ fn input(id: &str, updated: bool) -> SyncInput {
     } else {
         ("initial", "2030-01-01T14:59:59Z")
     };
-    let candidate = AssignmentCandidate {
-        external_key: ExternalRecordKey {
+    synthetic_input(
+        ExternalRecordKey {
             origin: OriginKind::Moodle,
             scope: "assignment-manager.verification.differential.synthetic".into(),
             id: id.into(),
         },
-        title: format!("[合成・差分同期検証 {id}] {label}"),
+        format!("[合成・差分同期検証 {id}] {label}"),
+        deadline,
+    )
+}
+
+fn synthetic_input(key: ExternalRecordKey, title: String, deadline: &str) -> SyncInput {
+    let candidate = AssignmentCandidate {
+        external_key: key,
+        title,
         deadline: Some(Deadline::DateTime(deadline.parse().unwrap())),
         submission: SubmissionTarget::Unknown,
         submission_url: None,

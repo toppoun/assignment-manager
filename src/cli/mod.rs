@@ -14,6 +14,8 @@ mod moodle_review;
 mod moodle_trial;
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
 mod notion_courses;
+#[cfg(target_os = "macos")]
+mod recurring;
 #[cfg(test)]
 mod tests;
 mod trial;
@@ -69,6 +71,8 @@ enum Command {
     RegisterProductionWriter,
     #[cfg(target_os = "macos")]
     CheckProductionWriter,
+    #[cfg(target_os = "macos")]
+    ProductionRecurring(recurring::Action),
     #[cfg(target_os = "macos")]
     VerificationApply {
         create: usize,
@@ -229,6 +233,10 @@ impl Arguments {
                 }
             }
             ["sync", "--dry-run"] => Command::Sync(false),
+            #[cfg(target_os = "macos")]
+            ["sync", "recurring", option] => {
+                Command::ProductionRecurring(recurring::Action::parse(option)?)
+            }
             #[cfg(target_os = "macos")]
             [
                 "sync",
@@ -1056,6 +1064,10 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         println!(
             "Append --headless to the live dry run to use the retained WebClass profile.\nOffline production writer check: --config PATH credentials check notion-writer"
         );
+        #[cfg(target_os = "macos")]
+        println!(
+            "Production recurring sync: --config PATH sync recurring <--dry-run | --enable-writes | --apply | --disable-writes>"
+        );
         println!(
             "Offline WebClass preflight: university-check webclass --courses-only --check-local [--http-probe]"
         );
@@ -1098,6 +1110,10 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         credentials::production_writer(&target).map_err(CliError::Credential)?;
         println!("production_writer=ready network=disabled");
         return Ok(0);
+    }
+    #[cfg(target_os = "macos")]
+    if let Command::ProductionRecurring(action) = args.command {
+        return Ok(recurring::execute(args.config.as_deref(), action));
     }
     #[cfg(target_os = "macos")]
     if matches!(

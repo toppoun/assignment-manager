@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+mod recurring;
+
 use super::*;
 use crate::{
     import::{DEFAULT_COURSE_SOURCE_SCOPE, ExternalRecordKey, OriginKind},

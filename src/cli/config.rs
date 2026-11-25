@@ -24,6 +24,17 @@ pub(super) struct Config {
     pub course_mappings: Vec<CourseMapping>,
     #[serde(default)]
     pub sample_assignment_page_ids: Vec<String>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub recurring_sync: Option<RecurringConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) struct RecurringConfig {
+    pub writer_bot_id: String,
+    pub moodle: Option<assignment_manager::notion::ChangeLimits>,
+    pub webclass: Option<assignment_manager::notion::ChangeLimits>,
 }
 
 #[derive(Deserialize)]

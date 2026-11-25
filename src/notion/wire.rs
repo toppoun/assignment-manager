@@ -32,7 +32,7 @@ pub struct NotionPropertyIds {
     pub source: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotionTarget {
     pub assignments_data_source_id: String,
@@ -95,7 +95,7 @@ impl CourseRulesTarget {
     }
 }
 
-#[derive(PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Schema {
     pub assignments_id: String,
     pub assignments_database: String,
@@ -621,7 +621,7 @@ pub(super) fn relation_value(id: &str) -> Result<Value, NotionError> {
 }
 
 /// A request preview with no authorization data or send method.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedWrite {
     pub(super) target_id: String,
     key: SyncKey,
@@ -638,6 +638,17 @@ impl PreparedWrite {
             method: Method::POST,
             path: "/v1/pages".into(),
             body: json!({"parent":{"type":"data_source_id","data_source_id":target_id},"properties":properties}),
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn verification_patch(key: SyncKey, page_id: &str, properties: Value) -> Self {
+        Self {
+            target_id: super::trial::MOODLE_VERIFICATION_ASSIGNMENTS.to_owned(),
+            key,
+            method: Method::PATCH,
+            path: format!("/v1/pages/{page_id}"),
+            body: json!({"properties": properties}),
         }
     }
 

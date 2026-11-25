@@ -64,6 +64,154 @@ fn stderr(output: &Output) -> &str {
     std::str::from_utf8(&output.stderr).unwrap()
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn recurring_cli_reports_blocked_as_versioned_json_without_credentials_or_state() {
+    let temp = tempfile::tempdir().unwrap();
+    for (argument, mode, error) in [
+        ("--apply", "apply", "configuration_required"),
+        ("--dry-run", "preview", "configuration_required"),
+        (
+            "--disable-writes",
+            "disable_writes",
+            "configuration_required",
+        ),
+        (
+            "--enable-writes",
+            "enable_writes",
+            "interactive_terminal_required",
+        ),
+    ] {
+        let output = call(&temp, &["sync", "recurring", argument]);
+        assert_eq!(output.status.code(), Some(2));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["mode"], mode);
+        assert_eq!(report["error"], error);
+        assert!(stderr(&output).is_empty());
+    }
+    assert!(!local_root(&temp).exists());
+}
+
+#[cfg(target_os = "macos")]
+fn recurring_config(path: &Path, [assignments, courses, rules]: [&str; 3]) -> serde_json::Value {
+    let config = serde_json::json!({
+        "notion": {
+            "assignments_data_source_id": assignments,
+            "courses_data_source_id": courses,
+            "properties": {
+                "title":"title","deadline":"date","course":"course","submission_url":"url",
+                "sync_key":"sync","source":"source"
+            },
+            "course_rules": {
+                "data_source_id": rules,
+                "course_term":"term","source":"source","scope":"scope","external_id":"id",
+                "term":"term","course":"course","status":"status","setup":{"group_id":"gid"}
+            }
+        },
+        "webclass": false,
+        "moodle":{"host":"moodle.fixture.invalid","path":"/calendar/export","scope":"default.course-related"}
+    });
+    fs::write(path, config.to_string()).unwrap();
+    config
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn recurring_cli_disables_offline_when_policy_is_removed_and_respects_target_lock() {
+    use assignment_manager::notion::state::StateStore;
+    let temp = tempfile::tempdir().unwrap();
+    let path = test_home(&temp).join("config.json");
+    let assignments = "41d85934-7e84-811c-a9bb-000b8b646c3f";
+    recurring_config(
+        &path,
+        [
+            assignments,
+            "41d85934-7e84-815d-bab8-000b9dbad959",
+            "42285934-7e84-8183-8e04-000ba36d1080",
+        ],
+    );
+    let run = |action| {
+        let output = call(
+            &temp,
+            &[
+                "--config",
+                path.to_str().unwrap(),
+                "sync",
+                "recurring",
+                action,
+            ],
+        );
+        assert!(stderr(&output).is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        (output.status.code().unwrap(), report)
+    };
+    let (code, report) = run("--apply");
+    assert_eq!(code, 2);
+    assert_eq!(report["error"], "recurring_not_configured");
+    let (code, report) = run("--disable-writes");
+    assert_eq!(code, 2);
+    assert_eq!(report["error"], "state_missing_or_invalid");
+    assert!(!local_root(&temp).exists());
+
+    let directory = local_root(&temp).join("targets").join(assignments);
+    fs::create_dir_all(&directory).unwrap();
+    StateStore::initialize(&directory.join("state.sqlite3"), assignments).unwrap();
+    let lock = TargetLock::acquire(&directory).unwrap();
+    let (code, report) = run("--disable-writes");
+    assert_eq!(code, 4);
+    assert_eq!(report["status"], "busy");
+    assert_eq!(report["error"], "target_busy");
+    drop(lock);
+    for _ in 0..2 {
+        let (code, report) = run("--disable-writes");
+        assert_eq!(code, 0);
+        assert_eq!(report["mode"], "disable_writes");
+        assert_eq!(report["status"], "disabled");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn recurring_cli_rejects_verification_target_and_has_no_live_test_action() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = test_home(&temp).join("verification.json");
+    let mut config = recurring_config(
+        &path,
+        [
+            "41e85934-7e84-817e-b1d2-000b68726503",
+            "41e85934-7e84-81df-902b-000bbece9bf7",
+            "42285934-7e84-81a9-9770-000be500f527",
+        ],
+    );
+    config["recurring_sync"] = serde_json::json!({
+        "writer_bot_id": "00000000-0000-4000-8000-000000000001",
+        "moodle": {"max_creates": 5, "max_updates": 3}
+    });
+    fs::write(&path, config.to_string()).unwrap();
+    for action in ["--dry-run", "--apply", "--disable-writes"] {
+        let output = call(
+            &temp,
+            &[
+                "--config",
+                path.to_str().unwrap(),
+                "sync",
+                "recurring",
+                action,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["error"], "target_mismatch");
+    }
+    let output = call(&temp, &["sync", "recurring", "verification_live_recurring"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("invalid_arguments"));
+    assert!(!local_root(&temp).exists());
+}
+
 #[cfg(all(windows, feature = "synthetic-https-fixture"))]
 #[test]
 fn moodle_trial_rejects_redirected_input_before_opening_config_or_state() {

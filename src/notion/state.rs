@@ -252,13 +252,17 @@ impl StateStore {
     }
 
     pub fn read(path: &Path, target: &str) -> Result<Option<StateSummary>, StateError> {
+        Self::read_only(path, target)?
+            .map(|state| state.summary())
+            .transpose()
+    }
+
+    pub(super) fn read_only(path: &Path, target: &str) -> Result<Option<Self>, StateError> {
         check_path(path)?;
         if !exists(path)? {
             return Ok(None);
         }
-        Self::open(path, target, OpenFlags::SQLITE_OPEN_READ_ONLY)?
-            .summary()
-            .map(Some)
+        Self::open(path, target, OpenFlags::SQLITE_OPEN_READ_ONLY).map(Some)
     }
 
     /// Open an already initialized state file for explicit apply or recovery.
@@ -318,6 +322,127 @@ impl StateStore {
             )
             .map(|changed| changed == 1)
             .map_err(|_| StateError::Database)
+    }
+
+    pub(super) fn recurring_approval(&self) -> Result<Option<String>, StateError> {
+        if !self.has_table("recurring_approval")? {
+            return Ok(None);
+        }
+        if !self.has_table("recurring_origins")? {
+            return Err(StateError::InvalidDatabase);
+        }
+        self.0
+            .query_row(
+                "SELECT fingerprint FROM recurring_approval WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StateError::InvalidDatabase)
+    }
+
+    pub(super) fn approve_recurring(&self, fingerprint: &str) -> Result<(), StateError> {
+        // These tables are additive so existing first-sync state files stay usable.
+        let tx = self
+            .0
+            .unchecked_transaction()
+            .map_err(|_| StateError::Database)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS recurring_approval (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                fingerprint TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS recurring_origins (
+                sync_key TEXT PRIMARY KEY NOT NULL,
+                source TEXT NOT NULL CHECK(source IN ('moodle','webclass'))
+            ) STRICT;",
+        )
+        .map_err(|_| StateError::Database)?;
+        tx.execute(
+            "INSERT INTO recurring_approval VALUES (1,?1)
+             ON CONFLICT(singleton) DO UPDATE SET fingerprint=excluded.fingerprint",
+            [fingerprint],
+        )
+        .map_err(|_| StateError::Database)?;
+        tx.commit().map_err(|_| StateError::Database)
+    }
+
+    pub(super) fn revoke_recurring_approval(&self) -> Result<(), StateError> {
+        if self.recurring_approval()?.is_some() {
+            self.0
+                .execute("DELETE FROM recurring_approval WHERE singleton=1", [])
+                .map_err(|_| StateError::Database)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn reserve_recurring_create(
+        &self,
+        key: &SyncKey,
+        source: UniversitySource,
+    ) -> Result<bool, StateError> {
+        let tx = self
+            .0
+            .unchecked_transaction()
+            .map_err(|_| StateError::Database)?;
+        if !self.reserve_create(key)? {
+            return Ok(false);
+        }
+        let source = match source {
+            UniversitySource::Moodle => "moodle",
+            UniversitySource::WebClass => "webclass",
+        };
+        tx.execute(
+            "INSERT INTO recurring_origins VALUES (?1,?2)
+             ON CONFLICT(sync_key) DO UPDATE SET source=excluded.source",
+            params![key.as_str(), source],
+        )
+        .map_err(|_| StateError::Database)?;
+        tx.commit().map_err(|_| StateError::Database)?;
+        Ok(true)
+    }
+
+    pub(super) fn recurring_origins(
+        &self,
+    ) -> Result<HashMap<SyncKey, UniversitySource>, StateError> {
+        if !self.has_table("recurring_origins")? {
+            return Ok(HashMap::new());
+        }
+        let mut statement = self
+            .0
+            .prepare(
+                "SELECT b.sync_key,r.source FROM bindings b
+             JOIN recurring_origins r USING (sync_key) WHERE b.status<>'linked'",
+            )
+            .map_err(|_| StateError::InvalidDatabase)?;
+        let mut rows = statement
+            .query([])
+            .map_err(|_| StateError::InvalidDatabase)?;
+        let mut origins = HashMap::new();
+        while let Some(row) = rows.next().map_err(|_| StateError::InvalidDatabase)? {
+            let key: String = row.get(0).map_err(|_| StateError::InvalidDatabase)?;
+            let source: String = row.get(1).map_err(|_| StateError::InvalidDatabase)?;
+            let source = match source.as_str() {
+                "moodle" => UniversitySource::Moodle,
+                "webclass" => UniversitySource::WebClass,
+                _ => return Err(StateError::InvalidDatabase),
+            };
+            origins.insert(
+                key.parse().map_err(|_| StateError::InvalidDatabase)?,
+                source,
+            );
+        }
+        Ok(origins)
+    }
+
+    fn has_table(&self, name: &str) -> Result<bool, StateError> {
+        self.0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1 AND type='table')",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|_| StateError::InvalidDatabase)
     }
 
     pub fn binding(&self, key: &SyncKey) -> Result<Option<Binding>, StateError> {

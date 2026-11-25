@@ -67,6 +67,7 @@ impl CourseRuleSummary {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub(super) struct ConfirmedCourse {
     pub(super) page_id: String,
     pub(super) term: String,
@@ -74,6 +75,7 @@ pub(super) struct ConfirmedCourse {
 
 type RuleResult = Result<ConfirmedCourse, DeferredReason>;
 
+#[derive(PartialEq, Eq)]
 pub(super) struct CourseRuleEntry {
     pub(super) page_id: String,
     pub(super) name: String,
@@ -109,6 +111,17 @@ pub(super) struct CourseRules {
 }
 
 impl CourseRules {
+    pub(super) fn webclass_scopes(&self) -> BTreeMap<String, String> {
+        self.by_key
+            .iter()
+            .filter(|(key, _)| key.origin == OriginKind::WebClass)
+            .filter_map(|(key, rule)| {
+                let course = rule.resolution.as_ref().ok()?;
+                Some((key.id.clone(), course.term.clone()))
+            })
+            .collect()
+    }
+
     pub(super) fn resolve(&self, assignment: &SyncAssignment) -> Result<&str, DeferredReason> {
         let rule = assignment
             .course_key
@@ -156,16 +169,7 @@ impl NotionClient {
             .ok_or(NotionError::Configuration)?;
         let schema = self.retrieve_schema(target)?;
         let rules = self.read_course_rules(config, &schema)?;
-        Ok(rules
-            .by_key
-            .into_iter()
-            .filter_map(|(key, rule)| {
-                if key.origin != OriginKind::WebClass {
-                    return None;
-                }
-                rule.resolution.ok().map(|course| (key.id, course.term))
-            })
-            .collect())
+        Ok(rules.webclass_scopes())
     }
 
     pub(super) fn read_course_rules(

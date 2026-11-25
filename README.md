@@ -339,12 +339,120 @@ cargo run --locked --offline -- --config local/notion-production.json sync --app
 Phase 3Cの合成HTTPモックでの作成・再同期、障害復旧、実書き込みの有効化条件は
 [Notion同期 Phase 3C](docs/NOTION-SYNC-PHASE-3C.md)を参照してください。
 
+#### Macで本番の差分同期を1回実行する
+
+定期同期は既定で書き込み無効です。検証は合成データとループバックのNotionモックで行います。
+実アカウントによるWebClassの自動取得は大学の利用条件を確認してから行ってください。
+既存の本番状態DBと本番専用Writerを使い、初回同期とは別に定期同期の書き込みを承認します。
+既存Writerに初回作成用の `Read content` と `Insert content` だけを付けている場合、
+既存課題の更新には同じ接続に `Update content` が必要です。承認時の読み取り検証はBot ID・対象・スキーマを確認します。
+
+Moodleだけで始める場合は、既存の本番設定の `notion` と `moodle` を使い、次の項目を追加または変更します。
+`writer_bot_id` に既存の本番専用WriterのBot IDを指定し、`recurring_sync.webclass` を省略します。
+定期同期はMoodleだけを取得し、JSONに `webclass.acquisition = "disabled"` を出力します。
+Moodleには、本番対象に登録済みの授業関連カレンダーURLと、Notionの授業対応表に登録したスコープを使います。
+
+```json
+{
+  "webclass": false,
+  "recurring_sync": {
+    "writer_bot_id": "00000000-0000-4000-8000-000000000001",
+    "moodle": { "max_creates": 5, "max_updates": 3 }
+  }
+}
+```
+
+Moodleの運用開始時は、1回あたり作成5件・更新3件を目安にします。初回同期後の差分に適用する上限です。
+承認前に `--dry-run` の `moodle.planned` を確認し、学期開始時などに上限を超える場合は変更内容を確認してから
+上限を調整します。上限を超えた取得元は `change_limit` で停止します。`0` は該当する操作を無効にします。
+
+```sh
+"$CLI" --config local/notion-production.json sync recurring --dry-run
+"$CLI" --config local/notion-production.json sync recurring --enable-writes
+"$CLI" --config local/notion-production.json sync recurring --apply
+```
+
+`--dry-run` は取得と計画を行います。`--enable-writes` では対話端末に表示される課題・授業・対応表の対象、
+WriterのBot ID、取得元、変更件数の上限を確認します。表示された承認文字列を入力すると、Writerと対象スキーマを
+読み取りで検証し、承認を対象の状態DBに保存します。対象、Bot ID、取得元、Moodleフィード設定、上限、
+または検証済みのスキーマが変わった場合、適用には再承認が必要です。
+
+`--apply` は1回実行して終了します。WebClassを設定した場合は既存の専用プロファイルをヘッドレスで開き、
+再認証が必要ならWebClassだけを失敗として報告します。取得元ごとに処理し、上限超過やその取得元に限られる不整合も分けて扱います。
+Notionの一覧や対象スキーマが不完全な実行は書き込み前に停止します。既存課題の変更は課題名と期限に限定し、
+手動課題、提出状態、メモ、提出URLを保護します。作成の成否が不明なら状態DBに残して照合し、未確定のまま再送しません。
+期限経過などによる課題の減少や正常な空の取得で、既存課題を削除・アーカイブすることはありません。
+
+標準出力の1行JSONには `schema_version`、`mode`、`status`、全体の `error`、
+`moodle`・`webclass` ごとの取得状態・候補数・適用状態・計画件数・適用件数・エラーが含まれます。
+取得失敗や未実行の `candidates` は `null`、正常に取得できた空の一覧は `0` です。
+書き込み結果が確認できなかった場合は保留または未確定として報告します。
+
+| 終了コード | 状態 | 意味 |
+| --- | --- | --- |
+| 0 | `success` / `approved` / `disabled` | 選択した取得元の処理が完了、書き込み承認を保存、または取り消し済み |
+| 1 | `failed` | 処理対象の取得元がすべて失敗 |
+| 2 | `blocked` | 承認不足・ポリシー変更・整合性違反などで適用不可 |
+| 3 | `partial` | 取得元の一部が成功、または適用に保留・未確定が残った |
+| 4 | `busy` | 対象の排他ロックを別プロセスが保持 |
+
+起動間隔や通知はCLIの外で管理します。Linuxへ移行する際は、旧ホストを停止し、承認と作成意図を含む
+既存の状態DBを引き継ぎます。ローカルの排他ロックはホストをまたいで共有されません。
+
+**一時停止**するには、使用中の設定ファイルから `recurring_sync` を外します。以後の `--apply` は
+`recurring_not_configured` と終了コード `2` を返します。同じ設定を復元すると、状態DBに残っている承認が再び有効になります。
+
+**承認を取り消す**には、同じ本番対象の設定ファイルを指定して次を実行します。`recurring_sync` を外した状態でも実行できます。
+
+```sh
+"$CLI" --config local/notion-production.json sync recurring --disable-writes
+```
+
+`--disable-writes` はローカルの本番状態DBを排他ロックし、定期同期の承認だけを取り消します。同期履歴、同期キー、
+未解決の作成予約は保持します。キーチェーン、Notion、大学サービスへの接続は不要です。
+取り消し済みの場合も `mode: "disable_writes"`、`status: "disabled"`、終了コード `0` を返します。
+ほかの処理が対象をロック中の場合は `target_busy` と終了コード `4` を返すので、処理の終了後に再実行します。
+取り消し後は同じ設定を復元しても、再度 `--enable-writes` で承認するまで `--apply` は書き込みを停止します。
+
 ### macOSの検証用Notionへの試験同期
 
 `notion-trial --target ID` は独立した検証用課題・授業データソースと合成課題1件を使います。
 既定はdry-runです。書き込みには `--allow-notion-write` と、表示された計画の対話承認が必要です。
 検証環境の準備・共有と試験書き込みには別途承認が必要です。設定例と検証手順は
 [Notion同期 Phase 3D](docs/NOTION-SYNC-PHASE-3D.md)を参照してください。
+
+定期同期は、macOSの明示実行用テスト `verification_live_recurring` で実Notionを検証できます。
+`local/notion-verification.json` の検証用課題・授業・対応表のIDと、既存の検証用BotのIDを照合します。
+Writerには検証用課題DBでの読み取り、作成、更新権限が必要です。
+取得データは合成し、同期キーと独立した状態DBで今回の合成課題1件に書き込みを限定します。
+
+```sh
+cargo test --locked --offline --all-features --lib --no-run
+# 上のコマンドが表示した lib のテストバイナリを TEST_BINARY に設定する。
+export ASSIGNMENT_MANAGER_RECURRING_STATE="$(mktemp -d /private/tmp/assignment-manager-recurring.XXXXXXXX)"
+export ASSIGNMENT_MANAGER_RECURRING_ID="$(openssl rand -hex 6)"
+test_phase=notion::http_tests::verification_live::recurring::verification_live_recurring
+ASSIGNMENT_MANAGER_RECURRING_PHASE=preflight "$TEST_BINARY" --exact "$test_phase" --ignored --nocapture
+```
+
+以降は同じバイナリで `ASSIGNMENT_MANAGER_RECURRING_PHASE` を切り替え、標準入力を `/dev/null` に
+接続して実行します。キーチェーンに許可が必要な場合は、`preflight` で検証用項目ごとに許可します。
+`enable` のときだけ、明示承認として環境変数 `ASSIGNMENT_MANAGER_RECURRING_APPROVAL` に
+`ENABLE VERIFICATION RECURRING ` と実行IDを連結した文字列を渡します。
+
+| フェーズ | 期待する出力と終了コード |
+| --- | --- |
+| `unapproved` | `write_not_approved`、2 |
+| `enable` | `approved`、0。承認文字列を省略すると `approval_missing`、2 |
+| `create` | Moodleの作成1件、0 |
+| `seed` | 合成課題に保護対象のテスト値を設定、0 |
+| `update-partial` | Moodleの更新1件、HOPPIIの模擬再認証エラー、3 |
+| `repeat` | 作成・更新ともに0件、0 |
+| `policy-changed` | `policy_changed`、2 |
+| `disable` | 検証用StateStoreから承認だけを取り消す、0 |
+| `disabled-apply` | `write_not_approved`、2 |
+
+途中で失敗した場合も `disable` を実行します。検証用StateStoreと合成課題は確認用に残ります。
 
 ### 授業の対応表と既存課題の移行案
 

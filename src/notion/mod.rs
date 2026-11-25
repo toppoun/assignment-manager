@@ -20,8 +20,9 @@ mod trial;
 mod wire;
 
 pub use apply::{
-    ApplyError, ApplyPreview, ApplyReport, AssignmentReadback, ProductionAssignmentWriter,
-    ProductionWriterCheckError, ProtectedManualAssignment,
+    ApplyError, ApplyPreview, ApplyReport, AssignmentReadback, ChangeLimits,
+    ProductionAssignmentWriter, ProductionWriterCheckError, ProtectedManualAssignment,
+    RecurringInputs, RecurringMode, RecurringPolicy, RecurringReport,
 };
 pub use apply::{
     MOODLE_INTEGRATION_SCOPE, MoodleBindingAudit, MoodlePreviewCoverage, MoodlePreviewMappings,

@@ -312,7 +312,7 @@ impl NotionClient {
         fresh.missing_bindings = 0;
         StateStore::initialize(&state_path, assignments_id)?;
         let store = StateStore::for_apply(&state_path, assignments_id)?;
-        writer.execute_apply(fresh, &store, access)
+        writer.execute_apply(&fresh, &store, access)
     }
 
     /// Compare the current rows to the original acquisition, and inspect optional
