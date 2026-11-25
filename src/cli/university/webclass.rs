@@ -1,3 +1,5 @@
+#[cfg(any(windows, target_os = "macos"))]
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use assignment_manager::{
@@ -85,14 +87,15 @@ pub(in crate::cli) fn check_browser_local(explicit: Option<&Path>) -> Result<u8,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8 {
-    use assignment_manager::webclass_browser::{self, ProfileMode};
-
+pub(super) fn interactive_terminal() -> bool {
+    let terminal = io::stdin().is_terminal() && io::stderr().is_terminal();
     #[cfg(windows)]
-    if !crate::cli::windows_dialog::interactive_station() {
-        println!("webclass browser diagnostic=interactive_windows_session_required");
-        return finish(false);
-    }
+    let terminal = terminal && crate::cli::windows_dialog::interactive_station();
+    terminal
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn prompt_browser_authentication() {
     #[cfg(windows)]
     let browser = "Edge";
     #[cfg(target_os = "macos")]
@@ -100,13 +103,46 @@ pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8
     println!(
         "{browser}の大学公式画面で認証し、HOPPIIのWebClassリンクを開いてください。中止する場合は専用の{browser}を閉じてください。"
     );
-    let (mode, profile) = if keep_profile {
-        (ProfileMode::Retained, "retained")
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(in crate::cli) fn authenticate() -> u8 {
+    if !interactive_terminal() {
+        println!("webclass authentication=stopped diagnostic=interactive_terminal_required");
+        return finish(false);
+    }
+    prompt_browser_authentication();
+    let check = assignment_manager::webclass_browser::authenticate();
+    report_browser_navigation(check.navigation);
+    match check.result {
+        Ok(()) => {
+            println!("webclass authentication=ready profile=retained");
+            finish(true)
+        }
+        Err(reason) => {
+            println!("webclass authentication=failed diagnostic={reason}");
+            finish(false)
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(in crate::cli) fn browser(keep_profile: bool, headless: bool, course_id: Option<&str>) -> u8 {
+    use assignment_manager::webclass_browser::{self, ProfileMode};
+
+    let mode = if headless || !interactive_terminal() {
+        ProfileMode::Headless
+    } else if keep_profile {
+        ProfileMode::Retained
     } else {
-        (ProfileMode::Temporary, "temporary")
+        ProfileMode::Temporary
     };
+    if !matches!(mode, ProfileMode::Headless) {
+        prompt_browser_authentication();
+    }
     if let Some(course_id) = course_id {
         let check = webclass_browser::run_for_course(mode, course_id);
+        let profile = mode.label();
         println!(
             "webclass browser lms_reached={} courses_get={} contents_get={} profile={profile}",
             check.lms_reached, check.courses_get, check.contents_get,
@@ -146,7 +182,7 @@ pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8
                 finish(true)
             }
             Err(reason) => {
-                println!("webclass assignments=0 validation=failed diagnostic={reason}");
+                println!("webclass acquisition=failed diagnostic={reason}");
                 finish(false)
             }
         };
@@ -179,7 +215,7 @@ pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8
             finish(true)
         }
         Err(reason) => {
-            println!("webclass courses=0 validation=failed diagnostic={reason}");
+            println!("webclass acquisition=failed diagnostic={reason}");
             finish(false)
         }
     }
@@ -189,12 +225,9 @@ pub(in crate::cli) fn browser(keep_profile: bool, course_id: Option<&str>) -> u8
 pub(in crate::cli) fn read_browser_course_list(
     mode: assignment_manager::webclass_browser::ProfileMode,
 ) -> Result<assignment_manager::sync::AcquiredWebClassCourses, &'static str> {
-    use assignment_manager::webclass_browser::{self, ProfileMode};
+    use assignment_manager::webclass_browser;
     let check = webclass_browser::run(mode);
-    let profile = match mode {
-        ProfileMode::Temporary => "temporary",
-        ProfileMode::Retained => "retained",
-    };
+    let profile = mode.label();
     println!(
         "webclass browser lms_reached={} courses_get={} profile={profile}",
         check.lms_reached, check.courses_get
@@ -204,7 +237,7 @@ pub(in crate::cli) fn read_browser_course_list(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn report_browser_navigation(
+pub(super) fn report_browser_navigation(
     navigation: Option<assignment_manager::webclass_browser::BrowserNavigation>,
 ) {
     if let Some(navigation) = navigation {
@@ -216,7 +249,17 @@ fn report_browser_navigation(
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub(in crate::cli) fn browser(_keep_profile: bool, _course_id: Option<&str>) -> u8 {
+pub(in crate::cli) fn browser(
+    _keep_profile: bool,
+    _headless: bool,
+    _course_id: Option<&str>,
+) -> u8 {
+    println!("webclass browser diagnostic=windows_or_macos_required");
+    finish(false)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(in crate::cli) fn authenticate() -> u8 {
     println!("webclass browser diagnostic=windows_or_macos_required");
     finish(false)
 }

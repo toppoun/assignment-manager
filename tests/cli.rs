@@ -448,7 +448,12 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
         "--courses-only",
         "--allow-university-read",
     ];
-    for flags in [&[][..], &["--keep-profile"][..], &["--http-probe"][..]] {
+    for flags in [
+        &[][..],
+        &["--keep-profile"][..],
+        &["--http-probe"][..],
+        &["--headless"][..],
+    ] {
         let output = call(&temp, &[webclass.as_slice(), flags].concat());
         assert_eq!(output.status.code(), Some(2));
         assert!(stderr(&output).contains("source_disabled"));
@@ -473,6 +478,24 @@ fn university_check_requires_the_exact_opt_in_and_moodle_configuration() {
     let browser_profile = "Library/Application Support/AssignmentManagerWebClassChrome";
     #[cfg(any(windows, target_os = "macos"))]
     assert!(!test_home(&temp).join(browser_profile).exists());
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn webclass_authentication_does_not_open_a_browser_without_a_terminal() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = call(
+        &temp,
+        &[
+            "university-check",
+            "webclass",
+            "--authenticate",
+            "--allow-university-read",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).contains("interactive_terminal_required"));
+    assert!(!local_root(&temp).exists());
 }
 
 #[cfg(feature = "synthetic-https-fixture")]

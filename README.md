@@ -63,7 +63,8 @@ Moodleの実データ読み取り手順、WebClassの認証上の制約、両OS�
 ### WebClassの授業一覧と1授業の課題を確認する
 
 授業一覧と1授業の課題の確認には、WindowsではMicrosoft Edge、macOSではGoogle Chromeを使います。
-PATH上のNode.jsと、ブラウザを操作できるデスクトップセッションが必要です。実通信は、別途承認を得てから実行します。
+PATH上のNode.jsが必要です。ブラウザで本人認証を行うときは、操作できるデスクトップセッションと対話端末で実行します。
+実通信は、別途承認を得てから実行します。
 
 ```sh
 cargo run --locked --offline -- university-check webclass --courses-only --allow-university-read
@@ -74,7 +75,8 @@ cargo run --locked --offline -- university-check webclass --courses-only --allow
 年度・学期ごとの件数を端末に表示します。表示できる授業が現在履修中かどうかは別途確認します。
 中止するときは専用ブラウザを閉じます。
 
-一時プロファイルが既定です。認証・同意状態を再利用する場合に限り、末尾に `--keep-profile` を付けます。
+対話端末では一時プロファイルが既定です。認証・同意状態を再利用する場合は、末尾に `--keep-profile` を付けます。
+非対話の取得は、既存の専用プロファイルをヘッドレスで開きます。
 Windowsでは `%LOCALAPPDATA%\AssignmentManagerWebClassEdge`、macOSでは
 `~/Library/Application Support/AssignmentManagerWebClassChrome` に保持されます。
 どちらも専用の `--user-data-dir` を使用し、一時プロファイルは実行ごとに作成して終了時に削除します。
@@ -144,6 +146,60 @@ cargo run --locked --offline -- --config PATH university-check webclass --course
 
 HTTP診断ではSAMLフォームのACS照合または同意画面の観測で停止します。
 [HTTP診断の通信制限](docs/WEB-NETWORK-SECURITY.md#webclass授業一覧専用cli)を参照してください。
+
+### Macの運用用CLIと非対話取得
+
+開発には `cargo run` を使い、運用では署名を検証した固定パスのCLIを使います。
+Rust、Xcode Command Line Tools、ロック済みのCargo依存関係を用意してから、次を実行します。
+
+```sh
+CLI="$(bash macos/install-operation-cli.sh)"
+printf '%s\n' "$CLI"
+```
+
+スクリプトは `target/operation-build` でリリースビルドし、
+`~/Library/Application Support/AssignmentManagerCLI/bin` の下にSHA-256別のディレクトリを作って配置します。
+配置済みのCLIは上書きしません。別の配置先を使う場合は絶対パスを引数に渡します。
+ビルド環境が管理している署名を使う場合は、`ASSIGNMENT_MANAGER_SIGN_IDENTITY` にその署名IDを指定できます。
+更新時は同じ手順で新しいパスに配置し、次の非対話診断に通ってから実行先を切り替えます。
+切り戻すときは、直前に動作したCLIの絶対パスを指定します。
+
+キーチェーンの確認が出たら、今回配置したCLIからの要求であることを確認し、
+MoodleとNotion Readerなど、そのCLIが担当する項目にだけ「常に許可」を与えます。
+Writerの読み取り確認には以下を実行します。トークンの読み取りと形式検証だけを行い、結果を固定値で表示します。
+
+```sh
+"$CLI" --config local/notion-production.json credentials check notion-writer
+"$CLI" --config local/notion-production.json credentials check notion-writer </dev/null
+```
+
+最初の実行はアクセスが未許可のときに対話端末で行います。2行目が
+`production_writer=ready network=disabled` なら、その同じCLIで非対話の読み取りが可能です。
+`credential_missing` は対象項目が未登録、`credential_unavailable` は許可や解錠などが必要な状態です。
+ReaderとMoodleはそれぞれの読み取り専用コマンドで確認できます。
+CLI更新後はこの確認を繰り返します。キーチェーンへの許可は必要な項目と対象CLIに限定します。
+
+WebClassで実アカウントを用いた自動取得の可否は大学に確認してください。開発・回帰テストにはローカル模擬環境を使います。
+利用条件が確認できた環境では、本人が対話端末で次を実行して、大学公式画面で認証・同意し、HOPPIIのWebClassリンクを開きます。
+WebClassのログイン済み画面を検出するとChromeを閉じて専用プロファイルを保存します。この手順では授業・課題APIの取得はありません。
+
+```sh
+"$CLI" --config local/notion-production.json university-check webclass --authenticate --allow-university-read
+```
+
+通常の取得は次のように実行できます。コマンドは授業ルール・課題の読み取りと差分の確認を行います。
+
+```sh
+"$CLI" --config local/notion-production.json sync --dry-run --allow-university-read --allow-notion-read --production-read-only --headless
+```
+
+授業一覧や1授業の確認にも、従来の診断コマンドで末尾に `--headless` を指定できます。
+非対話のブラウザ取得では既存の専用プロファイルでWebClassへ直接接続します。
+実行中は排他ロックを保持します。macOSでは専用ディレクトリを `0700` で作り、開く際に所有者とアクセスモードを検査します。
+`reauth_required` または `auth_expired` の場合は取得を中止し、利用者が `--authenticate` で認証し直します。
+`access_denied` はアクセス拒否、`network_failed` と `browser_navigation_failed` は通信・遷移失敗、
+`server_unavailable` は429または5xx、`invalid_course_response` などは応答形式不一致です。
+認証状態を確認できない画面は `webclass_ready_timeout` で停止します。失敗した取得を空の授業・課題として扱いません。
 
 ### macOSでのビルドとローカル検証
 

@@ -52,6 +52,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
   const dashboardPath = "/webclass/ip_mods.php/plugin/score_summary_table/dashboard";
   const contentsPath = coursesPath.replace(/courses$/, "contents");
   const ssoPostPath = "/webclass/singlesignon.php";
+  const loginPath = "/webclass/login.php";
   const cssoQuery = "?ticket=fixture-private-csso-query";
   const scienceGroup = "fixture-scientific-english-2";
   const scienceCourses = JSON.stringify(JSON.parse(courses).map((course) => course.group_id === "fixture-course-002"
@@ -61,7 +62,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
   const selectPath = (group) => contentsPath + "?" + new URLSearchParams({ group_id: group });
   const servers = [];
   const counters = { portal: 0, consent: 0, remembered: 0, acs: 0, queriedCsso: 0,
-    courses: 0, contents: 0, unknown: 0, mutation: 0 };
+    courses: 0, contents: 0, unknown: 0, mutation: 0, login: 0 };
   const contentsRequests = [];
   const secret = "synthetic-unexported-session";
   const failedNavigation = "/disconnected?state=fixture-private-navigation";
@@ -144,8 +145,22 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
         if (request.url === ssoPostPath + cssoQuery) counters.queriedCsso++;
         request.resume().on("end", () => response.writeHead(303, {
           Location: "/webclass/",
-          "Set-Cookie": "fixture=" + secret + "; Path=/webclass; HttpOnly; Secure; SameSite=Lax",
+          "Set-Cookie": "fixture=" + secret + "; Path=/webclass; HttpOnly; Secure; SameSite=Lax" +
+            (resultMode.startsWith("operation-") ? "; Max-Age=300" : ""),
         }).end());
+      } else if (new URL(request.url, lms).pathname === loginPath) {
+        counters.login++;
+        html(response, '<input type="password">');
+      } else if (request.url === dashboardPath) {
+        if (resultMode === "operation-idp") {
+          response.writeHead(302, { Location: idp + "/consent" }).end();
+        } else if (resultMode === "operation-document-forbidden") {
+          response.writeHead(403).end();
+        } else if (request.headers.cookie !== "fixture=" + secret) {
+          response.writeHead(302, { Location: loginPath }).end();
+        } else {
+          html(response, '<a href="/webclass/logout.php">ログアウト</a>');
+        }
       } else if (request.url === "/webclass/") {
         if (request.headers.cookie !== "fixture=" + secret) {
           response.writeHead(401).end();
@@ -172,6 +187,14 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
           response.writeHead(401).end();
         } else if (resultMode === "redirect") {
           response.writeHead(302, { Location: "/webclass/blocked" }).end();
+        } else if (resultMode === "operation-login-redirect") {
+          response.writeHead(302, { Location: loginPath + "?fixture-query=private" }).end();
+        } else if (resultMode === "operation-login-html") {
+          html(response, '<input type="password">');
+        } else if (resultMode === "operation-server") {
+          response.writeHead(503).end();
+        } else if (resultMode === "operation-network") {
+          request.socket.destroy();
         } else {
           const body = resultMode === "csso-query" ? scienceCourses :
             resultMode === "special" ? courses.replace("fixture-course-002", special) : courses;
@@ -227,7 +250,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
       return {
         executable, profile: join(root, profile), entry: portal + "/portal",
         origins: [portal, idp, lms], lms, coursesPath, contentsPath, dashboardPath, ssoPostPath,
-        maxBytes: 1024 * 1024, loginMillis: 6000, ...options,
+        loginPath, maxBytes: 1024 * 1024, loginMillis: 6000, ...options,
       };
     }
 
@@ -340,7 +363,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
 
     resultMode = "redirect";
     const redirected = await testRun("redirect", clickFixtureConsent);
-    assert.equal(redirected.reason, "course_request_failed");
+    assert.equal(redirected.reason, "unexpected_api_redirect");
     assert.equal(redirected.courses_get, 1);
     assert.equal(counters.acs, 6);
     assert.equal(counters.courses, 6);
@@ -369,7 +392,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
     assert.equal(missing.courses_get, 1);
     assert.equal(missing.contents_get, 0);
     for (const [mode, diagnostic] of [
-      ["contents-expired", "auth_expired"], ["contents-redirect", "contents_request_failed"],
+      ["contents-expired", "access_denied"], ["contents-redirect", "unexpected_api_redirect"],
       ["partial", "invalid_contents_response"], ["html", "invalid_contents_response"],
       ["large", "contents_response_limit"],
     ]) {
@@ -527,6 +550,50 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
       assert.equal(unaffected.courses_get, 1);
       assert.equal(interrupted?.reason, "browser_closed");
     }
+
+    handoffOrigin = undefined;
+    resultMode = "operation-authenticate";
+    const base = { ...counters };
+    const authenticated = await runBrowser(config("operation-retained", { operation: "authenticate" }),
+      { flags, headed: isMac, interact: clickFixtureConsent });
+    assert.equal(authenticated.reason, "authenticated");
+    assert.equal(authenticated.courses_get, 0);
+    assert.equal(authenticated.contents_get, 0);
+    assert.equal(authenticated.body, undefined);
+    assert.equal(counters.consent, base.consent + 1);
+    assert.equal(counters.acs, base.acs + 1);
+    assert.equal(counters.courses, base.courses);
+
+    const headless = (profile = "operation-retained") => config(profile, {
+      operation: "headless", entry: lms + dashboardPath,
+    });
+    const acquired = await runBrowser(headless(), { flags: [certificateFlag] },
+      () => selectPath("fixture-course-002"));
+    assert.equal(acquired.reason, "ok");
+    assert.equal(acquired.courses_get, 1);
+    assert.equal(acquired.contents_get, 1);
+
+    for (const [mode, reason, requests, profile] of [
+      ["operation-authenticate", "reauth_required", 0, "operation-empty"],
+      ["operation-idp", "reauth_required", 0],
+      ["operation-document-forbidden", "access_denied", 0],
+      ["operation-login-redirect", "reauth_required", 1],
+      ["operation-login-html", "reauth_required", 1],
+      ["operation-server", "server_unavailable", 1],
+      ["operation-network", "network_failed", 1],
+    ]) {
+      resultMode = mode;
+      const failed = await runBrowser(headless(profile), { flags: [certificateFlag] },
+        () => assert.fail("failed acquisition reached course selection"));
+      assert.equal(failed.reason, reason, mode);
+      assert.equal(failed.courses_get, requests, mode);
+      assert.equal(failed.contents_get, 0, mode);
+      assert.equal(failed.body, undefined, mode);
+    }
+    assert.equal(counters.portal, base.portal + 1);
+    assert.equal(counters.consent, base.consent + 1);
+    assert.equal(counters.acs, base.acs + 1);
+    assert.equal(counters.login, 0);
   } finally {
     await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

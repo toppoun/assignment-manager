@@ -94,19 +94,19 @@ mod tests {
 
     use super::*;
     use crate::webclass_browser::{
-        BrowserConfig, DriverMessage, ProfileMode, driver_command, run_driver,
+        BrowserConfig, BrowserOperation, DriverMessage, ProfileMode, driver_command, run_driver,
     };
 
     #[test]
     fn retained_profile_rejects_a_public_directory_or_redirected_marker() {
         let local = tempfile::tempdir().unwrap();
         let base = local.path().canonicalize().unwrap();
-        let profile = BrowserProfile::retained(&base).unwrap();
+        let profile = BrowserProfile::retained(&base, true).unwrap();
         let path = profile.path().to_owned();
         profile.close().unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            BrowserProfile::retained(&base).err(),
+            BrowserProfile::retained(&base, false).err(),
             Some("profile_not_managed")
         );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -114,7 +114,7 @@ mod tests {
         fs::remove_dir(&marker).unwrap();
         symlink(&base, marker).unwrap();
         assert_eq!(
-            BrowserProfile::retained(&base).err(),
+            BrowserProfile::retained(&base, false).err(),
             Some("profile_path_unavailable")
         );
     }
@@ -129,7 +129,7 @@ mod tests {
             let profile = if temporary_profile {
                 BrowserProfile::open(ProfileMode::Temporary).unwrap()
             } else {
-                BrowserProfile::retained(&base).unwrap()
+                BrowserProfile::retained(&base, true).unwrap()
             };
             let path = profile.path().to_owned();
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -139,12 +139,14 @@ mod tests {
                 executable: &chrome,
                 profile: &path,
                 temporary_profile,
+                operation: BrowserOperation::Browse,
                 entry: format!("{origin}/portal"),
                 origins: [&origin; 3],
                 lms: &origin,
                 courses_path: "/webclass/courses",
                 contents_path: "/webclass/contents",
                 dashboard_path: "/webclass/dashboard",
+                login_path: "/webclass/login.php",
                 sso_post_path: "/webclass/singlesignon.php",
                 select_contents: false,
                 max_bytes: 4096,
@@ -170,7 +172,7 @@ mod tests {
             } else {
                 drop(profile);
                 assert_eq!(
-                    BrowserProfile::retained(&base).err(),
+                    BrowserProfile::retained(&base, false).err(),
                     Some("profile_in_use")
                 );
             }
@@ -186,7 +188,7 @@ mod tests {
             if temporary_profile {
                 assert!(!path.exists());
             } else {
-                let profile = BrowserProfile::retained(&base).unwrap();
+                let profile = BrowserProfile::retained(&base, false).unwrap();
                 assert_eq!(profile.path(), path);
                 let missing = base.join("missing-chrome");
                 config.executable = &missing;

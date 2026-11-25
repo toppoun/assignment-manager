@@ -57,12 +57,18 @@ enum Command {
     #[cfg(target_os = "macos")]
     ProductionDryRun,
     #[cfg(target_os = "macos")]
+    HeadlessDryRun {
+        production: bool,
+    },
+    #[cfg(target_os = "macos")]
     ProductionFirstSync {
         writer: String,
         create: usize,
     },
     #[cfg(target_os = "macos")]
     RegisterProductionWriter,
+    #[cfg(target_os = "macos")]
+    CheckProductionWriter,
     #[cfg(target_os = "macos")]
     VerificationApply {
         create: usize,
@@ -124,6 +130,10 @@ enum Command {
 enum WebClassCheckMode {
     Browser {
         keep_profile: bool,
+        course_id: Option<String>,
+    },
+    Authenticate,
+    Headless {
         course_id: Option<String>,
     },
     HttpProbe {
@@ -234,6 +244,20 @@ impl Arguments {
                 "--allow-notion-read",
                 "--production-read-only",
             ] if config.is_some() => Command::ProductionDryRun,
+            #[cfg(target_os = "macos")]
+            [
+                "sync",
+                "--dry-run",
+                "--allow-university-read",
+                "--allow-notion-read",
+                rest @ ..,
+            ] if config.is_some() => match rest {
+                ["--headless"] => Command::HeadlessDryRun { production: false },
+                ["--production-read-only", "--headless"] => {
+                    Command::HeadlessDryRun { production: true }
+                }
+                _ => return Err(CliError::Usage),
+            },
             #[cfg(target_os = "macos")]
             [
                 "sync",
@@ -374,6 +398,15 @@ impl Arguments {
             ["fixture-apply"] => Command::FixtureApply,
             [
                 "university-check",
+                "webclass",
+                "--authenticate",
+                "--allow-university-read",
+            ] => Command::UniversityWebClass {
+                mode: WebClassCheckMode::Authenticate,
+                review_local: false,
+            },
+            [
+                "university-check",
                 "moodle",
                 "--allow-university-read",
                 rest @ ..,
@@ -411,6 +444,7 @@ impl Arguments {
                         },
                         false,
                     ),
+                    ["--headless"] => (WebClassCheckMode::Headless { course_id: None }, false),
                     ["--stop-before-consent"] | ["--http-probe", "--stop-before-consent"] => (
                         WebClassCheckMode::HttpProbe {
                             stop_before_consent: true,
@@ -441,16 +475,20 @@ impl Arguments {
                 "--allow-university-read",
                 rest @ ..,
             ] if !id.trim().is_empty() && !id.starts_with("--") => {
-                let keep_profile = match rest {
-                    [] | ["--browser"] => false,
-                    ["--keep-profile"] | ["--browser", "--keep-profile"] => true,
+                let mode = match rest {
+                    [] | ["--browser"] | ["--keep-profile"] | ["--browser", "--keep-profile"] => {
+                        WebClassCheckMode::Browser {
+                            keep_profile: rest.contains(&"--keep-profile"),
+                            course_id: Some((*id).into()),
+                        }
+                    }
+                    ["--headless"] => WebClassCheckMode::Headless {
+                        course_id: Some((*id).into()),
+                    },
                     _ => return Err(CliError::Usage),
                 };
                 Command::UniversityWebClass {
-                    mode: WebClassCheckMode::Browser {
-                        keep_profile,
-                        course_id: Some((*id).into()),
-                    },
+                    mode,
                     review_local: false,
                 }
             }
@@ -491,6 +529,10 @@ impl Arguments {
             #[cfg(target_os = "macos")]
             ["credentials", "set", "notion-writer"] if config.is_some() => {
                 Command::RegisterProductionWriter
+            }
+            #[cfg(target_os = "macos")]
+            ["credentials", "check", "notion-writer"] if config.is_some() => {
+                Command::CheckProductionWriter
             }
             ["credentials", "set", kind] => {
                 Command::Register(Kind::parse(kind).ok_or(CliError::Usage)?)
@@ -999,6 +1041,9 @@ fn run_fixture(_: Command, _: PathBuf) -> Result<u8, CliError> {
 fn execute(args: Arguments) -> Result<u8, CliError> {
     if args.command == Command::Help {
         println!("{USAGE}");
+        println!(
+            "WebClass retained session: university-check webclass --authenticate --allow-university-read\nWebClass retained fetch: append --headless to the courses-only or course-id browser command"
+        );
         #[cfg(target_os = "macos")]
         println!(
             "Course setup preview: --config PATH sync --setup-courses --term YEAR:SEMESTER --allow-university-read --allow-notion-read\nCourse setup verification apply: add --apply --allow-notion-write --expect-plan PLAN_ID"
@@ -1006,6 +1051,10 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         #[cfg(target_os = "macos")]
         println!(
             "Live dry run: --config PATH sync --dry-run --allow-university-read --allow-notion-read [--production-read-only]\nVerification assignment apply: --config PATH sync --apply --allow-university-read --allow-notion-read --allow-notion-write --expect-create N --expect-unchanged N [--expect-update N]\nProduction first sync: --config PATH sync --apply --allow-university-read --allow-notion-read --allow-notion-write --production-first-sync --writer BOT_ID [--expect-create N]\nProduction writer registration: --config PATH credentials set notion-writer"
+        );
+        #[cfg(target_os = "macos")]
+        println!(
+            "Append --headless to the live dry run to use the retained WebClass profile.\nOffline production writer check: --config PATH credentials check notion-writer"
         );
         println!(
             "Offline WebClass preflight: university-check webclass --courses-only --check-local [--http-probe]"
@@ -1039,10 +1088,23 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         return Ok(0);
     }
     #[cfg(target_os = "macos")]
+    if args.command == Command::CheckProductionWriter {
+        let path = args.config.as_deref().ok_or(CliError::Usage)?;
+        let target = assignment_manager::notion::live_assignment_read_target(
+            &Config::read(path)?.notion,
+            true,
+        )
+        .map_err(|_| ConfigError::Invalid)?;
+        credentials::production_writer(&target).map_err(CliError::Credential)?;
+        println!("production_writer=ready network=disabled");
+        return Ok(0);
+    }
+    #[cfg(target_os = "macos")]
     if matches!(
         args.command,
         Command::VerificationDryRun
             | Command::ProductionDryRun
+            | Command::HeadlessDryRun { .. }
             | Command::VerificationApply { .. }
             | Command::ProductionFirstSync { .. }
     ) {
@@ -1056,13 +1118,16 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             } => Mode::VerificationApply {
                 expected: (create, update, unchanged),
             },
-            Command::ProductionDryRun => Mode::ProductionDryRun,
+            Command::ProductionDryRun | Command::HeadlessDryRun { production: true } => {
+                Mode::ProductionDryRun
+            }
             Command::ProductionFirstSync { ref writer, create } => {
                 Mode::ProductionFirstSync { writer, create }
             }
             _ => Mode::VerificationDryRun,
         };
-        return university::dry_run::execute(&Config::read(path)?, path, mode);
+        let headless = matches!(args.command, Command::HeadlessDryRun { .. });
+        return university::dry_run::execute(&Config::read(path)?, path, mode, headless);
     }
     #[cfg(target_os = "macos")]
     if let Command::CourseSetupPreview {
@@ -1167,8 +1232,21 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
             university::webclass::check_browser_config(args.config.as_deref())?;
             return Ok(university::webclass::browser(
                 *keep_profile,
+                false,
                 course_id.as_deref(),
             ));
+        }
+        if let WebClassCheckMode::Headless { course_id } = &mode {
+            university::webclass::check_browser_config(args.config.as_deref())?;
+            return Ok(university::webclass::browser(
+                true,
+                true,
+                course_id.as_deref(),
+            ));
+        }
+        if mode == WebClassCheckMode::Authenticate {
+            university::webclass::check_browser_config(args.config.as_deref())?;
+            return Ok(university::webclass::authenticate());
         }
         if mode == WebClassCheckMode::LocalBrowser {
             return university::webclass::check_browser_local(args.config.as_deref());

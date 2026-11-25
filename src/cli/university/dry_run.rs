@@ -57,7 +57,12 @@ impl SyncWriter<'_> {
     }
 }
 
-pub(in crate::cli) fn execute(local: &Config, path: &Path, mode: Mode<'_>) -> Result<u8, CliError> {
+pub(in crate::cli) fn execute(
+    local: &Config,
+    path: &Path,
+    mode: Mode<'_>,
+    headless: bool,
+) -> Result<u8, CliError> {
     let production = matches!(
         mode,
         Mode::ProductionDryRun | Mode::ProductionFirstSync { .. }
@@ -198,8 +203,14 @@ pub(in crate::cli) fn execute(local: &Config, path: &Path, mode: Mode<'_>) -> Re
         println!("webclass=failed diagnostic={reason}");
         None
     } else {
-        println!("Chromeの大学公式画面で認証し、HOPPIIのWebClassリンクを開いてください。");
-        let check = webclass_browser::run_for_confirmed_courses(ProfileMode::Temporary, &requested);
+        let profile = if headless || !super::webclass::interactive_terminal() {
+            ProfileMode::Headless
+        } else {
+            super::webclass::prompt_browser_authentication();
+            ProfileMode::Temporary
+        };
+        let check = webclass_browser::run_for_confirmed_courses(profile, &requested);
+        super::webclass::report_browser_navigation(check.navigation);
         println!(
             "webclass_fetch confirmed_groups={} courses_get={} contents_get={}",
             requested.len(),

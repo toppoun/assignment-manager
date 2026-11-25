@@ -41,6 +41,25 @@ const PROFILE_OWNER_MARKER: &str = "assignment-manager-webclass-profile-v1";
 pub enum ProfileMode {
     Temporary,
     Retained,
+    Authenticate,
+    Headless,
+}
+
+impl ProfileMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Temporary => "temporary",
+            Self::Retained | Self::Authenticate | Self::Headless => "retained",
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+enum BrowserOperation {
+    Browse,
+    Authenticate,
+    Headless,
 }
 
 enum BrowserProfile {
@@ -64,11 +83,14 @@ impl BrowserProfile {
                     .map(Self::Temporary)
                     .map_err(|_| "browser_setup")
             }
-            ProfileMode::Retained => Self::retained(&platform::retained_base()?),
+            ProfileMode::Retained | ProfileMode::Authenticate => {
+                Self::retained(&platform::retained_base()?, true)
+            }
+            ProfileMode::Headless => Self::retained(&platform::retained_base()?, false),
         }
     }
 
-    fn retained(local: &Path) -> Result<Self, &'static str> {
+    fn retained(local: &Path, create: bool) -> Result<Self, &'static str> {
         let path = local.join(platform::PROFILE_DIRECTORY);
         let marker = path.join(PROFILE_OWNER_MARKER);
         check_path(&marker).map_err(|_| "profile_path_unavailable")?;
@@ -76,10 +98,18 @@ impl BrowserProfile {
             return Err("profile_path_unavailable");
         }
         // Claim only a new directory. Never initialize any pre-existing profile in place.
-        match platform::create_private_dir(&path) {
-            Ok(()) => platform::create_private_dir(&marker).map_err(|_| "profile_setup")?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err("profile_setup"),
+        if create {
+            match platform::create_private_dir(&path) {
+                Ok(()) => platform::create_private_dir(&marker).map_err(|_| "profile_setup")?,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err("profile_setup"),
+            }
+        } else if let Err(error) = path.symlink_metadata() {
+            return Err(if error.kind() == io::ErrorKind::NotFound {
+                "reauth_required"
+            } else {
+                "profile_path_unavailable"
+            });
         }
         platform::verify_profile_owner(&path, &marker)?;
         let _lock = TargetLock::acquire(&path).map_err(|error| match error {
@@ -179,12 +209,14 @@ struct BrowserConfig<'a> {
     executable: &'a Path,
     profile: &'a Path,
     temporary_profile: bool,
+    operation: BrowserOperation,
     entry: String,
     origins: [&'a str; 3],
     lms: &'a str,
     courses_path: &'a str,
     contents_path: &'a str,
     dashboard_path: &'a str,
+    login_path: &'a str,
     sso_post_path: &'a str,
     select_contents: bool,
     max_bytes: usize,
@@ -373,26 +405,39 @@ impl BrowserReply {
             {
                 Ok(())
             }
-            "acquisition_context_changed" => Err("acquisition_context_changed"),
-            "auth_expired" => Err("auth_expired"),
-            "browser_closed" => Err("browser_closed"),
-            "browser_navigation_failed" => Err("browser_navigation_failed"),
-            "course_request_failed" => Err("course_request_failed"),
-            "course_response_limit" => Err("course_response_limit"),
-            "contents_request_failed" => Err("contents_request_failed"),
-            "contents_response_limit" => Err("contents_response_limit"),
-            "edge_start_failed" => Err("edge_start_failed"),
-            "chrome_start_failed" => Err("chrome_start_failed"),
-            "invalid_course_response" => Err("invalid_course_response"),
-            "invalid_contents_response" => Err("invalid_contents_response"),
-            "login_timeout" => Err("login_timeout"),
-            "navigation_limit" => Err("navigation_limit"),
-            "navigation_method_blocked" => Err("navigation_method_blocked"),
-            "profile_startup_tabs" => Err("profile_startup_tabs"),
-            "profile_cleanup_failed" => Err("profile_cleanup_failed"),
-            "proxy_failure" => Err("proxy_failure"),
-            "unknown_destination" => Err("unknown_destination"),
-            _ => Err("browser_protocol"),
+            _ => Err(self.diagnostic()),
+        }
+    }
+
+    fn diagnostic(&self) -> &'static str {
+        match self.reason.as_str() {
+            "acquisition_context_changed" => "acquisition_context_changed",
+            "auth_expired" => "auth_expired",
+            "reauth_required" => "reauth_required",
+            "access_denied" => "access_denied",
+            "server_unavailable" => "server_unavailable",
+            "network_failed" => "network_failed",
+            "unexpected_api_redirect" => "unexpected_api_redirect",
+            "browser_closed" => "browser_closed",
+            "browser_navigation_failed" => "browser_navigation_failed",
+            "course_request_failed" => "course_request_failed",
+            "course_response_limit" => "course_response_limit",
+            "contents_request_failed" => "contents_request_failed",
+            "contents_response_limit" => "contents_response_limit",
+            "edge_start_failed" => "edge_start_failed",
+            "chrome_start_failed" => "chrome_start_failed",
+            "invalid_course_response" => "invalid_course_response",
+            "invalid_contents_response" => "invalid_contents_response",
+            "login_timeout" => "login_timeout",
+            "webclass_ready_timeout" => "webclass_ready_timeout",
+            "acquisition_timeout" => "acquisition_timeout",
+            "navigation_limit" => "navigation_limit",
+            "navigation_method_blocked" => "navigation_method_blocked",
+            "profile_startup_tabs" => "profile_startup_tabs",
+            "profile_cleanup_failed" => "profile_cleanup_failed",
+            "proxy_failure" => "proxy_failure",
+            "unknown_destination" => "unknown_destination",
+            _ => "browser_protocol",
         }
     }
 
@@ -506,16 +551,32 @@ fn launch(
 ) -> Result<DriverResult, &'static str> {
     let executable = browser_executable()?;
     let profile = BrowserProfile::open(mode)?;
+    let (operation, entry) = match mode {
+        ProfileMode::Headless => (
+            BrowserOperation::Headless,
+            format!("{WEBCLASS_ORIGIN}{DASHBOARD_PATH}"),
+        ),
+        ProfileMode::Authenticate => (
+            BrowserOperation::Authenticate,
+            format!("{HOPPII_ORIGIN}{USER_PAGE}"),
+        ),
+        _ => (
+            BrowserOperation::Browse,
+            format!("{HOPPII_ORIGIN}{USER_PAGE}"),
+        ),
+    };
     let config = BrowserConfig {
         executable: &executable,
         profile: profile.path(),
         temporary_profile: matches!(mode, ProfileMode::Temporary),
-        entry: format!("{HOPPII_ORIGIN}{USER_PAGE}"),
+        operation,
+        entry,
         origins: [HOPPII_ORIGIN, IDP_ORIGIN, WEBCLASS_ORIGIN],
         lms: WEBCLASS_ORIGIN,
         courses_path: COURSES_PATH,
         contents_path: CONTENTS_PATH,
         dashboard_path: DASHBOARD_PATH,
+        login_path: "/webclass/login.php",
         sso_post_path: WEBCLASS_SSO_POST_PATH,
         select_contents: request.is_some(),
         max_bytes: BodyKind::WebClassJson.limit(),
@@ -561,6 +622,24 @@ pub fn run(mode: ProfileMode) -> BrowserCourseCheck {
     })
 }
 
+/// Let the account holder establish a retained session without reading course data.
+pub fn authenticate() -> BrowserCheck<()> {
+    check(ProfileMode::Authenticate, None, |driver| {
+        let reply = &driver.reply;
+        if reply.reason == "authenticated"
+            && reply.lms_reached
+            && reply.courses_get == 0
+            && reply.contents_get == 0
+            && reply.body.is_none()
+            && reply.bodies.is_none()
+        {
+            Ok(())
+        } else {
+            Err(reply.diagnostic())
+        }
+    })
+}
+
 /// Reads the assignments of one course identified by the source-native `group_id`.
 pub fn run_for_course(
     mode: ProfileMode,
@@ -603,16 +682,21 @@ mod tests {
         let base = local.path().canonicalize().unwrap();
         #[cfg(windows)]
         let base = local.path().to_owned();
-        let first = BrowserProfile::retained(&base).unwrap();
+        assert_eq!(
+            BrowserProfile::retained(&base, false).err(),
+            Some("reauth_required")
+        );
+        assert!(!base.join(platform::PROFILE_DIRECTORY).exists());
+        let first = BrowserProfile::retained(&base, true).unwrap();
         let path = first.path().to_owned();
         let browser_file = path.join("browser-owned-fixture");
         fs::write(&browser_file, "synthetic browser state").unwrap();
         assert_eq!(
-            BrowserProfile::retained(&base).err(),
+            BrowserProfile::retained(&base, false).err(),
             Some("profile_in_use")
         );
         first.close().unwrap();
-        let reopened = BrowserProfile::retained(&base).unwrap();
+        let reopened = BrowserProfile::retained(&base, false).unwrap();
         assert_eq!(reopened.path(), path);
         assert_eq!(
             fs::read_to_string(browser_file).unwrap(),
@@ -631,7 +715,7 @@ mod tests {
         fs::create_dir(&foreign).unwrap();
         fs::write(foreign.join("test-fixture"), "unmanaged").unwrap();
         assert_eq!(
-            BrowserProfile::retained(&base).err(),
+            BrowserProfile::retained(&base, true).err(),
             Some("profile_not_managed")
         );
         assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1);
@@ -692,6 +776,7 @@ mod tests {
             executable: Path::new("fixture-browser"),
             profile: Path::new("fixture-profile"),
             temporary_profile: true,
+            operation: BrowserOperation::Browse,
             entry: "https://hoppii.synthetic.invalid/portal".into(),
             origins: [
                 "https://hoppii.synthetic.invalid",
@@ -702,6 +787,7 @@ mod tests {
             courses_path: COURSES_PATH,
             contents_path: CONTENTS_PATH,
             dashboard_path: DASHBOARD_PATH,
+            login_path: "/webclass/login.php",
             sso_post_path: WEBCLASS_SSO_POST_PATH,
             select_contents: true,
             max_bytes: BodyKind::WebClassJson.limit(),

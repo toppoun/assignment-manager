@@ -162,9 +162,9 @@ function browserNetworkCause({ errorText: code, blockedReason }) {
   }
 }
 
-function parseUrl(raw) {
+function parseUrl(raw, base) {
   try {
-    const url = new URL(raw);
+    const url = new URL(raw, base);
     return url.username || url.password ? null : url;
   } catch {
     return null;
@@ -186,6 +186,19 @@ function navigationStage(url, config) {
   return null;
 }
 
+function requiresAuthentication(url, config) {
+  if (!url) return false;
+  return url.origin === config.lms
+    ? url.pathname === config.loginPath
+    : config.origins.slice(0, 2).includes(url.origin);
+}
+
+function statusReason(status) {
+  if (status === 401) return "auth_expired";
+  if (status === 403) return "access_denied";
+  if (status === 429 || status >= 500) return "server_unavailable";
+}
+
 // Runs in an isolated JS world on the verified WebClass document.
 function loggedIn(dashboard) {
   const signedIn = (doc) => {
@@ -204,43 +217,55 @@ function loggedIn(dashboard) {
   });
 }
 
-async function readJson(origin, target, maxBytes, kind, referrer) {
+async function readJson(origin, target, maxBytes, kind, referrer, classifyStatus) {
   if (location.origin !== origin || !location.pathname.startsWith("/webclass/")) {
     return { reason: "acquisition_context_changed" };
   }
   try {
     const response = await fetch(target, {
       method: "GET", mode: "same-origin", credentials: "same-origin",
-      redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15000),
+      redirect: "manual", cache: "no-store", signal: AbortSignal.timeout(15000),
       headers: { Accept: "application/json" },
       referrer: referrer ?? undefined, referrerPolicy: referrer ? "same-origin" : undefined,
     });
-    if (response.status === 401 || response.status === 403) return { reason: "auth_expired" };
+    const failure = classifyStatus(response.status);
+    if (failure) return { reason: failure };
+    if (response.type === "opaqueredirect") return { reason: "unexpected_api_redirect" };
+    const type = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
     if (response.status !== 200 || response.url !== origin + target || response.redirected ||
         response.headers.has("content-range") || response.headers.has("link") ||
-        response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") {
+        (type !== "application/json" && type !== "text/html")) {
       return { reason: `invalid_${kind}_response` };
     }
+    if (!response.body) return { reason: `invalid_${kind}_response` };
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8", { fatal: true });
     let bytes = 0;
     let body = "";
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) return { reason: "ok", body: body + decoder.decode() };
-      bytes += value.length;
+      bytes += value?.length ?? 0;
       if (bytes > maxBytes) {
         void reader.cancel();
         return { reason: `${kind}_response_limit` };
       }
-      body += decoder.decode(value, { stream: true });
+      try {
+        body += decoder.decode(value, { stream: !done });
+      } catch {
+        return { reason: `invalid_${kind}_response` };
+      }
+      if (done) break;
     }
+    if (type === "application/json") return { reason: "ok", body };
+    return { reason: /<input\b[^>]*\stype\s*=\s*(?:"password"|'password'|password(?=[\s/>]))/i.test(body)
+      ? "reauth_required" : `invalid_${kind}_response` };
   } catch {
-    return { reason: `${kind}_request_failed` };
+    return { reason: "network_failed" };
   }
 }
 
-const expression = (fn, ...args) => "(" + fn.toString() + ")(" + args.map((arg) => JSON.stringify(arg)).join(",") + ")";
+const expression = (fn, ...args) => "(" + fn.toString() + ")(" + args
+  .map((arg) => typeof arg === "function" ? "(" + arg.toString() + ")" : JSON.stringify(arg)).join(",") + ")";
 
 async function isolatedWorld(pipe, session, frameId) {
   const { executionContextId } = await pipe.send("Page.createIsolatedWorld", {
@@ -317,6 +342,8 @@ export async function runBrowser(config, fixture, selectContents, signal) {
   let browserReady = false;
   let proxy;
   const isMac = process.platform === "darwin";
+  const headless = config.operation === "headless";
+  const authenticate = config.operation === "authenticate";
   const startupFailure = isMac ? "chrome_start_failed" : "edge_start_failed";
   let stopped = false;
   let lmsReached = false;
@@ -331,10 +358,14 @@ export async function runBrowser(config, fixture, selectContents, signal) {
   const interrupted = () => stop("browser_closed");
   signal?.addEventListener("abort", interrupted, { once: true });
   if (signal?.aborted) interrupted();
-  const timeout = setTimeout(() => stop("login_timeout"), config.loginMillis);
+  const timeout = setTimeout(() => stop(headless ? "acquisition_timeout" : "login_timeout"), config.loginMillis);
+  const readyTimeout = headless
+    ? setTimeout(() => stop("webclass_ready_timeout"), Math.min(30000, config.loginMillis))
+    : undefined;
   let outcome;
   try {
-    proxy = await startProxy(config.origins.filter((origin) => new URL(origin).protocol === "https:"),
+    const origins = headless ? [config.lms] : config.origins;
+    proxy = await startProxy(origins.filter((origin) => new URL(origin).protocol === "https:"),
       fixture?.dial, fixture?.connectMillis);
     if (stopped) throw new Error();
     const flags = [
@@ -346,7 +377,8 @@ export async function runBrowser(config, fixture, selectContents, signal) {
       "--proxy-bypass-list=<-loopback>",
       "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
     ];
-    if (fixture) flags.push("--headless=new", ...fixture.flags);
+    if (headless || (fixture && !fixture.headed)) flags.push("--headless=new");
+    if (fixture) flags.push(...fixture.flags);
     browser = spawn(config.executable, flags, { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
     browserExited = new Promise((resolve) => {
       browser.once("exit", () => {
@@ -407,7 +439,22 @@ export async function runBrowser(config, fixture, selectContents, signal) {
     }
 
     // Interception only reads routing metadata, never request headers or form fields.
-    async function requestPaused({ request: { url: raw, method }, requestId, resourceType, frameId }, session) {
+    async function requestPaused({
+      request: { url: raw, method }, requestId, resourceType, frameId,
+      responseStatusCode, responseErrorReason, responseHeaders,
+    }, session) {
+      if (responseStatusCode !== undefined || responseErrorReason !== undefined) {
+        if (!stopped && armed?.requestId === requestId &&
+            armed.session === session && responseStatusCode >= 300 && responseStatusCode < 400) {
+          const locations = responseHeaders?.filter(({ name }) => name.toLowerCase() === "location");
+          if (locations?.length === 1) {
+            const target = parseUrl(locations[0].value, raw);
+            if (target?.protocol === "https:" && requiresAuthentication(target, config)) stop("reauth_required");
+          }
+        }
+        await pipe.send("Fetch.continueResponse", { requestId }, session);
+        return;
+      }
       const url = parseUrl(raw);
       const document = resourceType === "Document";
       const page = pages.get(session);
@@ -415,8 +462,10 @@ export async function runBrowser(config, fixture, selectContents, signal) {
       const topLevel = document && mainFrame && mainFrame.id === frameId;
       const initializing = document && page && !mainFrame;
       const stage = document ? navigationStage(url, config) : null;
+      const authentication = headless && document && requiresAuthentication(url, config);
+      if (authentication && (topLevel || initializing)) stop("reauth_required");
       const navigationAllowed = !document || (stage !== null && /^(GET|POST)$/.test(method));
-      let allowed = !stopped && navigationAllowed;
+      let allowed = !stopped && !authentication && navigationAllowed && (!headless || method === "GET" || method === "HEAD");
       if (!navigationAllowed && topLevel) {
         stop(stage ? "navigation_method_blocked" : "unknown_destination",
           { stage: stage ?? page.stage, kind: "top_level_request", cause: "navigation_blocked" });
@@ -429,9 +478,9 @@ export async function runBrowser(config, fixture, selectContents, signal) {
         if (reading || isGuardedApi(url, config)) {
           allowed = armed && (resourceType === "XHR" || resourceType === "Fetch") && method === "GET" &&
             session === armed.session && frameId === armed.frame.id && mainFrame === armed.frame &&
-            url.href === config.lms + armed.target && !armed.used;
+            url.href === config.lms + armed.target && armed.requestId === undefined;
           if (allowed) {
-            armed.used = true;
+            armed.requestId = requestId;
             requests[armed.kind]++;
           }
         } else if (method !== "GET" && method !== "HEAD") {
@@ -453,7 +502,8 @@ export async function runBrowser(config, fixture, selectContents, signal) {
         page.stage = stage;
       }
       await pipe.send(allowed ? "Fetch.continueRequest" : "Fetch.failRequest",
-        allowed ? { requestId } : { requestId, errorReason: "BlockedByClient" }, session);
+        allowed ? { requestId, ...(armed?.requestId === requestId ? { interceptResponse: true } : {}) }
+          : { requestId, errorReason: "BlockedByClient" }, session);
     }
 
     pipe.onEvent = (method, params, session) => {
@@ -494,6 +544,11 @@ export async function runBrowser(config, fixture, selectContents, signal) {
           frameId: params.frameId, loaderId: params.loaderId, stage, method: requestMethod.toLowerCase(),
           origin: url.origin, proxyCursor: proxy.cursor(),
         });
+      } else if ((headless || authenticate) && method === "Network.responseReceived" && params.type === "Document") {
+        const document = pages.get(session)?.documents.get(params.requestId);
+        const reason = (document?.stage === "webclass" || (document && headless)) &&
+          statusReason(params.response.status);
+        if (reason) stop(reason);
       } else if (method === "Network.loadingFailed" && params.type === "Document") {
         const document = pages.get(session)?.documents.get(params.requestId);
         if (document) {
@@ -542,13 +597,19 @@ export async function runBrowser(config, fixture, selectContents, signal) {
           lmsReached = true;
           const verify = expression(loggedIn, config.dashboardPath);
           const context = await isolatedWorld(pipe, tab, frame.id).catch(() => undefined);
-          const ready = context !== undefined && await evaluate(pipe, tab, context, verify).catch(() => false);
+          if (context === undefined) continue;
+          const ready = await evaluate(pipe, tab, context, verify).catch(() => false);
+          if (headless && !ready && candidate.frame === frame &&
+              await evaluate(pipe, tab, context, 'Boolean(document.querySelector(\'input[type="password"]\'))')
+                .catch(() => false)) return { reason: "reauth_required" };
           if (!ready || stopped || candidate.frame !== frame) continue;
+          clearTimeout(readyTimeout);
+          if (authenticate) return { reason: "authenticated" };
           reading = true;
           async function read(kind, target, referrer = null) {
             if (stopped || candidate.frame !== frame) return { reason: "auth_expired" };
             armed = { session: tab, frame, kind, target };
-            const fetchJson = expression(readJson, config.lms, target, config.maxBytes, kind, referrer);
+            const fetchJson = expression(readJson, config.lms, target, config.maxBytes, kind, referrer, statusReason);
             try {
               return await evaluate(pipe, tab, context, verify + " ? " + fetchJson +
                 ' : ({ reason: "auth_expired" })', 20000) ?? { reason: `${kind}_request_failed` };
@@ -605,6 +666,7 @@ export async function runBrowser(config, fixture, selectContents, signal) {
     outcome = stopped ? await stoppedResult : { reason: proxy ? startupFailure : "proxy_failure" };
   } finally {
     clearTimeout(timeout);
+    clearTimeout(readyTimeout);
     signal?.removeEventListener("abort", interrupted);
     if (browserExited) {
       const exited = await Promise.race([browserExited, delay(3000, false, { ref: false })]);

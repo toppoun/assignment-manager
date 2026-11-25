@@ -66,8 +66,13 @@ pub(in crate::cli) fn execute(
         println!("webclass diagnostic={reason}");
         return Ok(1);
     }
-    println!("Chromeの大学公式画面で認証し、HOPPIIのWebClassリンクを開いてください。");
-    let check = super::webclass::read_browser_course_list(ProfileMode::Temporary);
+    let profile = if super::webclass::interactive_terminal() {
+        super::webclass::prompt_browser_authentication();
+        ProfileMode::Temporary
+    } else {
+        ProfileMode::Headless
+    };
+    let check = super::webclass::read_browser_course_list(profile);
     let courses = match check {
         Ok(courses) => courses,
         Err(reason) => {

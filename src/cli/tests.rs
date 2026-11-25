@@ -18,11 +18,41 @@ fn production_assignment_dry_run_requires_explicit_read_only_route() {
         "--production-read-only",
     ];
     assert_eq!(parse(&args).unwrap().command, Command::ProductionDryRun);
+    assert_eq!(
+        parse(&[args.as_slice(), &["--headless"]].concat())
+            .unwrap()
+            .command,
+        Command::HeadlessDryRun { production: true }
+    );
+    assert_eq!(
+        parse(&[&args[..args.len() - 1], &["--headless"]].concat())
+            .unwrap()
+            .command,
+        Command::HeadlessDryRun { production: false }
+    );
     assert!(parse(&args[2..]).is_err());
     assert!(parse(&[args.as_slice(), &["--allow-notion-write"]].concat()).is_err());
     let mut apply = args;
     apply[3] = "--apply";
     assert!(parse(&apply).is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn production_writer_check_requires_a_config_and_never_selects_registration() {
+    let args = [
+        "--config",
+        "production.json",
+        "credentials",
+        "check",
+        "notion-writer",
+    ];
+    assert_eq!(
+        parse(&args).unwrap().command,
+        Command::CheckProductionWriter
+    );
+    assert!(parse(&args[2..]).is_err());
+    assert!(parse(&[args.as_slice(), &["--allow-notion-write"]].concat()).is_err());
 }
 
 #[cfg(target_os = "macos")]
@@ -139,6 +169,10 @@ fn webclass_defaults_to_temporary_edge_and_retention_requires_an_explicit_flag()
             },
         ),
         (
+            &["--headless"][..],
+            WebClassCheckMode::Headless { course_id: None },
+        ),
+        (
             &["--http-probe"][..],
             WebClassCheckMode::HttpProbe {
                 stop_before_consent: false,
@@ -162,6 +196,22 @@ fn webclass_defaults_to_temporary_edge_and_retention_requires_an_explicit_flag()
     }
     assert!(parse(&[base.as_slice(), &["--http-probe", "--keep-profile"]].concat()).is_err());
     assert!(parse(&[&base[..3], &["--keep-profile"]].concat()).is_err());
+    assert!(parse(&[base.as_slice(), &["--keep-profile", "--headless"]].concat()).is_err());
+    assert!(parse(&["university-check", "webclass", "--authenticate"]).is_err());
+    assert_eq!(
+        parse(&[
+            "university-check",
+            "webclass",
+            "--authenticate",
+            "--allow-university-read"
+        ])
+        .unwrap()
+        .command,
+        Command::UniversityWebClass {
+            mode: WebClassCheckMode::Authenticate,
+            review_local: false
+        }
+    );
 }
 
 #[test]

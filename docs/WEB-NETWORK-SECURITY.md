@@ -195,7 +195,7 @@ URL、Cookie、トークン、資格情報、SAML本文を出力・保存しな�
 再要求を説明できる。大学の製品・設定と、本人の同意選択の適用範囲は未確認。
 [OSSTech OpenAM 14 SAML設定ガイド 7.1.1・7.2](https://www.osstech.co.jp/download/updates/docs/openam/OSTD-OpenAM14-SAML-SetupGuide.pdf#page=28)
 
-授業一覧と1授業の課題確認CLIの `--allow-university-read` は、一時プロファイルでWindowsのMicrosoft Edge
+対話端末から授業一覧と1授業の課題確認CLIを実行すると、既定では一時プロファイルでWindowsのMicrosoft Edge
 またはmacOSのGoogle Chromeを起動する。Windowsでは標準のEdgeインストール先を探して `node.exe` を起動する。
 macOSでは `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` とPATH上の `node` を使う。
 WebClassが既存設定で無効な場合はブラウザ起動前に終了する。
@@ -213,7 +213,15 @@ Chromeプロセスに終了シグナルを送り、その終了を待って一�
 アプリの所有マーカーを必須とし、パス上の再解析ポイントとシンボリックリンクを拒否する。
 macOSではユーザー所有と専用ディレクトリの権限も確認し、CLIとのパイプが切れてもNodeがOSの排他ロックを保持する。
 認証と同意の保持期間は大学とブラウザの設定に従う。異常終了後も新しいタブから開始し、復元タブがあれば停止する。
-`courses` または `contents` が401または403の場合はその試行を終了し、再認証は次回の本人操作に委ねる。
+`--authenticate` は専用プロファイルで本人の認証・同意を待ち、WebClassのログイン済み画面で終了する。
+授業・課題APIは呼ばない。非対話または `--headless` の取得は同じ既存プロファイルを排他で開き、
+WebClassのダッシュボードから開始する。このときHOPPII・IdPへのナビゲーションと既知のログイン先、
+およびPOSTは許可しない。新しいプロファイルが必要な場合はブラウザ起動前に `reauth_required` を返す。
+
+`courses` または `contents` の401は `auth_expired`、403は `access_denied`、
+429・5xxは `server_unavailable` として終了する。取得APIはリダイレクトを追跡しない。
+既知のログイン先へのリダイレクトやログインフォームは `reauth_required`、
+他のリダイレクトは `unexpected_api_redirect`。通信失敗や形式不一致も取得失敗として扱う。
 
 ブラウザの制御は継承したDevToolsパイプに限定する。
 専用のループバックプロキシはHOPPII、IdP、WebClassのHTTPS `CONNECT` のみ転送する。
