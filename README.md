@@ -398,6 +398,8 @@ Notionの一覧や対象スキーマが不完全な実行は書き込み前に�
 
 起動間隔や通知はCLIの外で管理します。Linuxへ移行する際は、旧ホストを停止し、承認と作成意図を含む
 既存の状態DBを引き継ぎます。ローカルの排他ロックはホストをまたいで共有されません。
+macOSでの毎時実行、ログ・通知、CLIの更新や切り戻しは
+[Moodle定期同期のLaunchAgent手順](docs/MOODLE-RECURRING-LAUNCHAGENT.md)を参照してください。
 
 **一時停止**するには、使用中の設定ファイルから `recurring_sync` を外します。以後の `--apply` は
 `recurring_not_configured` と終了コード `2` を返します。同じ設定を復元すると、状態DBに残っている承認が再び有効になります。
