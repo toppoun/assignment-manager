@@ -13,7 +13,7 @@ pub use moodle_create::MoodleCreatePreview;
 mod moodle_integration;
 pub(super) mod recurring;
 pub use recurring::{
-    ChangeLimits, RecurringInputs, RecurringMode, RecurringPolicy, RecurringReport,
+    ChangeLimits, PlanHash, RecurringInputs, RecurringMode, RecurringPolicy, RecurringReport,
 };
 mod verification_assignments;
 pub use verification_assignments::{

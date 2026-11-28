@@ -20,7 +20,7 @@ mod trial;
 mod wire;
 
 pub use apply::{
-    ApplyError, ApplyPreview, ApplyReport, AssignmentReadback, ChangeLimits,
+    ApplyError, ApplyPreview, ApplyReport, AssignmentReadback, ChangeLimits, PlanHash,
     ProductionAssignmentWriter, ProductionWriterCheckError, ProtectedManualAssignment,
     RecurringInputs, RecurringMode, RecurringPolicy, RecurringReport,
 };

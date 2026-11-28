@@ -18,7 +18,9 @@ use crate::notion::{
     wire::uuid,
 };
 
+mod plan_hash;
 mod preview;
+pub use plan_hash::PlanHash;
 use preview::{PlanPreview, source_label};
 
 const SOURCES: [UniversitySource; 2] = [UniversitySource::Moodle, UniversitySource::WebClass];
@@ -75,6 +77,8 @@ pub enum RecurringMode {
     Preview,
     #[serde(rename = "preview")]
     PreviewWithPlan,
+    #[serde(skip_serializing)]
+    ApplyWithPlanHash(PlanHash),
     Apply,
 }
 
@@ -123,6 +127,8 @@ pub struct RecurringReport {
     webclass: SourceReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     plan: Option<PlanPreview>,
+    #[serde(skip)]
+    expected_plan_hash: Option<PlanHash>,
 }
 
 impl RecurringReport {
@@ -130,10 +136,10 @@ impl RecurringReport {
         let show_plan = mode == RecurringMode::PreviewWithPlan;
         Self {
             schema_version: 1,
-            mode: if show_plan {
-                RecurringMode::Preview
-            } else {
-                mode
+            mode: match mode {
+                RecurringMode::PreviewWithPlan => RecurringMode::Preview,
+                RecurringMode::ApplyWithPlanHash(_) => RecurringMode::Apply,
+                mode => mode,
             },
             status: Status::Blocked,
             error: Some(error),
@@ -142,6 +148,10 @@ impl RecurringReport {
             moodle: SourceReport::default(),
             webclass: SourceReport::default(),
             plan: show_plan.then(PlanPreview::default),
+            expected_plan_hash: match mode {
+                RecurringMode::ApplyWithPlanHash(hash) => Some(hash),
+                _ => None,
+            },
         }
     }
 
@@ -485,13 +495,15 @@ impl NotionClient {
         let id = destination.id(self, target)?;
         let _lock = TargetLock::acquire(directory).map_err(state_code)?;
         let path = directory.join("state.sqlite3");
-        let store = match report.mode {
-            RecurringMode::Apply => Some(StateStore::for_apply(&path, &id).map_err(state_code)?),
-            RecurringMode::Preview | RecurringMode::PreviewWithPlan => {
-                StateStore::read_only(&path, &id).map_err(state_code)?
-            }
+        let expected_hash = report.expected_plan_hash;
+        let needs_hash = expected_hash.is_some() || report.plan.is_some();
+        let mut store = if report.mode == RecurringMode::Apply && expected_hash.is_none() {
+            Some(StateStore::for_apply(&path, &id).map_err(state_code)?)
+        } else {
+            StateStore::read_only(&path, &id).map_err(state_code)?
         };
-        let approved = if let (RecurringMode::Apply, Some(store)) = (report.mode, &store) {
+        let approved = if report.mode == RecurringMode::Apply {
+            let store = store.as_ref().ok_or("state_missing_or_invalid")?;
             let approval = store
                 .recurring_approval()
                 .map_err(state_code)?
@@ -559,6 +571,9 @@ impl NotionClient {
             }
         }
         if inputs.is_empty() {
+            if expected_hash.is_some() {
+                return Err("plan_hash_mismatch");
+            }
             if report.mode == RecurringMode::Apply
                 && let Some(store) = store.as_ref()
             {
@@ -613,6 +628,7 @@ impl NotionClient {
             .transpose()
             .map_err(state_code)?
             .unwrap_or_default();
+        let pending_bindings = needs_hash.then(|| plan_hash::pending_bindings(&state));
         let fresh = self
             .prepare_plan(schema, state, Some(&rules), |schema, rows| {
                 let mut seen = HashSet::new();
@@ -726,6 +742,29 @@ impl NotionClient {
             }
         }
 
+        if let Some(pending_bindings) = pending_bindings {
+            let hash = plan_hash::compute(
+                (
+                    &destination.fingerprint(target, policy)?,
+                    &digest(&(&fresh.schema, &rule_schema))?,
+                ),
+                &fresh,
+                report,
+                &inputs,
+                &candidates,
+                pending_bindings,
+                &origins,
+            )?;
+            if let Some(expected) = expected_hash
+                && hash != expected
+            {
+                return Err("plan_hash_mismatch");
+            }
+            if let Some(preview) = &mut report.plan {
+                preview.hash = Some(hash);
+            }
+        }
+
         if report.mode == RecurringMode::Preview {
             for (source, _) in candidates {
                 let result = report.source(source);
@@ -738,6 +777,11 @@ impl NotionClient {
                 }
             }
             return Ok(());
+        }
+        if expected_hash.is_some() {
+            // The target lock spans both connections and all subsequent writes.
+            drop(store.take());
+            store = Some(StateStore::for_apply(&path, &id).map_err(state_code)?);
         }
         let store = store.as_ref().expect("apply requires a state database");
         for (key, page) in &fresh.recovered {

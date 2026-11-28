@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::*;
 use crate::notion::{
-    ChangeLimits, RecurringInputs, RecurringMode, RecurringPolicy,
+    ChangeLimits, PlanHash, RecurringInputs, RecurringMode, RecurringPolicy,
     state::{BindingStatus, RunIssue, RunOutcome, StateStore, TargetLock, test_state_dir},
     trial::{PRODUCTION_ASSIGNMENTS, PRODUCTION_COURSES, PRODUCTION_RULES},
 };
@@ -489,6 +489,24 @@ fn apply(
     reader: Vec<Exchange>,
     writer: Option<Vec<Exchange>>,
 ) -> (u8, Value) {
+    run_mode(
+        RecurringMode::Apply,
+        directory,
+        policy,
+        inputs,
+        reader,
+        writer,
+    )
+}
+
+fn run_mode(
+    mode: RecurringMode,
+    directory: &Path,
+    policy: &RecurringPolicy,
+    inputs: RecurringInputs,
+    reader: Vec<Exchange>,
+    writer: Option<Vec<Exchange>>,
+) -> (u8, Value) {
     let (client, server) = local_mock(reader);
     let writer = writer.map(local_mock);
     let (writer, writer_server) = match writer {
@@ -499,7 +517,7 @@ fn apply(
         &production_target(),
         policy,
         directory,
-        RecurringMode::Apply,
+        mode,
         || {
             assert!(matches!(
                 TargetLock::acquire(directory),
@@ -1016,6 +1034,333 @@ fn recurring_apply_replans_after_preview_and_checks_the_new_counts_against_limit
     assert_eq!(applied["moodle"]["planned"]["update"], 1);
     assert!(applied["moodle"]["applied"].is_null());
     assert!(applied.get("plan").is_none());
+}
+
+fn confirmed_hash(
+    directory: &Path,
+    policy: &RecurringPolicy,
+    inputs: RecurringInputs,
+    rows: Vec<Value>,
+) -> PlanHash {
+    let (_, preview) = run_mode(
+        RecurringMode::PreviewWithPlan,
+        directory,
+        policy,
+        inputs,
+        reader_script(rows),
+        None,
+    );
+    preview["plan"]["hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{preview}"))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn plan_hash_is_order_independent_and_matching_apply_and_repeat_use_the_same_plan() {
+    let directory = state_directory();
+    let dir = directory.path();
+    let policy = policy(3);
+    approve(dir, &policy);
+    let old = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    let manual = task(MANUAL, None, "Independent task");
+    let before = vec![old.clone(), manual.clone()];
+    let mut reversed = before.clone();
+    reversed.reverse();
+    let hash = confirmed_hash(dir, &policy, successful_inputs(), before);
+    assert_eq!(
+        hash,
+        confirmed_hash(dir, &policy, successful_inputs(), reversed.clone())
+    );
+    let path = format!("/v1/pages/{PAGE_A}");
+    let migrated = managed(UniversitySource::Moodle, PAGE_A, None);
+    let created = managed(UniversitySource::WebClass, PAGE_B, None);
+    let mut writes = writer_checks();
+    writes.extend([
+        Exchange::json("GET", &path, old),
+        Exchange::json("PATCH", &path, migrated.clone()).check(|_, body| {
+            assert_eq!(
+                body["properties"],
+                json!({"title":{"title":[text("【人工知能】Moodle task 0")]}})
+            );
+        }),
+        query(vec![], None),
+        create(created.clone()),
+    ]);
+    let (exit, report) = run_mode(
+        RecurringMode::ApplyWithPlanHash(hash),
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(reversed),
+        Some(writes),
+    );
+    assert_eq!(exit, 0, "{report}");
+    assert_eq!(report["moodle"]["applied"]["update"], 1);
+    assert_eq!(report["webclass"]["applied"]["create"], 1);
+    assert!(report.get("plan").is_none());
+    let rows = vec![migrated, created, manual];
+    let repeat = confirmed_hash(dir, &policy, successful_inputs(), rows.clone());
+    assert_ne!(hash, repeat);
+    let (exit, report) = run_mode(
+        RecurringMode::ApplyWithPlanHash(repeat),
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(rows),
+        Some(writer_checks()),
+    );
+    assert_eq!(exit, 0, "{report}");
+    for source in ["moodle", "webclass"] {
+        assert_eq!(report[source]["applied"]["unchanged"], 1);
+        assert_eq!(report[source]["applied"]["update"], 0);
+        assert_eq!(report[source]["applied"]["create"], 0);
+    }
+}
+
+#[test]
+fn plan_hash_rejects_value_page_candidate_and_source_drift_before_any_writer_or_state_update() {
+    let directory = state_directory();
+    let dir = directory.path();
+    let policy = policy(3);
+    approve(dir, &policy);
+    let state = dir.join("state.sqlite3");
+    let bytes = std::fs::read(&state).unwrap();
+    let old = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    let hash = confirmed_hash(dir, &policy, successful_inputs(), vec![old.clone()]);
+    let blocked = |inputs, rows| {
+        let (exit, report) = run_mode(
+            RecurringMode::ApplyWithPlanHash(hash),
+            dir,
+            &policy,
+            inputs,
+            reader_script(rows),
+            None,
+        );
+        assert_eq!(exit, 2, "{report}");
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["error"], "plan_hash_mismatch");
+        assert!(report["moodle"]["applied"].is_null() && report["webclass"]["applied"].is_null());
+        assert_eq!(std::fs::read(&state).unwrap(), bytes);
+    };
+    let mut title = successful_inputs();
+    // Drift in the second source must stop the first source's update as well.
+    title
+        .webclass
+        .as_mut()
+        .unwrap()
+        .assignments
+        .values_mut()
+        .next()
+        .unwrap()
+        .title = "Changed WebClass task".into();
+    blocked(title, vec![old.clone()]);
+    let mut deadline = successful_inputs();
+    deadline
+        .moodle
+        .as_mut()
+        .unwrap()
+        .assignments
+        .values_mut()
+        .next()
+        .unwrap()
+        .deadline = Some(Deadline::DateOnly("2026-12-01".parse().unwrap()));
+    blocked(deadline, vec![old.clone()]);
+    blocked(
+        successful_inputs(),
+        vec![managed(
+            UniversitySource::Moodle,
+            PAGE_C,
+            Some("Moodle task 0"),
+        )],
+    );
+    // The resulting PATCH is identical here. The observed pre-update title differs.
+    blocked(
+        successful_inputs(),
+        vec![managed(
+            UniversitySource::Moodle,
+            PAGE_A,
+            Some("Edited in Notion"),
+        )],
+    );
+    let mut extra = successful_inputs();
+    extra.moodle = Ok(mixed_input(&[], &[CATEGORY; 2]));
+    blocked(extra, vec![old.clone()]);
+    let mut missing_source = successful_inputs();
+    missing_source.webclass = Err("reauth_required");
+    blocked(missing_source, vec![old.clone()]);
+    blocked(
+        successful_inputs(),
+        vec![old, task(MANUAL, None, "【プログラミング2】WebClass task")],
+    );
+}
+
+#[test]
+fn plan_hash_covers_unresolved_intent_status_and_recovery_without_persisting_on_mismatch() {
+    let directory = state_directory();
+    let dir = directory.path();
+    let policy = policy_for(3, None);
+    approve(dir, &policy);
+    let state = dir.join("state.sqlite3");
+    let open = || StateStore::for_apply(&state, PRODUCTION_ASSIGNMENTS).unwrap();
+    let key = key("moodle-0");
+    let initial = confirmed_hash(dir, &policy, successful_inputs(), vec![]);
+    assert!(
+        open()
+            .reserve_recurring_create(&key, UniversitySource::Moodle)
+            .unwrap()
+    );
+    let pending = confirmed_hash(dir, &policy, successful_inputs(), vec![]);
+    assert_ne!(initial, pending);
+    open().mark_unknown(&key).unwrap();
+    let unknown = confirmed_hash(dir, &policy, successful_inputs(), vec![]);
+    assert_ne!(pending, unknown);
+
+    let rows = vec![managed(UniversitySource::Moodle, PAGE_A, None)];
+    let before = std::fs::read(&state).unwrap();
+    let (exit, report) = run_mode(
+        RecurringMode::ApplyWithPlanHash(unknown),
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(rows.clone()),
+        None,
+    );
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["error"], "plan_hash_mismatch");
+    assert_eq!(std::fs::read(&state).unwrap(), before);
+    assert_eq!(
+        open().binding(&key).unwrap().unwrap().status,
+        BindingStatus::Unknown
+    );
+    let recover = confirmed_hash(dir, &policy, successful_inputs(), rows.clone());
+    let (exit, report) = run_mode(
+        RecurringMode::ApplyWithPlanHash(recover),
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(rows),
+        Some(writer_checks()),
+    );
+    assert_eq!(exit, 0, "{report}");
+    assert_eq!(report["recovered_creates"], 1);
+    assert_eq!(report["moodle"]["applied"]["unchanged"], 1);
+    assert_eq!(
+        open().binding(&key).unwrap().unwrap().status,
+        BindingStatus::Linked
+    );
+}
+
+#[test]
+fn matching_plan_hash_still_requires_approval_and_does_not_override_limits() {
+    let directory = state_directory();
+    let dir = directory.path();
+    let policy = policy_for(0, None);
+    let hash = confirmed_hash(dir, &policy, successful_inputs(), vec![]);
+    assert_ne!(
+        hash,
+        confirmed_hash(dir, &policy_for(1, None), successful_inputs(), vec![])
+    );
+    let mode = RecurringMode::ApplyWithPlanHash(hash);
+    let (exit, report) = run_mode(mode, dir, &policy, successful_inputs(), vec![], None);
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["error"], "write_not_approved");
+    approve(dir, &policy);
+    let (exit, report) = run_mode(
+        mode,
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(vec![]),
+        None,
+    );
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["moodle"]["error"], "change_limit");
+    assert!(report["moodle"]["applied"].is_null());
+}
+
+#[test]
+fn matching_plan_hash_still_rechecks_the_page_and_creation_key_before_writing() {
+    let directory = state_directory();
+    let dir = directory.path();
+    let policy = policy(3);
+    approve(dir, &policy);
+    let old = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    let hash = confirmed_hash(dir, &policy, successful_inputs(), vec![old.clone()]);
+    let mut writes = writer_checks();
+    writes.extend([
+        Exchange::json(
+            "GET",
+            format!("/v1/pages/{PAGE_A}"),
+            managed(UniversitySource::Moodle, PAGE_A, Some("Concurrent edit")),
+        ),
+        query(
+            vec![managed(UniversitySource::WebClass, PAGE_B, None)],
+            None,
+        ),
+    ]);
+    let (exit, report) = run_mode(
+        RecurringMode::ApplyWithPlanHash(hash),
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(vec![old]),
+        Some(writes),
+    );
+    assert_eq!(exit, 3, "{report}");
+    assert_eq!(report["moodle"]["error"], "notion_conflict");
+    assert_eq!(report["moodle"]["applied"]["update"], 0);
+    assert_eq!(report["webclass"]["applied"]["create"], 0);
+}
+
+#[test]
+fn guarded_apply_blocks_conflicting_snapshots_and_total_acquisition_failure_without_state_updates()
+{
+    let directory = state_directory();
+    let dir = directory.path();
+    let policy = policy(3);
+    approve(dir, &policy);
+    let hash = confirmed_hash(dir, &policy, successful_inputs(), vec![]);
+    let state = dir.join("state.sqlite3");
+    let before = std::fs::read(&state).unwrap();
+    let duplicates = vec![
+        managed(UniversitySource::Moodle, PAGE_A, None),
+        managed(UniversitySource::Moodle, PAGE_B, None),
+    ];
+    let (_, preview) = run_mode(
+        RecurringMode::PreviewWithPlan,
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(duplicates.clone()),
+        None,
+    );
+    assert!(preview["plan"]["hash"].is_null());
+    let (exit, report) = run_mode(
+        RecurringMode::ApplyWithPlanHash(hash),
+        dir,
+        &policy,
+        successful_inputs(),
+        reader_script(duplicates),
+        None,
+    );
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["error"], "notion_conflict");
+    let (exit, report) = run_mode(
+        RecurringMode::ApplyWithPlanHash(hash),
+        dir,
+        &policy,
+        RecurringInputs {
+            moodle: Err("fetch_failed"),
+            webclass: Err("reauth_required"),
+        },
+        rules_snapshot(),
+        None,
+    );
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["error"], "plan_hash_mismatch");
+    assert_eq!(std::fs::read(&state).unwrap(), before);
 }
 
 #[test]

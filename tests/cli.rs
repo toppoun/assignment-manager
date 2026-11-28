@@ -132,6 +132,62 @@ fn recurring_show_plan_requires_dry_run_and_preserves_the_json_envelope() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn recurring_expected_plan_hash_requires_apply_and_valid_versioned_lowercase_hex() {
+    let temp = tempfile::tempdir().unwrap();
+    let hash = format!("v1-{}", "ab".repeat(32));
+    let normal = call(&temp, &["sync", "recurring", "--apply"]);
+    for flags in [
+        ["--apply", "--expect-plan-hash", hash.as_str()],
+        ["--expect-plan-hash", hash.as_str(), "--apply"],
+    ] {
+        let output = call(&temp, &["sync", "recurring", flags[0], flags[1], flags[2]]);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stdout, normal.stdout);
+        assert!(stderr(&output).is_empty());
+    }
+    for invalid in [
+        "",
+        "v1-1234",
+        &hash.to_uppercase(),
+        &hash.replace("v1-", "v2-"),
+        &hash.replace('a', "z"),
+    ] {
+        let output = call(
+            &temp,
+            &[
+                "sync",
+                "recurring",
+                "--apply",
+                "--expect-plan-hash",
+                invalid,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(stderr(&output).contains("invalid_arguments"));
+    }
+    for flags in [
+        &["--expect-plan-hash", hash.as_str()][..],
+        &["--dry-run", "--expect-plan-hash", hash.as_str()],
+        &[
+            "--dry-run",
+            "--show-plan",
+            "--expect-plan-hash",
+            hash.as_str(),
+        ],
+        &["--enable-writes", "--expect-plan-hash", hash.as_str()],
+    ] {
+        let mut args = vec!["sync", "recurring"];
+        args.extend_from_slice(flags);
+        let output = call(&temp, &args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    assert!(!local_root(&temp).exists());
+}
+
+#[cfg(target_os = "macos")]
 fn recurring_config(path: &Path, [assignments, courses, rules]: [&str; 3]) -> serde_json::Value {
     let config = serde_json::json!({
         "notion": {

@@ -371,11 +371,15 @@ Moodleの運用開始時は、1回あたり作成5件・更新3件を目安に�
 "$CLI" --config local/notion-production.json sync recurring --dry-run --show-plan
 "$CLI" --config local/notion-production.json sync recurring --enable-writes
 "$CLI" --config local/notion-production.json sync recurring --apply
+"$CLI" --config local/notion-production.json sync recurring --apply --expect-plan-hash "$REVIEWED_HASH"
 ```
 
 `--dry-run` は取得と計画を行います。`--show-plan` を追加すると `plan` フィールドに予定の課題名・期限・ページID・
 プロパティID・変更上限・未解決の作成意図が含まれます。詳細には課題情報が含まれるため、手動での確認時に使用します。
-適用時は新たに取得して計画を作り、プレビューから適用までの間に生じた変更も計画に反映されます。
+詳細プレビューの `plan.hash` を `--apply --expect-plan-hash` に渡すと、適用時の再計画と照合します。
+値は `v1-` と64桁の小文字16進数です。不一致は終了コード `2` と `plan_hash_mismatch` で報告し、
+全取得元への書き込みを見送ります。計画を確認できなかったプレビューの `plan.hash` は `null` です。
+ハッシュ指定は既存の書き込み承認・変更上限・書き込み直前の再照合と併用します。
 
 `--enable-writes` では対話端末に表示される課題・授業・対応表の対象、
 WriterのBot ID、取得元、変更件数の上限を確認します。表示された承認文字列を入力すると、Writerと対象スキーマを

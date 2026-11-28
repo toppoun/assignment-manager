@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
-use super::{ChangeLimits, PreparedApply};
+use super::{ChangeLimits, PlanHash, PreparedApply};
 use crate::{
     domain::Deadline,
     notion::{ConflictReason, DeferredReason, PlanAction, SyncInput, UniversitySource},
@@ -11,6 +11,7 @@ use crate::{
 /// The opt-in report projects values from the same prepared plan as the summary.
 #[derive(Default, Serialize)]
 pub(super) struct PlanPreview {
+    pub(super) hash: Option<PlanHash>,
     sources: BTreeMap<&'static str, SourcePlan>,
     recoverable_creates: Option<usize>,
     pub(super) unresolved_creates: Option<Vec<PendingCreate>>,

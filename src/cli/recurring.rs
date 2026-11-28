@@ -7,8 +7,8 @@ use std::{
 use assignment_manager::{
     moodle_http::{MoodleExportKind, MoodleFeed},
     notion::{
-        NotionClient, RecurringInputs, RecurringMode, RecurringPolicy, RecurringReport, SyncInput,
-        live_assignment_read_target,
+        NotionClient, PlanHash, RecurringInputs, RecurringMode, RecurringPolicy, RecurringReport,
+        SyncInput, live_assignment_read_target,
     },
     observation::SyncScope,
     secured_sync::SecuredSyncClients,
@@ -25,6 +25,7 @@ pub(super) enum Action {
     EnableWrites,
     DisableWrites,
     Apply,
+    ApplyWithPlanHash(PlanHash),
 }
 
 impl Action {
@@ -35,6 +36,11 @@ impl Action {
             ["--enable-writes"] => Ok(Self::EnableWrites),
             ["--disable-writes"] => Ok(Self::DisableWrites),
             ["--apply"] => Ok(Self::Apply),
+            ["--apply", "--expect-plan-hash", hash] | ["--expect-plan-hash", hash, "--apply"] => {
+                hash.parse()
+                    .map(Self::ApplyWithPlanHash)
+                    .map_err(|_| CliError::Usage)
+            }
             _ => Err(CliError::Usage),
         }
     }
@@ -43,7 +49,7 @@ impl Action {
         match self {
             Self::EnableWrites => Some("enable_writes"),
             Self::DisableWrites => Some("disable_writes"),
-            Self::Apply | Self::Preview | Self::ShowPlan => None,
+            Self::Apply | Self::ApplyWithPlanHash(_) | Self::Preview | Self::ShowPlan => None,
         }
     }
 }
@@ -52,6 +58,7 @@ pub(super) fn execute(path: Option<&Path>, action: Action) -> u8 {
     let mode = match action {
         Action::Preview => RecurringMode::Preview,
         Action::ShowPlan => RecurringMode::PreviewWithPlan,
+        Action::ApplyWithPlanHash(hash) => RecurringMode::ApplyWithPlanHash(hash),
         _ => RecurringMode::Apply,
     };
     match execute_inner(path, action, mode) {
