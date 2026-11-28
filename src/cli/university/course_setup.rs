@@ -72,7 +72,7 @@ pub(in crate::cli) fn execute(
     } else {
         ProfileMode::Headless
     };
-    let check = super::webclass::read_browser_course_list(profile);
+    let check = super::webclass::read_browser_course_list(profile, false);
     let courses = match check {
         Ok(courses) => courses,
         Err(reason) => {

@@ -100,6 +100,9 @@ struct SourceReport {
     planned: Option<DryRunCounts>,
     applied: Option<DryRunCounts>,
     error: Option<&'static str>,
+    #[cfg(target_os = "macos")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<crate::webclass_browser::BrowserDiagnostic>,
 }
 
 impl Default for SourceReport {
@@ -111,6 +114,8 @@ impl Default for SourceReport {
             planned: None,
             applied: None,
             error: None,
+            #[cfg(target_os = "macos")]
+            diagnostic: None,
         }
     }
 }
@@ -132,6 +137,17 @@ pub struct RecurringReport {
 }
 
 impl RecurringReport {
+    /// Detailed preview opts in to browser diagnostics; the runner uses the original shape.
+    #[cfg(target_os = "macos")]
+    pub fn record_webclass_browser_diagnostic(
+        &mut self,
+        diagnostic: crate::webclass_browser::BrowserDiagnostic,
+    ) {
+        if self.plan.is_some() && self.webclass.acquisition == "failed" && !diagnostic.is_empty() {
+            self.webclass.diagnostic = Some(diagnostic);
+        }
+    }
+
     pub fn blocked(mode: RecurringMode, error: &'static str) -> Self {
         let show_plan = mode == RecurringMode::PreviewWithPlan;
         Self {

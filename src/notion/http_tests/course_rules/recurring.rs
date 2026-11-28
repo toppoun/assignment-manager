@@ -1253,6 +1253,50 @@ fn plan_hash_covers_unresolved_intent_status_and_recovery_without_persisting_on_
 }
 
 #[test]
+fn detailed_webclass_failure_keeps_the_existing_recurring_result_contract() {
+    let directory = state_directory();
+    let policy = policy(3);
+    let diagnostic = json!({
+        "failure": {"stage": "courses_api", "reason": "authentication_redirect"},
+        "authenticated_by": "logout_control", "shutdown": "clean",
+    });
+    for mode in [RecurringMode::Preview, RecurringMode::PreviewWithPlan] {
+        let (client, server) = local_mock(rules_snapshot());
+        let mut report = client.run_production_recurring(
+            &production_target(),
+            &policy,
+            directory.path(),
+            mode,
+            || panic!("preview must not load a writer"),
+            |_| RecurringInputs {
+                moodle: Err("fetch_failed"),
+                webclass: Err("reauth_required"),
+            },
+        );
+        server.join().unwrap();
+        assert_eq!(report.exit_code(), 1);
+        report.record_webclass_browser_diagnostic(
+            serde_json::from_value(diagnostic.clone()).unwrap(),
+        );
+        let line = serde_json::to_string(&report).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        let json: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["mode"], "preview");
+        assert_eq!(json["webclass"]["error"], "reauth_required");
+        assert_eq!(json["moodle"]["error"], "fetch_failed");
+        assert!(json["moodle"].get("diagnostic").is_none());
+        if mode == RecurringMode::PreviewWithPlan {
+            assert_eq!(json["webclass"]["diagnostic"], diagnostic);
+            assert!(json["plan"]["hash"].is_null());
+        } else {
+            assert!(json.get("plan").is_none());
+            assert!(json["webclass"].get("diagnostic").is_none());
+        }
+    }
+}
+
+#[test]
 fn matching_plan_hash_still_requires_approval_and_does_not_override_limits() {
     let directory = state_directory();
     let dir = directory.path();

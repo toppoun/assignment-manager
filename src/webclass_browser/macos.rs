@@ -62,6 +62,25 @@ pub(super) fn verify_profile_owner(path: &Path, marker: &Path) -> Result<(), &'s
     Ok(())
 }
 
+/// Compare local filesystem identities without printing the user or any path.
+pub(super) fn profile_tag(path: &Path) -> Option<String> {
+    use aws_lc_rs::digest::{Context, SHA256};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let mut hash = Context::new(&SHA256);
+    hash.update(b"assignment-manager-webclass-profile-v1\0");
+    for directory in [path.ancestors().nth(3)?, path] {
+        let metadata = fs::metadata(directory).ok()?;
+        hash.update(&metadata.uid().to_be_bytes());
+        hash.update(&metadata.dev().to_be_bytes());
+        hash.update(&metadata.ino().to_be_bytes());
+    }
+    Some(format!(
+        "v1-{}",
+        URL_SAFE_NO_PAD.encode(&hash.finish().as_ref()[..16])
+    ))
+}
+
 pub(super) fn node_command(profile: &BrowserProfile) -> Command {
     let mut node = Command::new(NODE_EXECUTABLE);
     // The driver handles CLI termination via stdin EOF, including terminal Ctrl+C.
@@ -96,6 +115,27 @@ mod tests {
     use crate::webclass_browser::{
         BrowserConfig, BrowserOperation, DriverMessage, ProfileMode, driver_command, run_driver,
     };
+
+    #[test]
+    fn retained_profile_tag_identifies_same_home_and_profile_after_reopening() {
+        let local = tempfile::tempdir().unwrap();
+        let base = local
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("Library/Application Support");
+        fs::create_dir_all(&base).unwrap();
+        let first = BrowserProfile::retained(&base, true).unwrap();
+        let tag = profile_tag(first.path()).unwrap();
+        first.close().unwrap();
+        let reopened = BrowserProfile::retained(&base, false).unwrap();
+        assert_eq!(profile_tag(reopened.path()).as_deref(), Some(tag.as_str()));
+        assert!(tag.starts_with("v1-") && tag.len() == 25);
+        let other_base = base.join("other");
+        fs::create_dir(&other_base).unwrap();
+        let other = BrowserProfile::retained(&other_base, true).unwrap();
+        assert_ne!(profile_tag(other.path()), Some(tag));
+    }
 
     #[test]
     fn retained_profile_rejects_a_public_directory_or_redirected_marker() {

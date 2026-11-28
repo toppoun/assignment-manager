@@ -13,7 +13,7 @@ use assignment_manager::{
     observation::SyncScope,
     secured_sync::SecuredSyncClients,
     sync::acquire_moodle_with_diagnostic,
-    webclass_browser::{self, ProfileMode},
+    webclass_browser::{self, BrowserDiagnostic, ProfileMode},
 };
 
 use super::{CliError, Config, config, credentials, notion_diagnosis};
@@ -182,7 +182,8 @@ fn execute_inner(
     }
     let reader = credentials::unattended(|| credentials::notion_client(&target))
         .map_err(|status| status.code())?;
-    let report = reader.run_production_recurring(
+    let mut webclass_diagnostic = BrowserDiagnostic::default();
+    let mut report = reader.run_production_recurring(
         &local.notion,
         &policy,
         &directory,
@@ -198,12 +199,13 @@ fn execute_inner(
                 Err("disabled")
             },
             webclass: if settings.webclass.is_some() {
-                acquire_webclass(scopes)
+                acquire_webclass(scopes, &mut webclass_diagnostic)
             } else {
                 Err("disabled")
             },
         },
     );
+    report.record_webclass_browser_diagnostic(webclass_diagnostic);
     Ok(emit_report(&report))
 }
 
@@ -238,13 +240,19 @@ fn acquire_moodle(local: &Config, target: &str) -> Result<SyncInput, &'static st
     SyncInput::from_acquisitions(Some(&acquired), None).map_err(|_| "invalid_source_data")
 }
 
-fn acquire_webclass(scopes: &BTreeMap<String, String>) -> Result<SyncInput, &'static str> {
+fn acquire_webclass(
+    scopes: &BTreeMap<String, String>,
+    diagnostic: &mut BrowserDiagnostic,
+) -> Result<SyncInput, &'static str> {
     if scopes.is_empty() {
         return Ok(SyncInput::default());
     }
-    webclass_browser::check_local_dependencies()?;
-    let acquired =
-        webclass_browser::run_for_confirmed_courses(ProfileMode::Headless, scopes).result?;
+    webclass_browser::check_local_dependencies().inspect_err(|_| {
+        *diagnostic = BrowserDiagnostic::startup_failed();
+    })?;
+    let check = webclass_browser::run_for_confirmed_courses(ProfileMode::Headless, scopes);
+    *diagnostic = check.diagnostic;
+    let acquired = check.result?;
     let groups: HashSet<_> = acquired
         .attempts()
         .last()

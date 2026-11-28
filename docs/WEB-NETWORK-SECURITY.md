@@ -213,10 +213,27 @@ Chromeプロセスに終了シグナルを送り、その終了を待って一�
 アプリの所有マーカーを必須とし、パス上の再解析ポイントとシンボリックリンクを拒否する。
 macOSではユーザー所有と専用ディレクトリの権限も確認し、CLIとのパイプが切れてもNodeがOSの排他ロックを保持する。
 認証と同意の保持期間は大学とブラウザの設定に従う。異常終了後も新しいタブから開始し、復元タブがあれば停止する。
-`--authenticate` は専用プロファイルで本人の認証・同意を待ち、WebClassのログイン済み画面で終了する。
+`--authenticate` は専用プロファイルで本人の認証・同意を待ち、WebClassで表示されたログアウト操作を
+確認すると `authentication=ready profile=retained` と報告する。
 授業・課題APIは呼ばない。非対話または `--headless` の取得は同じ既存プロファイルを排他で開き、
 WebClassのダッシュボードから開始する。このときHOPPII・IdPへのナビゲーションと既知のログイン先、
 およびPOSTは許可しない。新しいプロファイルが必要な場合はブラウザ起動前に `reauth_required` を返す。
+
+`ready` は現在のChromeで認証済み画面を確認したことを表す。再起動後のセッション状況は
+`webclass browser_diagnostic` の `restart_session_check=not_checked` で示す。
+`diagnostic.authenticated_by` は検出した根拠、`diagnostic.shutdown` はChromeの終了方法を示す。
+`clean` はCDPでの終了要求後の終了コード0を表し、`terminated` と `killed` は終了シグナルを区別する。
+プロファイルの保持と、セッションが再起動後に使えるかは別に確認する。
+明示的な `university-check webclass --courses-only --allow-university-read --headless` で授業一覧を読み、
+成功した場合は `restart_session_check=courses_read` を返す。macOSでは、同じユーザー・`HOME`・設定で
+実行し、両方の `profile_tag` を比較できる。この値はローカルのホームと専用ディレクトリのファイル識別情報
+から計算する。ユーザー名、絶対パス、ブラウザ内データを含めず、比較用の状態も保存しない。
+
+停止場所と判定理由は `diagnostic.failure` の `stage` と `reason` に固定値で出す。例えば、画面遷移は
+`navigation`、授業APIは `courses_api`、課題APIは `assignments_api` となり、認証先リダイレクト
+`authentication_redirect` とログインHTML `login_html_response` を区別できる。
+`sync recurring --dry-run --show-plan` でWebClass取得が失敗した場合も `webclass.diagnostic` を出す。
+この項目は詳細プレビューに限る。既存の `error`、終了コード、通常同期とrunnerの1行JSONは維持する。
 
 `courses` または `contents` の401は `auth_expired`、403は `access_denied`、
 429・5xxは `server_unavailable` として終了する。取得APIはリダイレクトを追跡しない。
@@ -247,9 +264,11 @@ WebClassの `webclass` のいずれか。未知の遷移要求では、そのタ
 対応までは確定できない。複数の異なる失敗が観測された場合は省略する。通信の証拠を照合できない
 場合は `unknown_network_failure` とし、ログイン待ち時間切れや、取得APIの `auth_expired` と区別する。
 
-WebClassのタブでログアウト操作または既知のダッシュボードを確認したら、同一オリジンの固定
+WebClassのタブまたは同一オリジンの表示中のフレームでログアウト操作を確認したら、同一オリジンの固定
 `courses` に1回だけGETを送る。`mode` と `credentials` は `same-origin`、
-`redirect` は `error` とする。完全なHTTP 200 JSON、UTF-8、本文上限、タイムアウトを確認する。
+`redirect` は `manual` とする。完全なHTTP 200 JSON、UTF-8、本文上限、タイムアウトを確認する。
+ダッシュボードのパスだけでは取得を始めない。表示中のパスワード欄があればヘッドレスは停止し、
+ログアウト操作もログイン欄も確認できなければ認証状態が不明のまま待機上限で停止する。
 Cookieやローカルストレージはブラウザ内で管理する。Rust側は既存の `parse_courses`、
 授業IDの検証、件数上限を共用し、授業の取得値と年度・学期別件数を端末に表示する。
 

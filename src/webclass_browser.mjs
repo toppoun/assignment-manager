@@ -200,22 +200,31 @@ function statusReason(status) {
 }
 
 // Runs in an isolated JS world on the verified WebClass document.
-function loggedIn(dashboard) {
-  const signedIn = (doc) => {
-    if (!doc || doc.readyState === "loading" || doc.querySelector('input[type="password"]')) return false;
-    return [...doc.querySelectorAll("a[href], button, input[type=submit]")].some((control) => {
-      const label = (control.textContent || control.value || "").trim();
-      return /^(ログアウト|log\s*out|sign\s*out)$/i.test(label);
-    });
+function pageAuthentication() {
+  const visible = (element) => {
+    const style = element.ownerDocument.defaultView.getComputedStyle(element);
+    return style.visibility === "visible" &&
+      element.checkVisibility?.({ opacityProperty: true, visibilityProperty: true }) !== false &&
+      [...element.getClientRects()].some(({ width, height }) => width > 0 && height > 0);
   };
-  if (location.pathname === dashboard && document.readyState !== "loading" &&
-      !document.querySelector('input[type="password"]')) return true;
-  if (signedIn(document)) return true;
-  return [...document.querySelectorAll("iframe, frame")].some((frame) => {
+  const documents = [document];
+  for (const frame of document.querySelectorAll("iframe, frame")) {
     const doc = frame.contentDocument;
-    return doc?.location?.origin === location.origin && signedIn(doc);
-  });
+    if (doc?.location?.origin === location.origin && visible(frame)) documents.push(doc);
+  }
+  if (documents.some((doc) => [...doc.querySelectorAll('input[type="password"]')].some(visible))) {
+    return "login_form";
+  }
+  const marker = documents.some((doc) => doc.readyState !== "loading" &&
+    [...doc.querySelectorAll("a[href], button, input[type=submit]")].some((control) => {
+      const label = (control.textContent || control.value || "").trim();
+      return /^(ログアウト|log\s*out|sign\s*out)$/i.test(label) && visible(control);
+    }));
+  return marker ? "logout_control" : "unknown";
 }
+
+const failure = (reason, stage, detail) => ({ reason, failure: { stage, reason: detail } });
+const apiStage = (kind) => kind === "course" ? "courses_api" : "assignments_api";
 
 async function readJson(origin, target, maxBytes, kind, referrer, classifyStatus) {
   if (location.origin !== origin || !location.pathname.startsWith("/webclass/")) {
@@ -347,21 +356,36 @@ export async function runBrowser(config, fixture, selectContents, signal) {
   const startupFailure = isMac ? "chrome_start_failed" : "edge_start_failed";
   let stopped = false;
   let lmsReached = false;
+  let authenticatedBy;
+  let markerMissing = false;
+  let shutdown;
+  let exitStatus;
+  let armed;
   const requests = { course: 0, contents: 0 };
   let finish;
   const stoppedResult = new Promise((resolve) => { finish = resolve; });
-  const stop = (reason, navigation) => {
+  const stop = (reason, navigation, stage, detail) => {
     if (stopped) return;
     stopped = true;
-    finish(Promise.resolve(navigation).then((navigation) => ({ reason, navigation })));
+    finish(Promise.resolve(navigation).then((navigation) => ({
+      ...(stage ? failure(reason, stage, detail) : { reason }), navigation,
+    })));
   };
-  const interrupted = () => stop("browser_closed");
+  const interrupted = () => stop("browser_closed", undefined, "browser_shutdown", "browser_closed");
   signal?.addEventListener("abort", interrupted, { once: true });
   if (signal?.aborted) interrupted();
-  const timeout = setTimeout(() => stop(headless ? "acquisition_timeout" : "login_timeout"), config.loginMillis);
+  const stopWaitingForPage = (reason) => stop(reason, undefined, "page_detection",
+    markerMissing ? "authenticated_marker_missing" : "ready_timeout");
   const readyTimeout = headless
-    ? setTimeout(() => stop("webclass_ready_timeout"), Math.min(30000, config.loginMillis))
+    ? setTimeout(() => stopWaitingForPage("webclass_ready_timeout"), Math.min(30000, config.loginMillis))
     : undefined;
+  const timeout = setTimeout(() => {
+    if (headless) {
+      stop("acquisition_timeout", undefined, armed ? apiStage(armed.kind) : "navigation", "ready_timeout");
+    } else {
+      stopWaitingForPage("login_timeout");
+    }
+  }, config.loginMillis);
   let outcome;
   try {
     const origins = headless ? [config.lms] : config.origins;
@@ -381,13 +405,15 @@ export async function runBrowser(config, fixture, selectContents, signal) {
     if (fixture) flags.push(...fixture.flags);
     browser = spawn(config.executable, flags, { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
     browserExited = new Promise((resolve) => {
-      browser.once("exit", () => {
-        stop(isMac && !browserReady ? startupFailure : "browser_closed");
+      browser.once("exit", (code, signal) => {
+        exitStatus = { code, signal };
+        if (!isMac || browserReady) interrupted();
+        else stop(startupFailure, undefined, "browser_start", "startup_failed");
         resolve(true);
       });
       browser.once("error", () => {
         if (browser.pid === undefined) {
-          stop(startupFailure);
+          stop(startupFailure, undefined, "browser_start", "startup_failed");
           resolve(true);
         }
       });
@@ -395,7 +421,6 @@ export async function runBrowser(config, fixture, selectContents, signal) {
     const pipe = new BrowserPipe(browser, config.maxBytes * 6 + 65536);
     const pages = new Map();
     const embedded = new Set();
-    let armed;
     let reading = false;
     let documents = 0;
 
@@ -421,7 +446,7 @@ export async function runBrowser(config, fixture, selectContents, signal) {
       page.frame = { id: frame.id, webclass: isWebClassPage(url, config) };
       if (page.frame.webclass) lmsReached = true;
       if (initial?.failure) {
-        stop(initial.failure.reason, initial.failure.navigation);
+        stop(initial.failure.reason, initial.failure.navigation, "navigation", "navigation_blocked");
         return;
       }
 
@@ -430,11 +455,13 @@ export async function runBrowser(config, fixture, selectContents, signal) {
         page.stage = stage;
       } else if (frame.url === "chrome-error://chromewebdata/") {
         const failedStage = navigationStage(parseUrl(frame.unreachableUrl), config);
-        stop("browser_navigation_failed", describeNetworkFailure(page, frame.id, frame.loaderId, failedStage ?? page.stage));
+      stop("browser_navigation_failed", describeNetworkFailure(page, frame.id, frame.loaderId, failedStage ?? page.stage),
+        "navigation", "navigation_failed");
       } else if (frame.url !== "about:blank") {
         const internal = ["about:", "chrome:", "edge:"].includes(url?.protocol);
         stop("unknown_destination", { stage: page.stage,
-          kind: internal ? "browser_internal_page" : "top_level_commit", cause: "navigation_blocked" });
+          kind: internal ? "browser_internal_page" : "top_level_commit", cause: "navigation_blocked" },
+        "navigation", "navigation_blocked");
       }
     }
 
@@ -449,7 +476,9 @@ export async function runBrowser(config, fixture, selectContents, signal) {
           const locations = responseHeaders?.filter(({ name }) => name.toLowerCase() === "location");
           if (locations?.length === 1) {
             const target = parseUrl(locations[0].value, raw);
-            if (target?.protocol === "https:" && requiresAuthentication(target, config)) stop("reauth_required");
+            if (target?.protocol === "https:" && requiresAuthentication(target, config)) {
+              stop("reauth_required", undefined, apiStage(armed.kind), "authentication_redirect");
+            }
           }
         }
         await pipe.send("Fetch.continueResponse", { requestId }, session);
@@ -463,15 +492,18 @@ export async function runBrowser(config, fixture, selectContents, signal) {
       const initializing = document && page && !mainFrame;
       const stage = document ? navigationStage(url, config) : null;
       const authentication = headless && document && requiresAuthentication(url, config);
-      if (authentication && (topLevel || initializing)) stop("reauth_required");
+      if (authentication && (topLevel || initializing)) {
+        stop("reauth_required", undefined, "navigation", "authentication_redirect");
+      }
       const navigationAllowed = !document || (stage !== null && /^(GET|POST)$/.test(method));
       let allowed = !stopped && !authentication && navigationAllowed && (!headless || method === "GET" || method === "HEAD");
       if (!navigationAllowed && topLevel) {
         stop(stage ? "navigation_method_blocked" : "unknown_destination",
-          { stage: stage ?? page.stage, kind: "top_level_request", cause: "navigation_blocked" });
+          { stage: stage ?? page.stage, kind: "top_level_request", cause: "navigation_blocked" },
+          "navigation", "navigation_blocked");
       }
       if ((topLevel || initializing) && ++documents > 128) {
-        stop("navigation_limit");
+        stop("navigation_limit", undefined, "navigation", "navigation_blocked");
         allowed = false;
       }
       if (allowed && url?.origin === config.lms) {
@@ -548,7 +580,7 @@ export async function runBrowser(config, fixture, selectContents, signal) {
         const document = pages.get(session)?.documents.get(params.requestId);
         const reason = (document?.stage === "webclass" || (document && headless)) &&
           statusReason(params.response.status);
-        if (reason) stop(reason);
+        if (reason) stop(reason, undefined, "navigation", reason === "auth_expired" ? "session_expired" : reason);
       } else if (method === "Network.loadingFailed" && params.type === "Document") {
         const document = pages.get(session)?.documents.get(params.requestId);
         if (document) {
@@ -595,33 +627,51 @@ export async function runBrowser(config, fixture, selectContents, signal) {
           const frame = candidate.frame;
           if (!candidate.configured || !frame?.webclass) continue;
           lmsReached = true;
-          const verify = expression(loggedIn, config.dashboardPath);
+          const verify = expression(pageAuthentication);
           const context = await isolatedWorld(pipe, tab, frame.id).catch(() => undefined);
           if (context === undefined) continue;
-          const ready = await evaluate(pipe, tab, context, verify).catch(() => false);
-          if (headless && !ready && candidate.frame === frame &&
-              await evaluate(pipe, tab, context, 'Boolean(document.querySelector(\'input[type="password"]\'))')
-                .catch(() => false)) return { reason: "reauth_required" };
-          if (!ready || stopped || candidate.frame !== frame) continue;
+          const observed = await evaluate(pipe, tab, context, verify).catch(() => undefined);
+          if (stopped || candidate.frame !== frame) continue;
+          if (headless && observed === "login_form") {
+            return failure("reauth_required", "page_detection", "login_form_detected");
+          }
+          if (observed !== "logout_control") {
+            markerMissing ||= observed === "unknown";
+            continue;
+          }
+          authenticatedBy = observed;
           clearTimeout(readyTimeout);
           if (authenticate) return { reason: "authenticated" };
           reading = true;
           async function read(kind, target, referrer = null) {
-            if (stopped || candidate.frame !== frame) return { reason: "auth_expired" };
+            const stage = apiStage(kind);
+            if (stopped || candidate.frame !== frame) {
+              return failure("auth_expired", stage, "authentication_context_changed");
+            }
             armed = { session: tab, frame, kind, target };
             const fetchJson = expression(readJson, config.lms, target, config.maxBytes, kind, referrer, statusReason);
             try {
-              return await evaluate(pipe, tab, context, verify + " ? " + fetchJson +
-                ' : ({ reason: "auth_expired" })', 20000) ?? { reason: `${kind}_request_failed` };
+              const reply = await evaluate(pipe, tab, context, '(async () => { const marker = ' + verify +
+                '; return marker === "logout_control" ? ' + fetchJson +
+                ' : { reason: "auth_expired", marker }; })()', 20000) ?? { reason: `${kind}_request_failed` };
+              const detail = reply.marker === "unknown" ? "authenticated_marker_missing" :
+                reply.marker === "login_form" ? "login_form_detected" :
+                  { reauth_required: "login_html_response", auth_expired: "session_expired",
+                    access_denied: "access_denied", server_unavailable: "server_unavailable",
+                    unexpected_api_redirect: "unexpected_redirect",
+                    acquisition_context_changed: "authentication_context_changed" }[reply.reason];
+              return reply.reason === "ok" ? reply : failure(reply.reason, stage, detail ?? "request_failed");
             } catch {
-              return { reason: `${kind}_request_failed` };
+              return failure(`${kind}_request_failed`, stage, "request_failed");
             } finally {
               armed = undefined;
             }
           }
           const courses = await read("course", config.coursesPath);
           if (courses.reason !== "ok" || !selectContents) return courses;
-          if (stopped || requests.course !== 1 || candidate.frame !== frame) return { reason: "auth_expired" };
+          if (stopped || requests.course !== 1 || candidate.frame !== frame) {
+            return failure("auth_expired", "courses_api", "authentication_context_changed");
+          }
           const target = await selectContents(courses.body);
           if (target === null) return { reason: "course_selection_stopped" };
           const batch = Array.isArray(target);
@@ -657,13 +707,17 @@ export async function runBrowser(config, fixture, selectContents, signal) {
     }
 
     outcome = await Promise.race([
-      stoppedResult, interact().catch(() => ({ reason: isMac && !browserReady ? startupFailure : "browser_protocol" })),
+      stoppedResult, interact().catch(() => isMac && !browserReady
+        ? failure(startupFailure, "browser_start", "startup_failed") : { reason: "browser_protocol" }),
     ]);
     if (stopped) outcome = await stoppedResult;
     stopped = true;
-    await pipe.send("Browser.close", {}, undefined, 2500).catch(() => {});
+    const requestedClose = !exitStatus;
+    if (requestedClose) await pipe.send("Browser.close", {}, undefined, 2500).catch(() => {});
+    else if (exitStatus.code === 0) shutdown = "already_exited";
   } catch {
-    outcome = stopped ? await stoppedResult : { reason: proxy ? startupFailure : "proxy_failure" };
+    outcome = stopped ? await stoppedResult : failure(proxy ? startupFailure : "proxy_failure",
+      "browser_start", proxy ? "startup_failed" : "proxy_failure");
   } finally {
     clearTimeout(timeout);
     clearTimeout(readyTimeout);
@@ -671,21 +725,30 @@ export async function runBrowser(config, fixture, selectContents, signal) {
     if (browserExited) {
       const exited = await Promise.race([browserExited, delay(3000, false, { ref: false })]);
       if (!exited) {
+        shutdown = "terminated";
         browser.kill();
         const terminated = await Promise.race([browserExited, delay(1500, false)]);
         if (isMac && !terminated) {
+          shutdown = "killed";
           browser.kill("SIGKILL");
           if (!await Promise.race([browserExited, delay(1500, false)])) {
-            outcome = { reason: "profile_cleanup_failed" };
+            shutdown = "failed";
+            outcome = failure("profile_cleanup_failed", "browser_shutdown", "shutdown_failed");
             for (const stream of browser.stdio) stream?.destroy();
             browser.unref();
           }
         }
       }
+      if (exitStatus) {
+        shutdown ??= exitStatus.code === 0 ? "clean" :
+          ({ SIGTERM: "terminated", SIGKILL: "killed" }[exitStatus.signal] ?? "abnormal_exit");
+      }
     }
     await proxy?.close();
   }
-  return { ...outcome, courses_get: requests.course, contents_get: requests.contents, lms_reached: lmsReached };
+  const { failure: failedAt, ...reply } = outcome;
+  return { ...reply, diagnostic: { failure: failedAt, authenticated_by: authenticatedBy, shutdown },
+    courses_get: requests.course, contents_get: requests.contents, lms_reached: lmsReached };
 }
 
 async function runDriver(fixture) {

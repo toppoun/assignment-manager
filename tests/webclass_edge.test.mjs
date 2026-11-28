@@ -4,7 +4,7 @@ import { createHash, createPrivateKey, X509Certificate } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:https";
-import { connect, createServer as createTcpServer } from "node:net";
+import { Socket, connect, createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -28,6 +28,24 @@ test("the loopback proxy rejects an unlisted CONNECT before dialing", async () =
     for await (const chunk of client) reply += chunk;
     assert.match(reply, /^HTTP\/1\.1 403 Forbidden\r\n/);
     assert.equal(dialed, false);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("the loopback proxy records a stalled CONNECT after the observation cursor", { timeout: 2000 }, async () => {
+  const origin = "https://127.0.0.1:443";
+  const proxy = await startProxy([origin], () => new Socket(), 25);
+  try {
+    const cursor = proxy.cursor();
+    const client = connect({ host: "127.0.0.1", port: proxy.port });
+    client.setEncoding("ascii");
+    client.write("CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n");
+    let reply = "";
+    for await (const chunk of client) reply += chunk;
+    assert.match(reply, /^HTTP\/1\.1 502 Bad Gateway\r\n/);
+    assert.equal(proxy.failureSince(origin, cursor), "timeout");
+    assert.equal(proxy.failureSince(origin, proxy.cursor()), undefined);
   } finally {
     await proxy.close();
   }
@@ -146,7 +164,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
         request.resume().on("end", () => response.writeHead(303, {
           Location: "/webclass/",
           "Set-Cookie": "fixture=" + secret + "; Path=/webclass; HttpOnly; Secure; SameSite=Lax" +
-            (resultMode.startsWith("operation-") ? "; Max-Age=300" : ""),
+            (resultMode.startsWith("operation-") && resultMode !== "operation-session-only" ? "; Max-Age=300" : ""),
         }).end());
       } else if (new URL(request.url, lms).pathname === loginPath) {
         counters.login++;
@@ -156,10 +174,14 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
           response.writeHead(302, { Location: idp + "/consent" }).end();
         } else if (resultMode === "operation-document-forbidden") {
           response.writeHead(403).end();
+        } else if (resultMode === "operation-unsigned-dashboard") {
+          html(response, '<p>Anonymous</p><div hidden><input type="password"><a href="/webclass/logout.php">ログアウト</a></div>');
         } else if (request.headers.cookie !== "fixture=" + secret) {
           response.writeHead(302, { Location: loginPath }).end();
+        } else if (resultMode === "operation-visible-login") {
+          html(response, '<input hidden type="password"><input type="password"><a href="/webclass/logout.php">ログアウト</a>');
         } else {
-          html(response, '<a href="/webclass/logout.php">ログアウト</a>');
+          html(response, '<a href="/webclass/logout.php">ログアウト</a><div hidden><input type="password"></div>');
         }
       } else if (request.url === "/webclass/") {
         if (request.headers.cookie !== "fixture=" + secret) {
@@ -205,6 +227,10 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
         contentsRequests.push({ url: request.url, method: request.method, referrer: request.headers.referer, accept: request.headers.accept });
         if (request.headers.cookie !== "fixture=" + secret || resultMode === "contents-expired") {
           response.writeHead(403).end();
+        } else if (resultMode === "operation-contents-auth-redirect") {
+          response.writeHead(302, { Location: loginPath + "?fixture-query=private" }).end();
+        } else if (resultMode === "operation-contents-login-html") {
+          html(response, '<input type="password">');
         } else if (resultMode === "contents-redirect") {
           response.writeHead(302, { Location: selectPath("fixture-course-003") }).end();
         } else if (resultMode === "partial") {
@@ -419,6 +445,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
       assert.deepEqual(failedIdp, {
         reason: "browser_navigation_failed",
         navigation: { stage: "idp", kind: "browser_error_page", cause: "connection_closed", request_method: "get" },
+        diagnostic: { failure: { stage: "navigation", reason: "navigation_failed" }, shutdown: "clean" },
         lms_reached: false, courses_get: 0, contents_get: 0,
       });
     }
@@ -427,6 +454,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
     assert.deepEqual(failedSso, {
       reason: "browser_navigation_failed",
       navigation: { stage: "webclass_sso", kind: "browser_error_page", cause: "connection_closed", request_method: "post" },
+      diagnostic: { failure: { stage: "navigation", reason: "navigation_failed" }, shutdown: "clean" },
       lms_reached: false, courses_get: 0, contents_get: 0,
     });
     assert.equal(counters.contents, 7);
@@ -506,7 +534,13 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
       assert.equal(reply.navigation.stage, "webclass_sso");
       assert.equal(reply.navigation.request_method, "post");
       assert.equal(reply.navigation.cause, cause);
-      assert.equal(reply.navigation.proxy_connect_observed, proxyCause);
+      if (proxyCause === "timeout" && reply.navigation.proxy_connect_observed === undefined) {
+        // Chrome may start CONNECT before the document event supplies an observation cursor.
+        // The proxy's timeout recording is asserted directly in the stalled CONNECT test.
+        assert.deepEqual(reply.diagnostic.failure, { stage: "navigation", reason: "navigation_failed" });
+      } else {
+        assert.equal(reply.navigation.proxy_connect_observed, proxyCause);
+      }
       assert.ok(!JSON.stringify(reply).includes("127.0.0.1"));
       assert.equal(counters.courses, before.courses);
       assert.equal(counters.contents, before.contents);
@@ -549,6 +583,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
       assert.equal(unaffected.reason, "ok");
       assert.equal(unaffected.courses_get, 1);
       assert.equal(interrupted?.reason, "browser_closed");
+      assert.equal(interrupted.diagnostic.shutdown, "killed");
     }
 
     handoffOrigin = undefined;
@@ -560,6 +595,7 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
     assert.equal(authenticated.courses_get, 0);
     assert.equal(authenticated.contents_get, 0);
     assert.equal(authenticated.body, undefined);
+    assert.deepEqual(authenticated.diagnostic, { failure: undefined, authenticated_by: "logout_control", shutdown: "clean" });
     assert.equal(counters.consent, base.consent + 1);
     assert.equal(counters.acs, base.acs + 1);
     assert.equal(counters.courses, base.courses);
@@ -572,15 +608,18 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
     assert.equal(acquired.reason, "ok");
     assert.equal(acquired.courses_get, 1);
     assert.equal(acquired.contents_get, 1);
+    assert.equal(acquired.diagnostic.authenticated_by, "logout_control");
 
-    for (const [mode, reason, requests, profile] of [
-      ["operation-authenticate", "reauth_required", 0, "operation-empty"],
-      ["operation-idp", "reauth_required", 0],
-      ["operation-document-forbidden", "access_denied", 0],
-      ["operation-login-redirect", "reauth_required", 1],
-      ["operation-login-html", "reauth_required", 1],
-      ["operation-server", "server_unavailable", 1],
-      ["operation-network", "network_failed", 1],
+    for (const [mode, reason, requests, stage, detail, profile] of [
+      ["operation-authenticate", "reauth_required", 0, "navigation", "authentication_redirect", "operation-empty"],
+      ["operation-idp", "reauth_required", 0, "navigation", "authentication_redirect"],
+      ["operation-document-forbidden", "access_denied", 0, "navigation", "access_denied"],
+      ["operation-visible-login", "reauth_required", 0, "page_detection", "login_form_detected"],
+      ["operation-login-redirect", "reauth_required", 1, "courses_api", "authentication_redirect"],
+      ["operation-login-html", "reauth_required", 1, "courses_api", "login_html_response"],
+      ["expired", "auth_expired", 1, "courses_api", "session_expired"],
+      ["operation-server", "server_unavailable", 1, "courses_api", "server_unavailable"],
+      ["operation-network", "network_failed", 1, "courses_api", "request_failed"],
     ]) {
       resultMode = mode;
       const failed = await runBrowser(headless(profile), { flags: [certificateFlag] },
@@ -589,11 +628,44 @@ test(`isolated ${browserName} reads only the requested WebClass API endpoints ov
       assert.equal(failed.courses_get, requests, mode);
       assert.equal(failed.contents_get, 0, mode);
       assert.equal(failed.body, undefined, mode);
+      assert.deepEqual(failed.diagnostic.failure, { stage, reason: detail }, mode);
+      assert.doesNotMatch(JSON.stringify(failed.diagnostic), /fixture|https?:|cookie|password/i);
+    }
+    for (const [mode, reason, detail] of [
+      ["operation-contents-auth-redirect", "reauth_required", "authentication_redirect"],
+      ["operation-contents-login-html", "reauth_required", "login_html_response"],
+      ["contents-expired", "access_denied", "access_denied"],
+    ]) {
+      resultMode = mode;
+      const failed = await runBrowser(headless(), { flags: [certificateFlag] }, () => selectPath("fixture-course-002"));
+      assert.equal(failed.reason, reason, mode);
+      assert.equal(failed.courses_get, 1, mode);
+      assert.equal(failed.contents_get, 1, mode);
+      assert.deepEqual(failed.diagnostic.failure, { stage: "assignments_api", reason: detail }, mode);
     }
     assert.equal(counters.portal, base.portal + 1);
     assert.equal(counters.consent, base.consent + 1);
     assert.equal(counters.acs, base.acs + 1);
     assert.equal(counters.login, 0);
+
+    resultMode = "operation-session-only";
+    const session = await runBrowser(config("session-only", { operation: "authenticate" }),
+      { flags, headed: isMac, interact: clickFixtureConsent });
+    assert.equal(session.reason, "authenticated");
+    const restarted = await runBrowser(headless("session-only"), { flags: [certificateFlag] });
+    assert.equal(restarted.reason, "reauth_required");
+    assert.equal(restarted.courses_get, 0);
+    assert.deepEqual(restarted.diagnostic.failure, { stage: "navigation", reason: "authentication_redirect" });
+
+    resultMode = "operation-unsigned-dashboard";
+    for (const [operation, reason] of [["authenticate", "login_timeout"], ["headless", "webclass_ready_timeout"]]) {
+      const unsigned = await runBrowser({ ...headless("unsigned-" + operation), operation, loginMillis: 2500 },
+        { flags: [certificateFlag] });
+      assert.equal(unsigned.reason, reason);
+      assert.equal(unsigned.courses_get, 0);
+      assert.equal(unsigned.contents_get, 0);
+      assert.deepEqual(unsigned.diagnostic.failure, { stage: "page_detection", reason: "authenticated_marker_missing" });
+    }
   } finally {
     await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

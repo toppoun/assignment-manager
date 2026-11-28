@@ -140,7 +140,114 @@ pub struct BrowserCheck<T> {
     pub contents_get: u8,
     pub lms_reached: bool,
     pub navigation: Option<BrowserNavigation>,
+    pub diagnostic: BrowserDiagnostic,
+    pub profile_tag: Option<String>,
     pub result: Result<T, &'static str>,
+}
+
+/// Fixed categories only. No strings supplied by a page or the browser are forwarded.
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDiagnostic {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<BrowserFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authenticated_by: Option<AuthenticationMarker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shutdown: Option<BrowserShutdown>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserFailure {
+    stage: BrowserStage,
+    reason: BrowserReason,
+}
+
+impl BrowserFailure {
+    fn profile(code: &str) -> Self {
+        let reason = match code {
+            "reauth_required" => BrowserReason::ProfileMissing,
+            "profile_in_use" => BrowserReason::ProfileInUse,
+            "profile_not_managed" => BrowserReason::ProfileNotManaged,
+            _ => BrowserReason::ProfileUnavailable,
+        };
+        Self {
+            stage: BrowserStage::Profile,
+            reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BrowserStage {
+    Profile,
+    BrowserStart,
+    Navigation,
+    PageDetection,
+    CoursesApi,
+    AssignmentsApi,
+    BrowserShutdown,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BrowserReason {
+    ProfileMissing,
+    ProfileUnavailable,
+    ProfileInUse,
+    ProfileNotManaged,
+    StartupFailed,
+    ProxyFailure,
+    NavigationFailed,
+    NavigationBlocked,
+    AuthenticationRedirect,
+    AuthenticationContextChanged,
+    LoginFormDetected,
+    LoginHtmlResponse,
+    AuthenticatedMarkerMissing,
+    SessionExpired,
+    AccessDenied,
+    ReadyTimeout,
+    ServerUnavailable,
+    UnexpectedRedirect,
+    RequestFailed,
+    BrowserClosed,
+    ShutdownFailed,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthenticationMarker {
+    LogoutControl,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BrowserShutdown {
+    Clean,
+    AlreadyExited,
+    AbnormalExit,
+    Terminated,
+    Killed,
+    Failed,
+}
+
+impl BrowserDiagnostic {
+    pub fn startup_failed() -> Self {
+        Self {
+            failure: Some(BrowserFailure {
+                stage: BrowserStage::BrowserStart,
+                reason: BrowserReason::StartupFailed,
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.failure.is_none() && self.authenticated_by.is_none() && self.shutdown.is_none()
+    }
 }
 
 /// Only fixed navigation categories can cross the driver's result pipe.
@@ -231,6 +338,8 @@ struct BrowserReply {
     contents_get: u8,
     lms_reached: bool,
     navigation: Option<BrowserNavigation>,
+    #[serde(default)]
+    diagnostic: BrowserDiagnostic,
     body: Option<String>,
     bodies: Option<Vec<String>>,
 }
@@ -548,9 +657,32 @@ pub fn check_local_dependencies() -> Result<(), &'static str> {
 fn launch(
     mode: ProfileMode,
     request: Option<RequestedCourses<'_>>,
-) -> Result<DriverResult, &'static str> {
-    let executable = browser_executable()?;
-    let profile = BrowserProfile::open(mode)?;
+) -> (
+    Result<DriverResult, &'static str>,
+    BrowserDiagnostic,
+    Option<String>,
+) {
+    let executable = match browser_executable() {
+        Ok(executable) => executable,
+        Err(code) => return (Err(code), BrowserDiagnostic::startup_failed(), None),
+    };
+    let profile = match BrowserProfile::open(mode) {
+        Ok(profile) => profile,
+        Err(code) => {
+            let diagnostic = BrowserDiagnostic {
+                failure: Some(BrowserFailure::profile(code)),
+                ..BrowserDiagnostic::default()
+            };
+            return (Err(code), diagnostic, None);
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let profile_tag = match &profile {
+        BrowserProfile::Retained { path, .. } => platform::profile_tag(path),
+        BrowserProfile::Temporary(_) => None,
+    };
+    #[cfg(windows)]
+    let profile_tag = None;
     let (operation, entry) = match mode {
         ProfileMode::Headless => (
             BrowserOperation::Headless,
@@ -583,13 +715,25 @@ fn launch(
         login_millis: 5 * 60 * 1000,
     };
     let mut report = run_driver(&config, &profile, request);
+    let mut diagnostic = report
+        .as_ref()
+        .map(|driver| driver.reply.diagnostic)
+        .unwrap_or_default();
+    if matches!(report, Err("browser_runtime_unavailable")) {
+        diagnostic = BrowserDiagnostic::startup_failed();
+    }
     if profile.close().is_err() {
+        diagnostic.shutdown = Some(BrowserShutdown::Failed);
+        diagnostic.failure = Some(BrowserFailure {
+            stage: BrowserStage::BrowserShutdown,
+            reason: BrowserReason::ShutdownFailed,
+        });
         match &mut report {
             Ok(report) => report.reply.reason = "profile_cleanup_failed".into(),
             Err(reason) => *reason = "profile_cleanup_failed",
         }
     }
-    report
+    (report, diagnostic, profile_tag)
 }
 
 fn check<T>(
@@ -597,12 +741,15 @@ fn check<T>(
     request: Option<RequestedCourses<'_>>,
     parse: impl FnOnce(DriverResult) -> Result<T, &'static str>,
 ) -> BrowserCheck<T> {
-    match launch(mode, request) {
+    let (report, diagnostic, profile_tag) = launch(mode, request);
+    match report {
         Ok(driver) => BrowserCheck {
             courses_get: driver.reply.courses_get,
             contents_get: driver.reply.contents_get,
             lms_reached: driver.reply.lms_reached,
             navigation: driver.reply.navigation,
+            diagnostic,
+            profile_tag,
             result: parse(driver),
         },
         Err(reason) => BrowserCheck {
@@ -610,6 +757,8 @@ fn check<T>(
             contents_get: 0,
             lms_reached: false,
             navigation: None,
+            diagnostic,
+            profile_tag,
             result: Err(reason),
         },
     }
@@ -682,9 +831,11 @@ mod tests {
         let base = local.path().canonicalize().unwrap();
         #[cfg(windows)]
         let base = local.path().to_owned();
+        let code = BrowserProfile::retained(&base, false).err().unwrap();
+        assert_eq!(code, "reauth_required");
         assert_eq!(
-            BrowserProfile::retained(&base, false).err(),
-            Some("reauth_required")
+            serde_json::to_value(BrowserFailure::profile(code)).unwrap(),
+            json!({"stage": "profile", "reason": "profile_missing"})
         );
         assert!(!base.join(platform::PROFILE_DIRECTORY).exists());
         let first = BrowserProfile::retained(&base, true).unwrap();
@@ -733,6 +884,7 @@ mod tests {
             contents_get: 0,
             lms_reached: true,
             navigation: None,
+            diagnostic: BrowserDiagnostic::default(),
             body: Some(body),
             bodies: None,
         };
@@ -879,6 +1031,47 @@ mod tests {
                 .iter()
                 .all(|assignment| assignment.submission_url.is_none())
         );
+    }
+
+    #[test]
+    fn browser_driver_diagnostics_allow_only_fixed_authentication_categories() {
+        let diagnostic = json!({
+            "failure": { "stage": "assignments_api", "reason": "login_html_response" },
+            "authenticated_by": "logout_control", "shutdown": "clean",
+        });
+        let reply = json!({"reason": "reauth_required", "courses_get": 1, "contents_get": 1,
+            "lms_reached": true, "diagnostic": diagnostic});
+        let (driver, _) = synthetic_exchange(COURSES, SELECTED, reply.clone());
+        assert_eq!(driver.reply.diagnostic(), "reauth_required");
+        assert_eq!(
+            serde_json::to_value(driver.reply.diagnostic).unwrap(),
+            diagnostic
+        );
+
+        for field in [
+            "reason",
+            "stage",
+            "url",
+            "cookie",
+            "body",
+            "headers",
+            "profile_path",
+        ] {
+            let mut untrusted = reply.clone();
+            untrusted["diagnostic"]["failure"][field] = json!("private fixture value");
+            assert!(
+                serde_json::from_value::<BrowserReply>(untrusted).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["authenticated_by", "shutdown", "token"] {
+            let mut untrusted = reply.clone();
+            untrusted["diagnostic"][field] = json!("private fixture value");
+            assert!(
+                serde_json::from_value::<BrowserReply>(untrusted).is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

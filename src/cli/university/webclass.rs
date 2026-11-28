@@ -114,6 +114,7 @@ pub(in crate::cli) fn authenticate() -> u8 {
     prompt_browser_authentication();
     let check = assignment_manager::webclass_browser::authenticate();
     report_browser_navigation(check.navigation);
+    report_browser_diagnostic(&check, "not_checked");
     match check.result {
         Ok(()) => {
             println!("webclass authentication=ready profile=retained");
@@ -148,6 +149,16 @@ pub(in crate::cli) fn browser(keep_profile: bool, headless: bool, course_id: Opt
             check.lms_reached, check.courses_get, check.contents_get,
         );
         report_browser_navigation(check.navigation);
+        if headless {
+            report_browser_diagnostic(
+                &check,
+                if check.result.is_ok() {
+                    "assignments_read"
+                } else {
+                    "not_confirmed"
+                },
+            );
+        }
         return match check.result {
             Ok(result) => {
                 use assignment_manager::domain::Deadline;
@@ -187,7 +198,7 @@ pub(in crate::cli) fn browser(keep_profile: bool, headless: bool, course_id: Opt
             }
         };
     }
-    match read_browser_course_list(mode) {
+    match read_browser_course_list(mode, headless) {
         Ok(courses) => {
             for course in courses.records() {
                 println!(
@@ -224,6 +235,7 @@ pub(in crate::cli) fn browser(keep_profile: bool, headless: bool, course_id: Opt
 #[cfg(any(windows, target_os = "macos"))]
 pub(in crate::cli) fn read_browser_course_list(
     mode: assignment_manager::webclass_browser::ProfileMode,
+    show_diagnostic: bool,
 ) -> Result<assignment_manager::sync::AcquiredWebClassCourses, &'static str> {
     use assignment_manager::webclass_browser;
     let check = webclass_browser::run(mode);
@@ -233,7 +245,32 @@ pub(in crate::cli) fn read_browser_course_list(
         check.lms_reached, check.courses_get
     );
     report_browser_navigation(check.navigation);
+    if show_diagnostic {
+        report_browser_diagnostic(
+            &check,
+            if check.result.is_ok() {
+                "courses_read"
+            } else {
+                "not_confirmed"
+            },
+        );
+    }
     check.result
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn report_browser_diagnostic<T>(
+    check: &assignment_manager::webclass_browser::BrowserCheck<T>,
+    restart_session_check: &str,
+) {
+    println!(
+        "webclass browser_diagnostic {}",
+        serde_json::json!({
+            "profile_tag": check.profile_tag,
+            "restart_session_check": restart_session_check,
+            "diagnostic": check.diagnostic,
+        }),
+    );
 }
 
 #[cfg(any(windows, target_os = "macos"))]
