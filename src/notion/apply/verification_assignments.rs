@@ -9,6 +9,7 @@ use super::{ApplyError, ApplyReport, WriteAccess};
 use crate::notion::{
     CourseSetupVerification, DryRunReport, NotionClient, NotionError, NotionTarget, PlanAction,
     PreparedWrite, SyncInput, live_assignment_read_target,
+    plan::display_title,
     state::{StateStore, TargetLock},
     trial::{
         MOODLE_VERIFICATION_READER, MOODLE_VERIFICATION_WRITER, PRODUCTION_ASSIGNMENTS,
@@ -287,7 +288,7 @@ impl NotionClient {
             return Err(ApplyError::PlanChanged);
         }
         let rules = self.read_course_rules(rules_config, &schema)?;
-        let mut fresh = self.prepare_plan(schema, state, |schema, rows| {
+        let mut fresh = self.prepare_plan(schema, state, Some(&rules), |schema, rows| {
             Self::plan_from_course_rules(input, schema, rows, &rules)
         })?;
         let counts = fresh.deltas.counts_for(input);
@@ -405,10 +406,16 @@ impl NotionClient {
             report.deadlines_at_minute_precision +=
                 usize::from(deadline_matches && row.deadline != source.deadline);
             for (field, mismatch) in [
-                ("title", row.title != source.title),
+                (
+                    "title",
+                    row.title != display_title(&course.title, &source.title),
+                ),
                 ("deadline", !deadline_matches),
                 ("source", row.source != Some(source.source)),
-                ("course", more || row.course_page_ids.as_slice() != [course]),
+                (
+                    "course",
+                    more || row.course_page_ids.as_slice() != [course.page_id.as_str()],
+                ),
             ] {
                 if mismatch {
                     *report.field_mismatches.entry(field).or_default() += 1;

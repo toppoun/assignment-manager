@@ -21,18 +21,20 @@ use super::{CliError, Config, config, credentials, notion_diagnosis};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
     Preview,
+    ShowPlan,
     EnableWrites,
     DisableWrites,
     Apply,
 }
 
 impl Action {
-    pub(super) fn parse(value: &str) -> Result<Self, CliError> {
-        match value {
-            "--dry-run" => Ok(Self::Preview),
-            "--enable-writes" => Ok(Self::EnableWrites),
-            "--disable-writes" => Ok(Self::DisableWrites),
-            "--apply" => Ok(Self::Apply),
+    pub(super) fn parse(args: &[&str]) -> Result<Self, CliError> {
+        match args {
+            ["--dry-run"] => Ok(Self::Preview),
+            ["--dry-run", "--show-plan"] | ["--show-plan", "--dry-run"] => Ok(Self::ShowPlan),
+            ["--enable-writes"] => Ok(Self::EnableWrites),
+            ["--disable-writes"] => Ok(Self::DisableWrites),
+            ["--apply"] => Ok(Self::Apply),
             _ => Err(CliError::Usage),
         }
     }
@@ -41,16 +43,16 @@ impl Action {
         match self {
             Self::EnableWrites => Some("enable_writes"),
             Self::DisableWrites => Some("disable_writes"),
-            Self::Apply | Self::Preview => None,
+            Self::Apply | Self::Preview | Self::ShowPlan => None,
         }
     }
 }
 
 pub(super) fn execute(path: Option<&Path>, action: Action) -> u8 {
-    let mode = if action == Action::Preview {
-        RecurringMode::Preview
-    } else {
-        RecurringMode::Apply
+    let mode = match action {
+        Action::Preview => RecurringMode::Preview,
+        Action::ShowPlan => RecurringMode::PreviewWithPlan,
+        _ => RecurringMode::Apply,
     };
     match execute_inner(path, action, mode) {
         Ok(exit) => exit,

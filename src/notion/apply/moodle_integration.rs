@@ -219,7 +219,7 @@ impl NotionClient {
         for id in mappings.by_course.values() {
             verify_course(id)?;
         }
-        self.prepare_plan(schema, state, |schema, rows| {
+        self.prepare_plan(schema, state, None, |schema, rows| {
             self.plan_from_rows_with_course_check(
                 input,
                 schema,

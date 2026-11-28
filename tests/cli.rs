@@ -89,7 +89,44 @@ fn recurring_cli_reports_blocked_as_versioned_json_without_credentials_or_state(
         assert_eq!(report["status"], "blocked");
         assert_eq!(report["mode"], mode);
         assert_eq!(report["error"], error);
+        assert!(report.get("plan").is_none());
         assert!(stderr(&output).is_empty());
+    }
+    assert!(!local_root(&temp).exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn recurring_show_plan_requires_dry_run_and_preserves_the_json_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    for options in [["--dry-run", "--show-plan"], ["--show-plan", "--dry-run"]] {
+        let output = call(&temp, &["sync", "recurring", options[0], options[1]]);
+        assert_eq!(output.status.code(), Some(2));
+        let stdout = stdout(&output);
+        assert_eq!(stdout.lines().count(), 1);
+        let mut report: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        let plan = report.as_object_mut().unwrap().remove("plan").unwrap();
+        assert_eq!(plan["sources"], serde_json::json!({}));
+        assert!(plan["unresolved_creates"].is_null());
+        let summary = call(&temp, &["sync", "recurring", "--dry-run"]);
+        assert_eq!(
+            report,
+            serde_json::from_slice::<serde_json::Value>(&summary.stdout).unwrap()
+        );
+        assert!(stderr(&output).is_empty());
+    }
+    for options in [
+        &["--show-plan"][..],
+        &["--apply", "--show-plan"],
+        &["--enable-writes", "--show-plan"],
+        &["--disable-writes", "--show-plan"],
+        &["--dry-run", "--show-plan", "--show-plan"],
+    ] {
+        let mut args = vec!["sync", "recurring"];
+        args.extend_from_slice(options);
+        let output = call(&temp, &args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
     }
     assert!(!local_root(&temp).exists());
 }

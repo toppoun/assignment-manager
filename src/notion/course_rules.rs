@@ -16,7 +16,7 @@ use super::{
     trial::{PRODUCTION_ASSIGNMENTS, PRODUCTION_COURSES, PRODUCTION_RULES},
     wire::{
         Schema, data_source_parent, page_property, page_relations, property, relation_targets,
-        select_option_ids, text, uuid,
+        select_option_ids, text, uuid, valid_title,
     },
 };
 
@@ -71,6 +71,7 @@ impl CourseRuleSummary {
 pub(super) struct ConfirmedCourse {
     pub(super) page_id: String,
     pub(super) term: String,
+    pub(super) title: String,
 }
 
 type RuleResult = Result<ConfirmedCourse, DeferredReason>;
@@ -122,7 +123,10 @@ impl CourseRules {
             .collect()
     }
 
-    pub(super) fn resolve(&self, assignment: &SyncAssignment) -> Result<&str, DeferredReason> {
+    pub(super) fn resolve(
+        &self,
+        assignment: &SyncAssignment,
+    ) -> Result<&ConfirmedCourse, DeferredReason> {
         let rule = assignment
             .course_key
             .as_ref()
@@ -138,7 +142,7 @@ impl CourseRules {
         }
         // A unique confirmed Moodle rule asserts that this category belongs to
         // one term within the feed. The ICS supplies no independent term value.
-        Ok(&rule.page_id)
+        Ok(rule)
     }
 }
 
@@ -314,17 +318,27 @@ impl NotionClient {
         }
 
         if by_key.values().any(|rule| rule.resolution.is_ok()) {
-            let terms = self.query_course_pages(schema, &[&target.course_term], |_, page| {
-                text(page_property(page, &target.course_term, "rich_text")?)
-            })?;
+            let courses =
+                self.query_course_pages(schema, &[&target.course_term, "title"], |_, page| {
+                    let term = text(page_property(page, &target.course_term, "rich_text")?)?;
+                    let title = page_property(page, "title", "title")
+                        .and_then(text)
+                        .ok()
+                        .filter(|title| valid_title(title) && !title.chars().any(char::is_control));
+                    Ok((term, title))
+                })?;
             for rule in by_key.values_mut() {
-                if let Ok(course) = &rule.resolution {
-                    rule.resolution = match terms.get(&course.page_id) {
+                if let Ok(course) = &mut rule.resolution {
+                    rule.resolution = match courses.get(&course.page_id) {
                         None => Err(DeferredReason::CourseRuleInvalidRelation),
-                        Some(term) if term != &course.term => {
+                        Some((term, _)) if term != &course.term => {
                             Err(DeferredReason::CourseTermUnverified)
                         }
-                        Some(_) => continue,
+                        Some((_, None)) => Err(DeferredReason::CourseRuleInvalid),
+                        Some((_, Some(title))) => {
+                            course.title.clone_from(title);
+                            continue;
+                        }
                     };
                 }
             }
@@ -358,5 +372,9 @@ fn confirmed_course(page: &Value, target: &CourseRulesTarget) -> Result<RuleResu
         return Ok(Err(DeferredReason::CourseRuleInvalidRelation));
     }
     let page_id = links.remove(0);
-    Ok(Ok(ConfirmedCourse { page_id, term }))
+    Ok(Ok(ConfirmedCourse {
+        page_id,
+        term,
+        title: String::new(),
+    }))
 }

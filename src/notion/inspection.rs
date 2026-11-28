@@ -16,8 +16,8 @@ use super::{
     state::StateSummary,
     trial::MANAGED_PROPERTIES,
     wire::{
-        Schema, checked_page_id, data_source_parent, page_property, page_relations,
-        relation_targets, source_options, text, uuid,
+        Schema, checked_page_id, data_source_parent, page_relations, relation_targets,
+        source_options, uuid,
     },
 };
 
@@ -155,31 +155,25 @@ impl NotionClient {
         inspection.recoverable_creates = reconcile_snapshot(&mut state, &rows).len();
         inspection.unresolved_creates = state.pending;
         plan.defer_unreconciled(&state);
-        let titles = self.query_course_pages(&schema, &["title"], |_, page| {
-            text(page_property(page, "title", "title")?)
-        })?;
         let report = rules
             .by_key
             .into_iter()
             .map(|(key, rule)| {
                 let destination = match rule.resolution {
                     Ok(course) => Ok(VerificationCourse {
-                        title: titles
-                            .get(&course.page_id)
-                            .ok_or(NotionError::IncompleteSnapshot)?
-                            .clone(),
+                        title: course.title,
                         term: course.term,
                         page_id: course.page_id,
                     }),
                     Err(problem) => Err(problem),
                 };
-                Ok(VerificationCourseRule {
+                VerificationCourseRule {
                     key,
                     source_name: rule.name,
                     destination,
-                })
+                }
             })
-            .collect::<Result<_, NotionError>>()?;
+            .collect();
         Ok((inspection, plan, report))
     }
 

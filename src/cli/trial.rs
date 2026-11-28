@@ -151,10 +151,11 @@ mod macos {
             match &entry.action {
                 PlanAction::Create {
                     assignment,
+                    display_title,
                     course_page_id,
                 } => println!(
                     "create title={:?} deadline={} source=Moodle set_relation={}",
-                    assignment.title,
+                    display_title,
                     deadline(assignment.deadline.as_ref()),
                     course_page_id.is_some()
                 ),

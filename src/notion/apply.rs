@@ -38,6 +38,7 @@ use super::{
     AssignmentPatch, CourseMapping, DryRunCounts, DryRunReport, NotionAssignment, NotionClient,
     NotionError, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey, TrialAssignment,
     TrialRole, TrialTarget, VerificationTarget,
+    course_rules::CourseRules,
     state::{BindingStatus, StateError, StateStore, StateSummary, TargetLock},
     wire::{Schema, checked_page_id},
 };
@@ -181,7 +182,7 @@ impl Observation {
             Some(schema.title_content(page)?.clone())
         } else {
             // An unreadable manual row cannot safely rule out a duplicate candidate.
-            (row.title, row.deadline) = schema.manual_title_deadline(page)?;
+            schema.read_manual_comparison(page, &mut row)?;
             None
         };
         Ok(Self {
@@ -280,12 +281,16 @@ impl NotionClient {
         let _lock = TargetLock::acquire(directory)?;
         let store = StateStore::for_apply(&directory.join("state.sqlite3"), &target_id)?;
         let state = store.summary()?;
-        let plan = match self.retrieve_schema(target) {
-            Ok(schema) => self.prepare_apply(input, schema, mappings, state),
-            Err(error) => {
-                return Ok(unavailable(input, &state, error));
+        let plan = self.retrieve_schema(target).and_then(|schema| {
+            if let Some(config) = &target.course_rules {
+                let rules = self.read_course_rules(config, &schema)?;
+                self.prepare_plan(schema, state, Some(&rules), |schema, rows| {
+                    Self::plan_from_course_rules(input, schema, rows, &rules)
+                })
+            } else {
+                self.prepare_apply(input, schema, mappings, state)
             }
-        };
+        });
         match plan {
             Ok(plan) => self.execute_apply(&plan, &store, &WriteAccess::Mock),
             Err(error) => Ok(unavailable(input, &store.summary()?, error)),
@@ -299,7 +304,7 @@ impl NotionClient {
         mappings: &[CourseMapping],
         state: StateSummary,
     ) -> Result<PreparedApply, NotionError> {
-        self.prepare_plan(schema, state, |schema, rows| {
+        self.prepare_plan(schema, state, None, |schema, rows| {
             self.plan_from_rows(input, schema, rows, mappings)
         })
     }
@@ -308,6 +313,7 @@ impl NotionClient {
         &self,
         schema: Schema,
         mut state: StateSummary,
+        rules: Option<&CourseRules>,
         build: impl FnOnce(&Schema, &[NotionAssignment]) -> Result<DryRunReport, NotionError>,
     ) -> Result<PreparedApply, NotionError> {
         let mut pages = self.query_assignment_pages(&schema, None, |page, row| {
@@ -324,7 +330,7 @@ impl NotionClient {
             .collect();
         unresolved_keys.sort_unstable();
         let mut deltas = build(&schema, &rows)?;
-        let manual_candidates = deltas.defer_manual_candidates(&rows);
+        let manual_candidates = deltas.defer_manual_candidates(&rows, rules);
         deltas.defer_unreconciled(&state);
         let planned_keys: HashSet<_> = deltas.plan().iter().map(|entry| &entry.key).collect();
         let missing_bindings = state

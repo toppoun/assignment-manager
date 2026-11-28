@@ -368,11 +368,16 @@ Moodleの運用開始時は、1回あたり作成5件・更新3件を目安に�
 
 ```sh
 "$CLI" --config local/notion-production.json sync recurring --dry-run
+"$CLI" --config local/notion-production.json sync recurring --dry-run --show-plan
 "$CLI" --config local/notion-production.json sync recurring --enable-writes
 "$CLI" --config local/notion-production.json sync recurring --apply
 ```
 
-`--dry-run` は取得と計画を行います。`--enable-writes` では対話端末に表示される課題・授業・対応表の対象、
+`--dry-run` は取得と計画を行います。`--show-plan` を追加すると `plan` フィールドに予定の課題名・期限・ページID・
+プロパティID・変更上限・未解決の作成意図が含まれます。詳細には課題情報が含まれるため、手動での確認時に使用します。
+適用時は新たに取得して計画を作り、プレビューから適用までの間に生じた変更も計画に反映されます。
+
+`--enable-writes` では対話端末に表示される課題・授業・対応表の対象、
 WriterのBot ID、取得元、変更件数の上限を確認します。表示された承認文字列を入力すると、Writerと対象スキーマを
 読み取りで検証し、承認を対象の状態DBに保存します。対象、Bot ID、取得元、Moodleフィード設定、上限、
 または検証済みのスキーマが変わった場合、適用には再承認が必要です。

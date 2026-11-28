@@ -90,6 +90,10 @@ fn approve(directory: &Path, policy: &RecurringPolicy) {
 }
 
 fn rules_snapshot() -> Vec<Exchange> {
+    rules_snapshot_with_course("人工知能", 0x101)
+}
+
+fn rules_snapshot_with_course(moodle_title: &str, hoppii_course: usize) -> Vec<Exchange> {
     let mut script = schemas();
     script.extend([
         rules_query(
@@ -100,14 +104,333 @@ fn rules_snapshot() -> Vec<Exchange> {
                     "hoppii-option",
                     DEFAULT_COURSE_SOURCE_SCOPE,
                     GROUP,
-                    &fake_id(0x101),
+                    &fake_id(hoppii_course),
                 ),
             ],
             None,
         ),
-        courses_query(vec![course(0, TERM), course(1, TERM)]),
+        courses_query(vec![named_course(0, TERM, moodle_title), course(1, TERM)]),
     ]);
     script
+}
+
+#[test]
+fn title_migration_keeps_page_key_and_protected_fields_through_lost_patch_and_rename() {
+    let directory = state_directory();
+    let policy = policy_for(0, None);
+    approve(directory.path(), &policy);
+    let key = key("moodle-0");
+    let before = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    let mut after = before.clone();
+    after["properties"]["タイトル（改名済）"]["title"] = json!([text("【人工知能】Moodle task 0")]);
+    let manual = task(MANUAL, None, "【人工知能】Moodle task 0");
+    let rows = || vec![before.clone(), manual.clone()];
+    let (reader, preview_mock) = local_mock(reader_script(rows()));
+    let preview = reader.run_production_recurring(
+        &production_target(),
+        &policy,
+        directory.path(),
+        RecurringMode::Preview,
+        || panic!("preview does not load the writer"),
+        |_| successful_inputs(),
+    );
+    assert_eq!(preview.exit_code(), 0);
+    let preview = json!(preview);
+    assert_eq!(preview["moodle"]["planned"]["update"], 1);
+    assert_eq!(preview["moodle"]["planned"]["create"], 0);
+    assert!(!preview.to_string().contains("Moodle task 0"));
+    preview_mock.join().unwrap();
+
+    let path = format!("/v1/pages/{PAGE_A}");
+    let mut writes = writer_checks();
+    writes.extend([
+        Exchange::json("GET", &path, before.clone()),
+        Exchange::drop_response("PATCH", &path).check(|_, body| {
+            assert_eq!(
+                *body,
+                json!({"properties":{"title":{"title":[text("【人工知能】Moodle task 0")]}}})
+            );
+        }),
+        Exchange::json("GET", &path, after.clone()),
+    ]);
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(rows()),
+        Some(writes),
+    );
+    assert_eq!(exit, 0, "{report}");
+    assert_eq!(report["moodle"]["planned"], preview["moodle"]["planned"]);
+    assert_eq!(report["moodle"]["applied"]["update"], 1);
+    let store = StateStore::for_apply(
+        &directory.path().join("state.sqlite3"),
+        PRODUCTION_ASSIGNMENTS,
+    )
+    .unwrap();
+    assert_eq!(
+        store.binding(&key).unwrap().unwrap().page_id.as_deref(),
+        Some(PAGE_A)
+    );
+    let mut preserved = after.clone();
+    preserved["properties"]["タイトル（改名済）"] =
+        before["properties"]["タイトル（改名済）"].clone();
+    assert_eq!(preserved, before);
+
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(vec![after.clone(), manual.clone()]),
+        Some(writer_checks()),
+    );
+    assert_eq!(exit, 0, "{report}");
+    assert_eq!(report["moodle"]["applied"]["unchanged"], 1);
+    let renamed_snapshot = || rules_snapshot_with_course("人工知能演習", 0x101);
+    let mut reader = renamed_snapshot();
+    reader.extend(renamed_snapshot());
+    reader.push(query(vec![after.clone(), manual], None));
+    let mut renamed = after.clone();
+    renamed["properties"]["タイトル（改名済）"]["title"] =
+        json!([text("【人工知能演習】Moodle task 0")]);
+    let mut writes = writer_checks();
+    writes.extend([
+        Exchange::json("GET", &path, after),
+        Exchange::json("PATCH", &path, renamed).check(|_, body| {
+            assert_eq!(
+                *body,
+                json!({"properties":{"title":{"title":[text("【人工知能演習】Moodle task 0")]}}})
+            );
+        }),
+    ]);
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader,
+        Some(writes),
+    );
+    assert_eq!(exit, 0, "{report}");
+    assert_eq!(report["moodle"]["applied"]["update"], 1);
+    assert_eq!(
+        store.binding(&key).unwrap().unwrap().page_id.as_deref(),
+        Some(PAGE_A)
+    );
+}
+
+#[test]
+fn recurring_stops_when_the_formal_course_title_changes_during_acquisition() {
+    let directory = state_directory();
+    let policy = policy_for(3, None);
+    approve(directory.path(), &policy);
+    let mut reader = rules_snapshot();
+    reader.extend(rules_snapshot_with_course("人工知能演習", 0x101));
+    reader.push(query(vec![], None));
+    let (exit, report) = apply(directory.path(), &policy, successful_inputs(), reader, None);
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["moodle"]["error"], "course_rules_changed");
+}
+
+#[test]
+fn cross_lms_holds_legacy_current_and_possible_former_titles_in_the_same_course() {
+    let directory = state_directory();
+    let policy = policy_for(3, None);
+    approve(directory.path(), &policy);
+    for title in [
+        "Moodle task 0",
+        "【人工知能】Moodle task 0",
+        "【改名前】Moodle task 0",
+    ] {
+        let mut old_web = managed(UniversitySource::WebClass, PAGE_B, Some(title));
+        old_web["properties"]["授業"]["relation"] = json!([{"id":fake_id(0x100)}]);
+        let (exit, report) = apply(
+            directory.path(),
+            &policy,
+            successful_inputs(),
+            reader_script(vec![old_web]),
+            None,
+        );
+        assert_eq!(exit, 2, "{report}");
+        assert_eq!(report["moodle"]["error"], "potential_duplicate");
+    }
+    let other_course = managed(
+        UniversitySource::WebClass,
+        PAGE_B,
+        Some("【プログラミング2】Moodle task 0"),
+    );
+    let distinct_title = managed(
+        UniversitySource::WebClass,
+        PAGE_C,
+        Some("【人工知能】【補足】Moodle task 0"),
+    );
+    let mut distinct_title = distinct_title;
+    distinct_title["properties"]["同期キー"]["rich_text"] =
+        json!([text(key("other-web").as_str())]);
+    distinct_title["properties"]["授業"]["relation"] = json!([{"id":fake_id(0x100)}]);
+    let mut writes = writer_checks();
+    writes.extend([
+        query(vec![], None),
+        create(managed(UniversitySource::Moodle, PAGE_A, None)),
+    ]);
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(vec![other_course, distinct_title]),
+        Some(writes),
+    );
+    assert_eq!(exit, 0, "{report}");
+    assert_eq!(report["moodle"]["applied"]["create"], 1);
+}
+
+#[test]
+fn cross_lms_holds_both_acquired_candidates_with_the_same_display_title() {
+    let directory = state_directory();
+    let policy = policy(3);
+    approve(directory.path(), &policy);
+    let snapshot = || rules_snapshot_with_course("人工知能", 0x100);
+    let mut reader = snapshot();
+    reader.extend(snapshot());
+    reader.push(query(vec![], None));
+    let mut inputs = successful_inputs();
+    inputs
+        .webclass
+        .as_mut()
+        .unwrap()
+        .assignments
+        .values_mut()
+        .next()
+        .unwrap()
+        .title = "【人工知能】Moodle task 0".into();
+    let (exit, report) = apply(directory.path(), &policy, inputs, reader, None);
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["moodle"]["error"], "potential_duplicate");
+    assert_eq!(report["webclass"]["error"], "potential_duplicate");
+}
+
+#[test]
+fn title_only_migration_stops_at_the_update_limit() {
+    let directory = state_directory();
+    let policy = RecurringPolicy::new(
+        &fake_id(0x500),
+        Some((
+            ChangeLimits {
+                max_creates: 5,
+                max_updates: 0,
+            },
+            [
+                "moodle.fixture.invalid".into(),
+                "/calendar".into(),
+                FEED.into(),
+            ],
+        )),
+        None,
+    )
+    .unwrap();
+    approve(directory.path(), &policy);
+    let row = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(vec![row]),
+        None,
+    );
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["moodle"]["error"], "change_limit");
+    assert_eq!(report["moodle"]["planned"]["update"], 1);
+    assert_eq!(report["moodle"]["planned"]["create"], 0);
+}
+
+#[test]
+fn title_migration_defers_a_concurrent_edit_and_retries_on_the_same_key() {
+    let directory = state_directory();
+    let policy = policy_for(3, None);
+    approve(directory.path(), &policy);
+    let before = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    let mut user_edit = before.clone();
+    user_edit["last_edited_time"] = json!("2026-11-20T00:00:01Z");
+    user_edit["properties"]["メモ"]["rich_text"] = json!([text("New note")]);
+    user_edit["properties"]["タイトル（改名済）"]["title"] = json!([text("Manually edited title")]);
+    let path = format!("/v1/pages/{PAGE_A}");
+    let mut writes = writer_checks();
+    writes.push(Exchange::json("GET", &path, user_edit.clone()));
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(vec![before]),
+        Some(writes),
+    );
+    assert_eq!(exit, 3, "{report}");
+    assert_eq!(report["moodle"]["error"], "notion_conflict");
+    assert_eq!(report["moodle"]["applied"]["update"], 0);
+    let mut after = user_edit.clone();
+    after["properties"]["タイトル（改名済）"]["title"] = json!([text("【人工知能】Moodle task 0")]);
+    let mut writes = writer_checks();
+    writes.extend([
+        Exchange::json("GET", &path, user_edit.clone()),
+        Exchange::json("PATCH", &path, after).check(|_, body| {
+            assert_eq!(
+                *body,
+                json!({"properties":{"title":{"title":[text("【人工知能】Moodle task 0")]}}})
+            );
+        }),
+    ]);
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(vec![user_edit]),
+        Some(writes),
+    );
+    assert_eq!(exit, 0, "{report}");
+    assert_eq!(report["moodle"]["applied"]["update"], 1);
+}
+
+#[test]
+fn title_migration_stops_for_duplicate_keys_and_preserves_the_existing_page_owner() {
+    let directory = state_directory();
+    let policy = policy_for(3, None);
+    approve(directory.path(), &policy);
+    let first = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    let duplicate = managed(
+        UniversitySource::Moodle,
+        PAGE_B,
+        Some("【人工知能】Moodle task 0"),
+    );
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(vec![first.clone(), duplicate]),
+        None,
+    );
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report["error"], "notion_conflict");
+
+    let owner = key("other-owner");
+    let store = StateStore::for_apply(
+        &directory.path().join("state.sqlite3"),
+        PRODUCTION_ASSIGNMENTS,
+    )
+    .unwrap();
+    store.confirm(&owner, PAGE_A).unwrap();
+    let (exit, report) = apply(
+        directory.path(),
+        &policy,
+        successful_inputs(),
+        reader_script(vec![first]),
+        Some(writer_checks()),
+    );
+    assert_eq!(exit, 3, "{report}");
+    assert_eq!(report["moodle"]["applied"]["deferred"], 1);
+    assert_eq!(report["moodle"]["applied"]["update"], 0);
+    assert!(store.binding(&key("moodle-0")).unwrap().is_none());
+    assert_eq!(
+        store.binding(&owner).unwrap().unwrap().page_id.as_deref(),
+        Some(PAGE_A)
+    );
 }
 
 fn reader_script(snapshot: Vec<Value>) -> Vec<Exchange> {
@@ -126,22 +449,31 @@ fn successful_inputs() -> RecurringInputs {
 
 fn managed(source: UniversitySource, id: &str, title_override: Option<&str>) -> Value {
     let RecurringInputs { moodle, webclass } = successful_inputs();
-    let (input, course, option, name) = match source {
-        UniversitySource::Moodle => (moodle.unwrap(), 0x100, "option-md", "Moodle"),
-        UniversitySource::WebClass => (webclass.unwrap(), 0x101, "option-wc", "WebClass"),
+    let (input, course, course_name, option, name) = match source {
+        UniversitySource::Moodle => (moodle.unwrap(), 0x100, "人工知能", "option-md", "Moodle"),
+        UniversitySource::WebClass => (
+            webclass.unwrap(),
+            0x101,
+            "プログラミング2",
+            "option-wc",
+            "WebClass",
+        ),
     };
     let (key, data) = input.assignments().iter().next().unwrap();
-    let mut row = task(id, Some(key), title_override.unwrap_or(&data.title));
+    let display = format!("【{course_name}】{}", data.title);
+    let mut row = task(id, Some(key), title_override.unwrap_or(&display));
     row["properties"]["授業"]["relation"] = json!([{"id":fake_id(course)}]);
     row["properties"]["取得元"]["select"] = json!({"id":option,"name":name});
     row
 }
 
 fn create(row: Value) -> Exchange {
-    Exchange::json("POST", "/v1/pages", row).check(|_, body| {
+    let expected_title = row["properties"]["タイトル（改名済）"]["title"].clone();
+    Exchange::json("POST", "/v1/pages", row).check(move |_, body| {
         assert_eq!(body["parent"]["data_source_id"], PRODUCTION_ASSIGNMENTS);
         let fields = body["properties"].as_object().unwrap();
         assert_eq!(fields.len(), 4);
+        assert_eq!(fields["title"]["title"], expected_title);
         assert!(
             ["title", "sync", "orig", "R%3Ael"]
                 .iter()
@@ -229,7 +561,7 @@ fn recurring_sync_updates_only_title_and_deadline_and_is_idempotent() {
             assert_eq!(
                 body["properties"],
                 json!({
-                    "title":{"title":[text("Moodle task 0")]},
+                    "title":{"title":[text("【人工知能】Moodle task 0")]},
                     "due":{"date":{"start":"2026-12-01"}}
                 })
             );
@@ -544,6 +876,146 @@ fn recurring_sync_preview_needs_neither_writer_nor_approval() {
     assert_eq!(report["moodle"]["applied"], Value::Null);
     assert!(!directory.path().join("state.sqlite3").exists());
     server.join().unwrap();
+}
+
+#[test]
+fn recurring_detailed_preview_shows_updates_creates_and_holds_from_the_same_snapshot() {
+    let directory = test_state_dir();
+    let policy = policy_for(0, None);
+    let mut existing = managed(UniversitySource::Moodle, PAGE_A, Some("Moodle task 0"));
+    existing["properties"]["期限"]["date"] = json!({"start":"2026-11-28"});
+    let (reader, server) = local_mock(reader_script(vec![
+        existing,
+        task(MANUAL, None, "【人工知能】Moodle task 2"),
+    ]));
+    let mut input = mixed_input(&[], &[CATEGORY; 3]);
+    input
+        .assignments
+        .get_mut(&key("moodle-0"))
+        .unwrap()
+        .deadline = Some(Deadline::DateOnly("2026-12-01".parse().unwrap()));
+    let report = reader.run_production_recurring(
+        &production_target(),
+        &policy,
+        directory.path(),
+        RecurringMode::PreviewWithPlan,
+        || panic!("preview must not load a writer"),
+        |_| RecurringInputs {
+            moodle: Ok(input),
+            webclass: Err("disabled"),
+        },
+    );
+    assert_eq!(report.exit_code(), 2);
+    let report = json!(report);
+    assert_eq!(report["mode"], "preview");
+    assert_eq!(report["moodle"]["error"], "change_limit");
+    assert_eq!(report["moodle"]["planned"]["create"], 1);
+    assert_eq!(report["moodle"]["planned"]["update"], 1);
+    assert_eq!(report["moodle"]["planned"]["deferred"], 1);
+    assert!(report["moodle"]["applied"].is_null());
+    let moodle = &report["plan"]["sources"]["moodle"];
+    assert_eq!(moodle["limits"], json!({"max_creates":0,"max_updates":3}));
+    let entries = moodle["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let action = |kind| {
+        entries
+            .iter()
+            .find(|entry| entry["action"] == kind)
+            .unwrap()
+    };
+    let update = action("update");
+    assert_eq!(update["page_id"], PAGE_A);
+    assert_eq!(
+        update["title"],
+        json!({"before":"Moodle task 0","after":"【人工知能】Moodle task 0"})
+    );
+    assert_eq!(
+        update["deadline"],
+        json!({"before":{"DateOnly":"2026-11-28"},"after":{"DateOnly":"2026-12-01"}})
+    );
+    assert_eq!(update["properties"], json!(["due", "title"]));
+    assert_eq!(action("create")["title"], "【人工知能】Moodle task 1");
+    assert_eq!(action("deferred")["reason"], "manual_candidate");
+    assert!(!report.to_string().contains("synthetic-secret"));
+    assert!(!directory.path().join("state.sqlite3").exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn recurring_detailed_preview_reports_pending_intent_without_recovering_or_writing() {
+    let directory = state_directory();
+    let policy = policy_for(3, None);
+    let state = directory.path().join("state.sqlite3");
+    let store = StateStore::for_apply(&state, PRODUCTION_ASSIGNMENTS).unwrap();
+    let key = key("moodle-0");
+    assert!(store.reserve_create(&key).unwrap());
+    drop(store);
+    let before = std::fs::read(&state).unwrap();
+    let (reader, server) = local_mock(reader_script(vec![]));
+    let report = reader.run_production_recurring(
+        &production_target(),
+        &policy,
+        directory.path(),
+        RecurringMode::PreviewWithPlan,
+        || panic!("preview must not load a writer"),
+        |_| successful_inputs(),
+    );
+    assert_eq!(report.exit_code(), 2);
+    let report = json!(report);
+    assert_eq!(report["moodle"]["error"], "reconciliation_required");
+    assert_eq!(report["pending_creates"], 1);
+    assert_eq!(
+        report["plan"]["unresolved_creates"],
+        json!([{"source":"moodle","sync_key":key.as_str()}])
+    );
+    assert_eq!(
+        report["plan"]["sources"]["moodle"]["entries"][0]["reason"],
+        "pending_reconciliation"
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), before);
+    server.join().unwrap();
+}
+
+#[test]
+fn recurring_apply_replans_after_preview_and_checks_the_new_counts_against_limits() {
+    let directory = state_directory();
+    let policy = policy_for(1, None);
+    approve(directory.path(), &policy);
+    let (reader, server) = local_mock(reader_script(vec![]));
+    let preview = reader.run_production_recurring(
+        &production_target(),
+        &policy,
+        directory.path(),
+        RecurringMode::PreviewWithPlan,
+        || panic!("preview must not load a writer"),
+        |_| successful_inputs(),
+    );
+    assert_eq!(preview.exit_code(), 0);
+    let preview = json!(preview);
+    assert_eq!(preview["moodle"]["planned"]["create"], 1);
+    assert_eq!(preview["moodle"]["planned"]["update"], 0);
+    server.join().unwrap();
+
+    let (exit, applied) = apply(
+        directory.path(),
+        &policy,
+        RecurringInputs {
+            moodle: Ok(mixed_input(&[], &[CATEGORY; 3])),
+            webclass: Err("disabled"),
+        },
+        reader_script(vec![managed(
+            UniversitySource::Moodle,
+            PAGE_A,
+            Some("Edited in Notion"),
+        )]),
+        None,
+    );
+    assert_eq!(exit, 2);
+    assert_eq!(applied["moodle"]["error"], "change_limit");
+    assert_eq!(applied["moodle"]["planned"]["create"], 2);
+    assert_eq!(applied["moodle"]["planned"]["update"], 1);
+    assert!(applied["moodle"]["applied"].is_null());
+    assert!(applied.get("plan").is_none());
 }
 
 #[test]

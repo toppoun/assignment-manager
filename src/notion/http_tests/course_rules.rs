@@ -228,9 +228,7 @@ fn production_assignment_preview_reads_rules_and_holds_manual_duplicates() {
 
     let production_rules = "42285934-7e84-8183-8e04-000ba36d1080";
     let destination = fake_id(0x100);
-    let mut course_page = course(0, TERM);
-    course_page["properties"]["授業名"] =
-        json!({"id":"title","type":"title","title":[text("Synthetic course")]});
+    let course_page = named_course(0, TERM, "Synthetic course");
     let rule_pages = vec![
         rule(0, "moodle-option", FEED, "Moodle category", &destination),
         rule(
@@ -251,10 +249,7 @@ fn production_assignment_preview_reads_rules_and_holds_manual_duplicates() {
     };
     let mut script = rule_snapshot();
     script.extend(rule_snapshot());
-    script.extend([
-        query(vec![task(MANUAL, None, "Moodle task 0")], None),
-        courses_query(vec![course_page]),
-    ]);
+    script.push(query(vec![task(MANUAL, None, "Moodle task 0")], None));
     for exchange in &mut script {
         for (from, to) in [
             (A, PRODUCTION_ASSIGNMENTS),
@@ -282,6 +277,9 @@ fn production_assignment_preview_reads_rules_and_holds_manual_duplicates() {
     assert!(inspection.relation_target_verified);
     assert_eq!(inspection.snapshot.unwrap().manual, 1);
     assert_eq!(rules.len(), 2);
+    assert!(rules.iter().all(|rule| {
+        matches!(&rule.destination, Ok(course) if course.title == "Synthetic course")
+    }));
     assert_eq!(
         plan.counts_for(&input),
         DryRunCounts {
@@ -369,21 +367,25 @@ fn production_first_sync_creates_only_approved_rows_preserves_manual_and_repeats
     acquired.sort_by_key(|(key, _)| *key);
     let mut rows = vec![manual.clone()];
     for (index, (key, source)) in acquired.into_iter().enumerate() {
-        let mut row = task(&fake_id(0x600 + index), Some(key), &source.title);
+        let title = format!("【人工知能】{}", source.title);
+        let mut row = task(&fake_id(0x600 + index), Some(key), &title);
         row["properties"]["授業"]["relation"] = json!([{"id":destination}]);
         row["properties"]["提出URL"]["url"] = Value::Null;
         rows.push(row.clone());
         script.push(query(vec![], None));
-        script.push(Exchange::json("POST", "/v1/pages", row).check(|_, body| {
-            assert_eq!(body["parent"]["data_source_id"], PRODUCTION_ASSIGNMENTS);
-            let fields = body["properties"].as_object().unwrap();
-            assert_eq!(fields.len(), 4);
-            assert!(
-                ["title", "sync", "orig", "R%3Ael"]
-                    .iter()
-                    .all(|id| fields.contains_key(*id))
-            );
-        }));
+        script.push(
+            Exchange::json("POST", "/v1/pages", row).check(move |_, body| {
+                assert_eq!(body["parent"]["data_source_id"], PRODUCTION_ASSIGNMENTS);
+                let fields = body["properties"].as_object().unwrap();
+                assert_eq!(fields.len(), 4);
+                assert_eq!(fields["title"]["title"], json!([text(&title)]));
+                assert!(
+                    ["title", "sync", "orig", "R%3Ael"]
+                        .iter()
+                        .all(|id| fields.contains_key(*id))
+                );
+            }),
+        );
     }
     script.extend(manual_snapshot(manual.clone()));
     script.extend(rules_snapshot());
@@ -526,12 +528,280 @@ fn fake_id(index: usize) -> String {
 }
 
 fn course(index: usize, term: &str) -> Value {
+    named_course(
+        index,
+        term,
+        if index == 0 {
+            "人工知能"
+        } else {
+            "プログラミング2"
+        },
+    )
+}
+
+fn named_course(index: usize, term: &str, title: &str) -> Value {
     page(
         &fake_id(0x100 + index),
         C,
         C_DB,
-        json!({"学期":rich("course-term", term)}),
+        json!({
+            "学期":rich("course-term", term),
+            "授業名":{"id":"title","type":"title","title":[text(title)]}
+        }),
     )
+}
+
+#[test]
+fn planned_titles_preserve_lms_text_and_enforce_the_combined_utf16_limit() {
+    let destination = fake_id(0x100);
+    let formal = "人工知能";
+    let at_limit = format!("{}😀", "課".repeat(1_992));
+    let over_limit = format!("{at_limit}課");
+    let titles = [
+        ("発展課題R2", Some("【人工知能】発展課題R2".to_owned())),
+        (
+            "【人工知能】発展課題R2",
+            Some("【人工知能】発展課題R2".to_owned()),
+        ),
+        (
+            "【最適化】発展課題R2",
+            Some("【人工知能】【最適化】発展課題R2".to_owned()),
+        ),
+        (
+            "第10回（任意）[補足]",
+            Some("【人工知能】第10回（任意）[補足]".to_owned()),
+        ),
+        (
+            "【人工知能 】課題",
+            Some("【人工知能】【人工知能 】課題".to_owned()),
+        ),
+        (&at_limit, Some(format!("【{formal}】{at_limit}"))),
+        (&over_limit, None),
+    ];
+    let mut input = mixed_input(&[], &vec!["source category"; titles.len()]);
+    for (index, (original, _)) in titles.iter().enumerate() {
+        input
+            .assignments
+            .get_mut(&key(&format!("moodle-{index}")))
+            .unwrap()
+            .title = (*original).into();
+    }
+    let mut script = schemas();
+    script.extend([
+        rules_query(
+            vec![rule(
+                0,
+                "moodle-option",
+                FEED,
+                "source category",
+                &destination,
+            )],
+            None,
+        ),
+        courses_query(vec![named_course(0, TERM, formal)]).check(|path, _| {
+            assert!(path.contains("filter_properties=course-term"));
+            assert!(path.contains("filter_properties=title"));
+        }),
+        query(vec![], None),
+    ]);
+    let (client, mock) = mock(script);
+    let report = client.dry_run(&input, &rules_target(), &[]);
+    assert_eq!(report.error(), None);
+    assert_eq!(report.counts().create, titles.len() - 1);
+    assert_eq!(report.counts().deferred, 1);
+    for (index, (original, expected)) in titles.iter().enumerate() {
+        let key = key(&format!("moodle-{index}"));
+        assert_eq!(input.assignments()[&key].title, *original);
+        let entry = report.plan().iter().find(|entry| entry.key == key).unwrap();
+        match expected {
+            Some(expected) => {
+                assert!(
+                    matches!(&entry.action, PlanAction::Create { assignment, display_title, .. }
+                    if assignment.title == *original && display_title == expected)
+                );
+                let request = report.requests().iter().find(|r| r.key() == &key).unwrap();
+                assert_eq!(
+                    request.body()["properties"]["title"]["title"],
+                    json!([text(expected)])
+                );
+            }
+            None => assert_eq!(
+                entry.action,
+                PlanAction::Deferred(DeferredReason::InvalidDisplayTitle)
+            ),
+        }
+    }
+    assert!(!format!("{:?} {report}", report.plan()).contains("発展課題"));
+    mock.join().unwrap();
+}
+
+#[test]
+fn unavailable_formal_course_titles_defer_only_the_affected_rules() {
+    let categories = [
+        "blank",
+        "missing",
+        "malformed",
+        "control",
+        "valid",
+        "missing page",
+    ];
+    let input = mixed_input(&[], &categories);
+    let mut missing = course(1, TERM);
+    missing["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("授業名");
+    let mut malformed = course(2, TERM);
+    malformed["properties"]["授業名"]["title"] = json!([{"type": "mention"}]);
+    let mut split = course(4, TERM);
+    split["properties"]["授業名"]["title"] = json!([text("最"), text("適化")]);
+    let rules = categories
+        .iter()
+        .enumerate()
+        .map(|(index, category)| {
+            rule(
+                index,
+                "moodle-option",
+                FEED,
+                category,
+                &fake_id(0x100 + index),
+            )
+        })
+        .collect();
+    let mut script = schemas();
+    script.extend([
+        rules_query(rules, None),
+        courses_query(vec![
+            named_course(0, TERM, "　 "),
+            missing,
+            malformed,
+            named_course(3, TERM, "授業\n名"),
+            split,
+        ]),
+        query(vec![], None),
+    ]);
+    let (client, mock) = mock(script);
+    let report = client.dry_run(&input, &rules_target(), &[]);
+    assert_eq!(report.counts().course_rules.invalid, 4);
+    assert_eq!(report.counts().course_rules.invalid_relation, 1);
+    assert_eq!(report.counts().deferred, 5);
+    let [request] = report.requests() else {
+        panic!("only one course has a verified title");
+    };
+    assert_eq!(request.key(), &key("moodle-4"));
+    assert_eq!(
+        request.body()["properties"]["title"]["title"],
+        json!([text("【最適化】Moodle task 4")])
+    );
+    mock.join().unwrap();
+}
+
+#[test]
+fn mixed_manual_titles_and_existing_keys_are_protected_during_migration() {
+    let categories = ["same"; 10];
+    let mut input = mixed_input(&[], &categories);
+    input.assignments.get_mut(&key("moodle-7")).unwrap().title = "【人工知能】課題7".into();
+    let destination = fake_id(0x100);
+    let with_course = |mut row: Value, id: &str| {
+        row["properties"]["授業"]["relation"] = json!([{"id":id}]);
+        row
+    };
+    let rows = vec![
+        task(MANUAL, None, "Moodle task 0"),
+        task(&fake_id(0x601), None, "【人工知能】Moodle task 1"),
+        with_course(
+            task(&fake_id(0x602), None, "【改名前】Moodle task 2"),
+            &destination,
+        ),
+        with_course(
+            task(&fake_id(0x603), None, "【別授業】Moodle task 3"),
+            OLD_COURSE,
+        ),
+        with_course(
+            task(&fake_id(0x604), Some(&key("moodle-4")), "Moodle task 4"),
+            &destination,
+        ),
+        with_course(
+            task(
+                &fake_id(0x605),
+                Some(&key("moodle-5")),
+                "【人工知能】Moodle task 5",
+            ),
+            &destination,
+        ),
+        with_course(
+            task(
+                &fake_id(0x606),
+                Some(&key("moodle-6")),
+                "【改名前】Moodle task 6",
+            ),
+            &destination,
+        ),
+        task(PAGE_B, None, "【人工知能】Moodle task 6"),
+        with_course(
+            task(&fake_id(0x607), None, "【改名前【演習】】【人工知能】課題7"),
+            &destination,
+        ),
+        task(&fake_id(0x608), None, "【重要】Moodle task 8"),
+        with_course(task(&fake_id(0x609), None, "Moodle task 9"), OLD_COURSE),
+    ];
+    let mut script = schemas();
+    script.extend([
+        rules_query(
+            vec![rule(0, "moodle-option", FEED, "same", &destination)],
+            None,
+        ),
+        courses_query(vec![course(0, TERM)]),
+        query(rows, None),
+    ]);
+    let (client, mock) = mock(script);
+    let report = client.dry_run(&input, &rules_target(), &[]);
+    let counts = report.counts();
+    assert_eq!(
+        (
+            counts.create,
+            counts.update,
+            counts.unchanged,
+            counts.deferred
+        ),
+        (3, 2, 1, 4)
+    );
+    let first = fake_id(0x604);
+    let second = fake_id(0x606);
+    let changes: HashSet<_> = report.title_changes().collect();
+    assert_eq!(
+        changes,
+        HashSet::from([
+            (first.as_str(), "Moodle task 4", "【人工知能】Moodle task 4"),
+            (
+                second.as_str(),
+                "【改名前】Moodle task 6",
+                "【人工知能】Moodle task 6"
+            ),
+        ])
+    );
+    let created: HashSet<_> = report
+        .requests()
+        .iter()
+        .filter(|r| r.method() == Method::POST)
+        .map(PreparedWrite::key)
+        .collect();
+    assert_eq!(
+        created,
+        HashSet::from([&key("moodle-3"), &key("moodle-8"), &key("moodle-9")])
+    );
+    assert!(
+        report
+            .requests()
+            .iter()
+            .filter(|r| r.method() == Method::PATCH)
+            .all(|r| r.body()["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .eq(["title"]))
+    );
+    mock.join().unwrap();
 }
 
 fn rule(index: usize, source: &str, scope: &str, external_id: &str, to: &str) -> Value {
@@ -565,7 +835,7 @@ fn verification_apply_creates_once_and_reads_back_the_same_input() {
     let input = mixed_input(&[], &["Moodle course"]);
     let key = input.assignments().keys().next().unwrap().clone();
     let destination = fake_id(0x100);
-    let mut created = task(PAGE_A, Some(&key), "Moodle task 0");
+    let mut created = task(PAGE_A, Some(&key), "【人工知能】Moodle task 0");
     created["properties"]["授業"]["relation"] = json!([{"id": destination}]);
     created["properties"]["提出URL"]["url"] = Value::Null;
     let mut edited = created.clone();
@@ -577,7 +847,8 @@ fn verification_apply_creates_once_and_reads_back_the_same_input() {
     changed.title = "Updated title".into();
     changed.deadline = Some(Deadline::DateTime("2026-12-01T14:59:59Z".parse().unwrap()));
     let mut changed_page = edited.clone();
-    changed_page["properties"]["タイトル（改名済）"]["title"] = json!([text("Updated title")]);
+    changed_page["properties"]["タイトル（改名済）"]["title"] =
+        json!([text("【人工知能】Updated title")]);
     changed_page["properties"]["期限"]["date"] = json!({"start":"2026-12-01T14:59:00Z"});
     let mut with_new = mixed_input(&[], &["Moodle course", "Moodle course"]);
     with_new.assignments.insert(key.clone(), changed.clone());
@@ -586,7 +857,7 @@ fn verification_apply_creates_once_and_reads_back_the_same_input() {
         .keys()
         .find(|candidate| *candidate != &key)
         .unwrap();
-    let mut created_b = task(PAGE_B, Some(new_key), "Moodle task 1");
+    let mut created_b = task(PAGE_B, Some(new_key), "【人工知能】Moodle task 1");
     created_b["properties"]["授業"]["relation"] = json!([{"id": destination}]);
     let baseline = |rows| {
         let mut script = schemas();
@@ -620,6 +891,10 @@ fn verification_apply_creates_once_and_reads_back_the_same_input() {
             assert_eq!(body["parent"]["data_source_id"], ASSIGNMENTS);
             let props = body["properties"].as_object().unwrap();
             assert_eq!(props.len(), 4);
+            assert_eq!(
+                props["title"]["title"],
+                json!([text("【人工知能】Moodle task 0")])
+            );
             assert!(!props.contains_key("url"));
             assert!(!props.contains_key("private"));
         }),
@@ -646,7 +921,7 @@ fn verification_apply_creates_once_and_reads_back_the_same_input() {
     script.push(Exchange::drop_response("PATCH", &task_path).check(|_, body| {
         assert_eq!(
             body["properties"],
-            json!({"title":{"title":[text("Updated title")]}, "due":{"date":{"start":"2026-12-01T14:59:59Z"}}})
+            json!({"title":{"title":[text("【人工知能】Updated title")]}, "due":{"date":{"start":"2026-12-01T14:59:59Z"}}})
         );
     }));
     script.push(Exchange::json("GET", &task_path, changed_page.clone()));
@@ -740,7 +1015,7 @@ fn verification_apply_creates_once_and_reads_back_the_same_input() {
     assert_eq!(
         changed.requests()[0].body()["properties"],
         json!({
-            "title": {"title": [text("Updated title")]},
+            "title": {"title": [text("【人工知能】Updated title")]},
             "due": {"date": {"start": "2026-12-01T14:59:59Z"}}
         })
     );
@@ -1025,7 +1300,7 @@ fn strict_rules_defer_affected_tasks_and_preserve_user_managed_fields() {
     assert_eq!(update.key(), &key("moodle-0"));
     assert_eq!(
         update.body(),
-        &json!({"properties":{"title":{"title":[text("Moodle task 0")]}}})
+        &json!({"properties":{"title":{"title":[text("【人工知能】Moodle task 0")]}}})
     );
     assert!(
         report
@@ -1065,7 +1340,11 @@ fn malformed_or_incomplete_rule_reads_yield_no_assignment_plan_writes() {
             vec![
                 schemas().pop().unwrap(),
                 rules_query(vec![good.clone()], Some("next")),
-                Exchange::json("POST", format!("/v1/data_sources/{RULES}/query"), capped),
+                Exchange::json(
+                    "POST",
+                    format!("/v1/data_sources/{RULES}/query"),
+                    capped.clone(),
+                ),
             ],
             NotionError::IncompleteSnapshot,
         ),
@@ -1074,6 +1353,22 @@ fn malformed_or_incomplete_rule_reads_yield_no_assignment_plan_writes() {
                 schemas().pop().unwrap(),
                 rules_query(vec![good.clone()], Some("next")),
                 rules_query(vec![good.clone()], None),
+            ],
+            NotionError::IncompleteSnapshot,
+        ),
+        (
+            vec![
+                schemas().pop().unwrap(),
+                rules_query(vec![good.clone()], None),
+                Exchange::error("POST", format!("/v1/data_sources/{C}/query"), 403, ""),
+            ],
+            NotionError::Forbidden,
+        ),
+        (
+            vec![
+                schemas().pop().unwrap(),
+                rules_query(vec![good], None),
+                Exchange::json("POST", format!("/v1/data_sources/{C}/query"), capped),
             ],
             NotionError::IncompleteSnapshot,
         ),

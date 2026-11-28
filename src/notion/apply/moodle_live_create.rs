@@ -97,6 +97,7 @@ impl NotionClient {
                 PlanAction::Create {
                     assignment,
                     course_page_id: Some(course_page_id),
+                    ..
                 } => Some((&item.key, assignment, course_page_id)),
                 _ => None,
             })

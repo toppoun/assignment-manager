@@ -113,9 +113,10 @@ pub fn exercise_apply(input: &SyncInput, directory: &Path) -> Result<[ApplyRepor
     let (client, _server) =
         start_server(true).map_err(|_| ApplyError::Notion(NotionError::Configuration))?;
     StateStore::initialize(&state.path().join("state.sqlite3"), ASSIGNMENTS)?;
+    let target = course_rules_target();
     Ok([
-        client.apply(input, &target(), &[], state.path())?,
-        client.apply(input, &target(), &[], state.path())?,
+        client.apply(input, &target, &[], state.path())?,
+        client.apply(input, &target, &[], state.path())?,
     ])
 }
 
@@ -161,28 +162,38 @@ fn university_keys_reconcile_the_same_notion_pages_with_independent_state() {
 
     let (client, _server) = start_server(true).unwrap();
     let directory = super::state::test_state_dir();
-    let target = target();
+    let target = course_rules_target();
     let target_id = target.validated_id().unwrap();
     let first = acquire();
     let second = acquire();
     assert_eq!(first.assignments().len(), 10);
     assert_eq!(first.assignments(), second.assignments());
+    let preview = client.dry_run(&first, &target, &[]);
+    assert_eq!(preview.counts().create, 10);
     // Fixed UTF-8 byte-level vectors run identically on every host.
-    for (key, title, due, course) in [
+    for (key, title, due, course, display) in [
         (
             "v1:b7e92444ae37a18bb36c597fd2e6bd2ba0999bff4ece1984c465aba44cb977aa",
             "演習課題01",
             "2026-09-27T14:59:00Z",
             "Java2-2026",
+            "【合成授業 1】演習課題01",
         ),
         (
             "v1:f2683d509d2cc28d68ced0815d6c3cd4012d5ef6fa592db1c56ef3c3ef6aefd1",
             "演習課題A",
             "2026-10-31T14:59:59Z",
             "fixture-course-002",
+            "【合成授業 2】演習課題A",
         ),
     ] {
-        let assignment = &first.assignments()[&key.parse().unwrap()];
+        let key = key.parse().unwrap();
+        let assignment = &first.assignments()[&key];
+        let request = preview.requests().iter().find(|r| r.key() == &key).unwrap();
+        assert_eq!(
+            request.body()["properties"]["title"]["title"][0]["text"]["content"],
+            display
+        );
         assert_eq!(assignment.title, title);
         assert_eq!(
             assignment.deadline,
@@ -470,7 +481,12 @@ fn handle(
                         0x120 + index,
                         COURSES,
                         COURSES_DB,
-                        json!({"Term": rich("term", FIXTURE_TERM)}),
+                        json!({
+                            "Term": rich("term", FIXTURE_TERM),
+                            "Title": {"id":"title","type":"title","title":[
+                                super::wire::text_item(&format!("合成授業 {}", index + 1))
+                            ]}
+                        }),
                     )
                 })
                 .collect();

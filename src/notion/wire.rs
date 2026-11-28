@@ -442,6 +442,19 @@ impl Schema {
         ))
     }
 
+    pub(super) fn read_manual_comparison(
+        &self,
+        page: &Value,
+        row: &mut NotionAssignment,
+    ) -> Result<(), NotionError> {
+        (row.title, row.deadline) = self.manual_title_deadline(page)?;
+        // Missing or partial relations cannot rule out a possible duplicate.
+        if let Ok((courses, false)) = page_relations(page, &self.properties.course) {
+            row.course_page_ids = courses;
+        }
+        Ok(())
+    }
+
     pub(super) fn title_content<'a>(&self, page: &'a Value) -> Result<&'a Value, NotionError> {
         page_property(page, &self.properties.title, "title")
     }
@@ -455,9 +468,10 @@ impl Schema {
         let request = match &entry.action {
             PlanAction::Create {
                 assignment,
+                display_title,
                 course_page_id,
             } => {
-                props.insert(ids.title.clone(), title_value(&assignment.title)?);
+                props.insert(ids.title.clone(), title_value(display_title)?);
                 props.insert(ids.source.clone(), self.source_value(assignment.source));
                 props.insert(
                     ids.sync_key.clone(),
@@ -598,11 +612,15 @@ pub(super) fn text_item(text: &str) -> Value {
 }
 
 pub(super) fn title_value(title: &str) -> Result<Value, NotionError> {
-    // Conservative size unit for supplementary Unicode characters.
-    if title.trim().is_empty() || title.encode_utf16().count() > 2_000 {
+    if !valid_title(title) {
         return Err(NotionError::InvalidWrite);
     }
     Ok(json!({"title":[text_item(title)]}))
+}
+
+pub(super) fn valid_title(title: &str) -> bool {
+    // Conservative size unit for supplementary Unicode characters.
+    !title.trim().is_empty() && title.encode_utf16().count() <= 2_000
 }
 
 fn date_value(deadline: Option<&Deadline>) -> Value {

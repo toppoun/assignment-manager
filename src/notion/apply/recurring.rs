@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     path::Path,
 };
 
@@ -12,10 +12,14 @@ use crate::notion::{
     DeferredReason, DryRunCounts, DryRunReport, NotionPropertyIds, NotionSnapshot, NotionTarget,
     PlanAction, PreparedWrite, SyncInput, UniversitySource, live_assignment_read_target,
     plan::plan_sync_with_rules,
+    reader::cross_source_candidates,
     state::{RunIssue, RunOutcome, StateError, StateStore, TargetLock},
     trial::PRODUCTION_ASSIGNMENTS,
-    wire::{notion_deadline_matches, uuid},
+    wire::uuid,
 };
+
+mod preview;
+use preview::{PlanPreview, source_label};
 
 const SOURCES: [UniversitySource; 2] = [UniversitySource::Moodle, UniversitySource::WebClass];
 
@@ -69,6 +73,8 @@ pub struct RecurringInputs {
 #[serde(rename_all = "snake_case")]
 pub enum RecurringMode {
     Preview,
+    #[serde(rename = "preview")]
+    PreviewWithPlan,
     Apply,
 }
 
@@ -115,19 +121,27 @@ pub struct RecurringReport {
     recovered_creates: Option<usize>,
     moodle: SourceReport,
     webclass: SourceReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<PlanPreview>,
 }
 
 impl RecurringReport {
     pub fn blocked(mode: RecurringMode, error: &'static str) -> Self {
+        let show_plan = mode == RecurringMode::PreviewWithPlan;
         Self {
             schema_version: 1,
-            mode,
+            mode: if show_plan {
+                RecurringMode::Preview
+            } else {
+                mode
+            },
             status: Status::Blocked,
             error: Some(error),
             pending_creates: None,
             recovered_creates: None,
             moodle: SourceReport::default(),
             webclass: SourceReport::default(),
+            plan: show_plan.then(PlanPreview::default),
         }
     }
 
@@ -431,7 +445,11 @@ impl NotionClient {
         let mut report = RecurringReport::blocked(mode, "not_started");
         report.error = None;
         for source in SOURCES {
-            if policy.limits(source).is_none() {
+            if let Some(limits) = policy.limits(source) {
+                if let Some(plan) = &mut report.plan {
+                    plan.add_source(source, limits);
+                }
+            } else {
                 report.source(source).acquisition = "disabled";
             }
         }
@@ -469,7 +487,9 @@ impl NotionClient {
         let path = directory.join("state.sqlite3");
         let store = match report.mode {
             RecurringMode::Apply => Some(StateStore::for_apply(&path, &id).map_err(state_code)?),
-            RecurringMode::Preview => StateStore::read_only(&path, &id).map_err(state_code)?,
+            RecurringMode::Preview | RecurringMode::PreviewWithPlan => {
+                StateStore::read_only(&path, &id).map_err(state_code)?
+            }
         };
         let approved = if let (RecurringMode::Apply, Some(store)) = (report.mode, &store) {
             let approval = store
@@ -594,7 +614,7 @@ impl NotionClient {
             .map_err(state_code)?
             .unwrap_or_default();
         let fresh = self
-            .prepare_plan(schema, state, |schema, rows| {
+            .prepare_plan(schema, state, Some(&rules), |schema, rows| {
                 let mut seen = HashSet::new();
                 if rows
                     .iter()
@@ -606,7 +626,7 @@ impl NotionClient {
                 let mut all = DryRunReport::default();
                 for (source, input) in &inputs {
                     let plan = plan_sync_with_rules(input, NotionSnapshot::Complete(rows), &rules);
-                    match Self::prepare_report(schema, plan) {
+                    match Self::prepare_report(schema, plan, rows) {
                         Ok(mut plan) => {
                             plan.retain_input(input);
                             all.append(plan);
@@ -629,18 +649,46 @@ impl NotionClient {
             .map_err(state_code)?
             .unwrap_or_default();
         report.pending_creates = Some(fresh.pending);
+        if let Some(plan) = &mut report.plan {
+            plan.capture(&fresh, &inputs);
+        }
         let mut pending = Vec::new();
+        let mut unattributed = false;
         for key in &fresh.unresolved_keys {
             let source = inputs
                 .iter()
                 .find_map(|(source, input)| {
                     input.assignments().contains_key(key).then_some(*source)
                 })
-                .or_else(|| origins.get(key).copied())
-                .ok_or("unattributed_pending_create")?;
-            pending.push(source);
+                .or_else(|| origins.get(key).copied());
+            if let Some(unresolved) = report
+                .plan
+                .as_mut()
+                .and_then(|plan| plan.unresolved_creates.as_mut())
+            {
+                unresolved.push(preview::PendingCreate {
+                    sync_key: key.as_str().to_owned(),
+                    source: source.map(source_label),
+                });
+            }
+            if let Some(source) = source {
+                pending.push(source);
+            } else {
+                unattributed = true;
+            }
+        }
+        if unattributed {
+            return Err("unattributed_pending_create");
         }
 
+        let duplicates = cross_source_candidates(
+            fresh.deltas.plan(),
+            fresh.pages.iter().map(|page| &page.row),
+            inputs
+                .iter()
+                .flat_map(|(_, input)| input.assignments().values()),
+            &rules,
+        );
         let mut candidates = Vec::new();
         for (source, input) in &inputs {
             let result = report.source(*source);
@@ -662,7 +710,10 @@ impl NotionClient {
                 Some("reconciliation_required")
             } else if unsafe_patch {
                 Some("protected_field_change")
-            } else if has_cross_source_duplicate(&fresh, input, &inputs, &rules) {
+            } else if duplicates
+                .iter()
+                .any(|key| input.assignments().contains_key(key))
+            {
                 Some("potential_duplicate")
             } else {
                 None
@@ -806,55 +857,6 @@ fn scope_plan(full: &PreparedApply, input: &SyncInput) -> PreparedApply {
         unresolved_keys: Vec::new(),
         missing_bindings: 0,
     }
-}
-
-fn has_cross_source_duplicate(
-    plan: &PreparedApply,
-    input: &SyncInput,
-    inputs: &[(UniversitySource, SyncInput)],
-    rules: &crate::notion::course_rules::CourseRules,
-) -> bool {
-    let mut other = HashMap::<_, Vec<_>>::new();
-    for assignment in inputs
-        .iter()
-        .flat_map(|(_, input)| input.assignments().values())
-    {
-        if let Ok(course) = rules.resolve(assignment) {
-            other
-                .entry((course, assignment.title.as_str()))
-                .or_default()
-                .push((assignment.source, &assignment.deadline));
-        }
-    }
-    for page in &plan.pages {
-        let row = &page.row;
-        if let (Some(_), Some(source), [course]) =
-            (&row.sync_key, row.source, row.course_page_ids.as_slice())
-        {
-            other
-                .entry((course.as_str(), row.title.as_str()))
-                .or_default()
-                .push((source, &row.deadline));
-        }
-    }
-    plan.deltas.plan().iter().any(|entry| {
-        let PlanAction::Create {
-            assignment,
-            course_page_id: Some(course),
-        } = &entry.action
-        else {
-            return false;
-        };
-        input.assignments().contains_key(&entry.key)
-            && other
-                .get(&(course.as_str(), assignment.title.as_str()))
-                .is_some_and(|matches| {
-                    matches.iter().any(|(source, deadline)| {
-                        *source != assignment.source
-                            && notion_deadline_matches(deadline, &assignment.deadline)
-                    })
-                })
-    })
 }
 
 fn rules_target(target: &NotionTarget) -> Result<&crate::notion::CourseRulesTarget, &'static str> {

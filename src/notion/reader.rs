@@ -11,7 +11,7 @@ use super::{
     CourseMapping, DeferredReason, NotionAssignment, NotionClient, NotionError, NotionSnapshot,
     NotionTarget, PlanAction, PlannedAssignment, PreparedWrite, SyncInput, SyncKey,
     course_rules::CourseRules,
-    plan::plan_sync_with_rules,
+    plan::{course_prefix, display_title, plan_sync_with_rules},
     plan_sync,
     state::{BindingStatus, StateSummary},
     wire::{Schema, checked_page_id, notion_deadline_matches, relation_id, uuid},
@@ -64,6 +64,7 @@ impl fmt::Display for CoursePlanCounts {
 pub struct DryRunReport {
     plan: Vec<PlannedAssignment>,
     requests: Vec<PreparedWrite>,
+    previous_titles: HashMap<SyncKey, String>,
     error: Option<NotionError>,
 }
 
@@ -72,6 +73,7 @@ impl DryRunReport {
         Self {
             plan: plan_sync(input, NotionSnapshot::Incomplete, &[]),
             requests: Vec::new(),
+            previous_titles: HashMap::new(),
             error: Some(error),
         }
     }
@@ -84,6 +86,21 @@ impl DryRunReport {
     }
     pub fn error(&self) -> Option<NotionError> {
         self.error
+    }
+
+    /// Explicit preview of planned title updates as (page ID, before, after).
+    /// Titles are omitted from normal report formatting.
+    pub fn title_changes(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.plan.iter().filter_map(|entry| {
+            let PlanAction::Update { page_id, patch } = &entry.action else {
+                return None;
+            };
+            Some((
+                page_id.as_str(),
+                self.previous_titles.get(&entry.key)?.as_str(),
+                patch.title.as_deref()?,
+            ))
+        })
     }
 
     /// Require a prior binding to agree with the complete snapshot before
@@ -112,6 +129,7 @@ impl DryRunReport {
         }
         self.requests
             .retain(|request| !blocked.contains(request.key()));
+        self.previous_titles.retain(|key, _| !blocked.contains(key));
     }
 
     pub fn counts(&self) -> DryRunCounts {
@@ -127,11 +145,14 @@ impl DryRunReport {
             .retain(|entry| input.assignments().contains_key(&entry.key));
         self.requests
             .retain(|request| input.assignments().contains_key(request.key()));
+        self.previous_titles
+            .retain(|key, _| input.assignments().contains_key(key));
     }
 
     pub(super) fn append(&mut self, mut other: Self) {
         self.plan.append(&mut other.plan);
         self.requests.append(&mut other.requests);
+        self.previous_titles.extend(other.previous_titles);
     }
 
     pub(super) fn counts_where(&self, include: impl Fn(&SyncKey) -> bool) -> DryRunCounts {
@@ -172,28 +193,61 @@ impl DryRunReport {
     pub(super) fn defer_manual_candidates(
         &mut self,
         rows: &[NotionAssignment],
+        rules: Option<&CourseRules>,
     ) -> Vec<(SyncKey, String)> {
-        let mut manuals = HashMap::<&str, Vec<&NotionAssignment>>::new();
-        for row in rows.iter().filter(|row| row.sync_key.is_none()) {
-            manuals.entry(&row.title).or_default().push(row);
+        let mut manuals = HashMap::<_, Vec<_>>::new();
+        let mut bracketed = Vec::new();
+        for page in rows.iter().filter(|page| page.sync_key.is_none()) {
+            manuals.entry(page.title.as_str()).or_default().push(page);
+            if rules.is_some() && page.title.starts_with('【') {
+                bracketed.push(page);
+            }
         }
         let mut matches = Vec::new();
         let mut blocked = HashSet::new();
         for row in &mut self.plan {
-            let PlanAction::Create { assignment, .. } = &row.action else {
+            let PlanAction::Create {
+                assignment,
+                display_title,
+                ..
+            } = &row.action
+            else {
                 continue;
             };
-            let before = matches.len();
-            if let Some(pages) = manuals.get(assignment.title.as_str()) {
-                matches.extend(
-                    pages
-                        .iter()
-                        .filter(|page| {
-                            notion_deadline_matches(&page.deadline, &assignment.deadline)
+            let course = rules.and_then(|rules| rules.resolve(assignment).ok());
+            let exact = [
+                Some(assignment.title.as_str()),
+                (display_title != &assignment.title).then_some(display_title.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|title| manuals.get(title))
+            .flatten()
+            .copied()
+            .filter(|page| {
+                course.is_none_or(|course| {
+                    page.course_page_ids.is_empty()
+                        || page.course_page_ids.contains(&course.page_id)
+                })
+            });
+            let prefix = course.map(|course| course_prefix(&course.title));
+            let possible_earlier =
+                course
+                    .zip(prefix.as_deref())
+                    .into_iter()
+                    .flat_map(|(course, prefix)| {
+                        bracketed.iter().copied().filter(move |page| {
+                            page.course_page_ids.as_slice() == [course.page_id.as_str()]
+                                && possible_former_prefix(&page.title, &assignment.title, prefix)
                         })
-                        .map(|page| (row.key.clone(), page.page_id.clone())),
-                );
-            }
+                    });
+            let before = matches.len();
+            matches.extend(
+                exact
+                    .chain(possible_earlier)
+                    .filter(|page| notion_deadline_matches(&page.deadline, &assignment.deadline))
+                    .map(|page| (row.key.clone(), page.page_id.clone())),
+            );
             if matches.len() != before {
                 blocked.insert(&row.key);
                 row.action = PlanAction::Deferred(DeferredReason::ManualCandidate);
@@ -203,6 +257,83 @@ impl DryRunReport {
             .retain(|request| !blocked.contains(request.key()));
         matches
     }
+}
+
+/// A possible former display title only blocks creation. It cannot select a
+/// page or establish ownership. The caller checks the course and deadline.
+fn possible_former_prefix(stored_title: &str, original_title: &str, current_prefix: &str) -> bool {
+    !stored_title.starts_with(current_prefix)
+        && stored_title
+            .strip_suffix(original_title)
+            .and_then(|prefix| prefix.strip_prefix('【')?.strip_suffix('】'))
+            .is_some_and(|name| !name.trim().is_empty() && !name.chars().any(char::is_control))
+}
+
+pub(super) fn cross_source_candidates<'a>(
+    plan: &[PlannedAssignment],
+    rows: impl IntoIterator<Item = &'a NotionAssignment>,
+    inputs: impl IntoIterator<Item = &'a super::SyncAssignment>,
+    rules: &'a CourseRules,
+) -> HashSet<SyncKey> {
+    let mut acquired_by_course = HashMap::<_, Vec<_>>::new();
+    for assignment in inputs {
+        if let Ok(course) = rules.resolve(assignment) {
+            acquired_by_course
+                .entry(course.page_id.as_str())
+                .or_default()
+                .push((assignment, display_title(&course.title, &assignment.title)));
+        }
+    }
+    let mut stored_by_course = HashMap::<_, Vec<_>>::new();
+    for row in rows {
+        if let (Some(_), Some(source), [course]) =
+            (&row.sync_key, row.source, row.course_page_ids.as_slice())
+        {
+            stored_by_course
+                .entry(course.as_str())
+                .or_default()
+                .push((source, row));
+        }
+    }
+
+    let mut blocked = HashSet::new();
+    for entry in plan {
+        let PlanAction::Create {
+            assignment,
+            display_title,
+            course_page_id: Some(course),
+        } = &entry.action
+        else {
+            continue;
+        };
+        let Ok(resolved) = rules.resolve(assignment) else {
+            continue;
+        };
+        let prefix = course_prefix(&resolved.title);
+        let acquired = acquired_by_course
+            .get(course.as_str())
+            .is_some_and(|others| {
+                others.iter().any(|(other, other_display_title)| {
+                    other.source != assignment.source
+                        && (other.title == assignment.title || other_display_title == display_title)
+                        && (notion_deadline_matches(&other.deadline, &assignment.deadline)
+                            || notion_deadline_matches(&assignment.deadline, &other.deadline))
+                })
+            });
+        let stored = stored_by_course.get(course.as_str()).is_some_and(|others| {
+            others.iter().any(|(source, row)| {
+                *source != assignment.source
+                    && notion_deadline_matches(&row.deadline, &assignment.deadline)
+                    && (row.title == assignment.title
+                        || row.title == *display_title
+                        || possible_former_prefix(&row.title, &assignment.title, &prefix))
+            })
+        });
+        if acquired || stored {
+            blocked.insert(entry.key.clone());
+        }
+    }
+    blocked
 }
 
 impl fmt::Display for DryRunReport {
@@ -296,7 +427,7 @@ impl NotionClient {
                 verify_course(id)?;
             }
         }
-        Self::prepare_report(schema, plan)
+        Self::prepare_report(schema, plan, rows)
     }
 
     pub(super) fn plan_from_course_rules(
@@ -306,24 +437,47 @@ impl NotionClient {
         rules: &CourseRules,
     ) -> Result<DryRunReport, NotionError> {
         let plan = plan_sync_with_rules(input, NotionSnapshot::Complete(rows), rules);
-        let mut report = Self::prepare_report(schema, plan)?;
-        report.defer_manual_candidates(rows);
+        let mut report = Self::prepare_report(schema, plan, rows)?;
+        report.defer_manual_candidates(rows, Some(rules));
+        let blocked =
+            cross_source_candidates(report.plan(), rows, input.assignments().values(), rules);
+        for entry in &mut report.plan {
+            if blocked.contains(&entry.key) {
+                entry.action = PlanAction::Deferred(DeferredReason::CrossSourceCandidate);
+            }
+        }
+        report
+            .requests
+            .retain(|request| !blocked.contains(request.key()));
         Ok(report)
     }
 
     pub(super) fn prepare_report(
         schema: &Schema,
         plan: Vec<PlannedAssignment>,
+        rows: &[NotionAssignment],
     ) -> Result<DryRunReport, NotionError> {
         let mut requests = Vec::new();
+        let titles: HashMap<_, _> = rows
+            .iter()
+            .map(|row| (row.page_id.as_str(), &row.title))
+            .collect();
+        let mut previous_titles = HashMap::new();
         for entry in &plan {
             if let Some(request) = schema.prepare(entry)? {
                 requests.push(request);
+            }
+            if let PlanAction::Update { page_id, patch } = &entry.action
+                && patch.title.is_some()
+                && let Some(title) = titles.get(page_id.as_str())
+            {
+                previous_titles.insert(entry.key.clone(), (*title).clone());
             }
         }
         Ok(DryRunReport {
             plan,
             requests,
+            previous_titles,
             error: None,
         })
     }
@@ -365,7 +519,7 @@ impl NotionClient {
     ) -> Result<Vec<NotionAssignment>, NotionError> {
         self.query_assignment_pages(schema, None, |page, mut row| {
             if row.sync_key.is_none() {
-                (row.title, row.deadline) = schema.manual_title_deadline(page)?;
+                schema.read_manual_comparison(page, &mut row)?;
             }
             Ok(row)
         })

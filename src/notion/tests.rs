@@ -220,12 +220,14 @@ fn notion_initial_plan_preserves_same_title_tasks_and_manual_rows_then_converges
     for id in ["a", "b"] {
         let PlanAction::Create {
             assignment,
+            display_title,
             course_page_id,
         } = action(&initial, &key(id))
         else {
             panic!("expected a create");
         };
         assert_eq!(assignment.title, "Same title");
+        assert_eq!(display_title, "Same title");
         assert_eq!(assignment.submission_url, None);
         assert_eq!(course_page_id, &None);
         rows.push(moodle_row(id, &assignment.title));

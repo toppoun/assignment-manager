@@ -7,7 +7,7 @@ use crate::{domain::Deadline, import::ExternalRecordKey};
 use serde::{Deserialize, Serialize};
 
 use super::course_rules::CourseRules;
-use super::wire::{notion_deadline_matches, uuid};
+use super::wire::{notion_deadline_matches, uuid, valid_title};
 use super::{SyncAssignment, SyncInput, SyncKey, UniversitySource};
 
 /// The read projection needed to compare source-owned properties. A row with
@@ -20,7 +20,8 @@ pub struct NotionAssignment {
     pub source: Option<UniversitySource>,
     pub title: String,
     pub deadline: Option<Deadline>,
-    /// All page IDs in the course relation on a managed page.
+    /// Complete relation on a managed page. Manual rows may include course IDs
+    /// as context for a potential duplicate.
     pub course_page_ids: Vec<String>,
 }
 
@@ -67,18 +68,21 @@ impl fmt::Debug for AssignmentPatch {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConflictReason {
     DuplicateSyncKey,
     InvalidOrRepeatedPage,
     AmbiguousCourseMapping,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeferredReason {
     IncompleteSnapshot,
     PendingReconciliation,
     ManualCandidate,
+    CrossSourceCandidate,
     /// Only an earlier WebClass attempt produced this candidate.
     EarlierAttempt,
     /// The run has no current candidate. Includes failed, skipped, filtered and absent records.
@@ -90,12 +94,14 @@ pub enum DeferredReason {
     CourseTermUnverified,
     CourseRelationMismatch,
     CourseExcluded,
+    InvalidDisplayTitle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PlanAction {
     Create {
         assignment: SyncAssignment,
+        display_title: String,
         course_page_id: Option<String>,
     },
     Update {
@@ -110,6 +116,34 @@ pub enum PlanAction {
     Excluded,
 }
 
+impl fmt::Debug for PlanAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create {
+                assignment,
+                course_page_id,
+                ..
+            } => f
+                .debug_struct("Create")
+                .field("assignment", assignment)
+                .field("course_page_id", course_page_id)
+                .finish(),
+            Self::Update { page_id, patch } => f
+                .debug_struct("Update")
+                .field("page_id", page_id)
+                .field("patch", patch)
+                .finish(),
+            Self::Unchanged { page_id } => f
+                .debug_struct("Unchanged")
+                .field("page_id", page_id)
+                .finish(),
+            Self::Conflict(reason) => f.debug_tuple("Conflict").field(reason).finish(),
+            Self::Deferred(reason) => f.debug_tuple("Deferred").field(reason).finish(),
+            Self::Excluded => f.write_str("Excluded"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedAssignment {
     pub key: SyncKey,
@@ -121,6 +155,7 @@ pub struct PlannedAssignment {
 /// Produce one action per managed synchronization key in lexicographic key
 /// order. Conflicts suppress writes for the affected keys. An incomplete
 /// snapshot suppresses all writes. Manual rows never produce an operation.
+/// This entry point uses the legacy page-ID mappings for the trial commands.
 pub fn plan_sync(
     input: &SyncInput,
     snapshot: NotionSnapshot<'_>,
@@ -141,7 +176,7 @@ pub fn plan_sync(
         {
             None => CourseResolution::Unmapped,
             Some(pages) => match pages.first().filter(|_| pages.len() == 1) {
-                Some(Some(id)) => CourseResolution::Mapped(id),
+                Some(Some(id)) => CourseResolution::LegacyMapped(id),
                 _ => CourseResolution::AmbiguousLegacyMapping,
             },
         }
@@ -155,7 +190,7 @@ pub(super) fn plan_sync_with_rules(
 ) -> Vec<PlannedAssignment> {
     plan_assignments(input, snapshot, true, |assignment| {
         match rules.resolve(assignment) {
-            Ok(id) => CourseResolution::Mapped(id),
+            Ok(course) => CourseResolution::Confirmed(course),
             Err(reason) => CourseResolution::Deferred(reason),
         }
     })
@@ -163,9 +198,23 @@ pub(super) fn plan_sync_with_rules(
 
 enum CourseResolution<'a> {
     Unmapped,
-    Mapped(&'a str),
+    LegacyMapped(&'a str),
+    Confirmed(&'a super::course_rules::ConfirmedCourse),
     AmbiguousLegacyMapping,
     Deferred(DeferredReason),
+}
+
+pub(super) fn display_title(course_title: &str, original_title: &str) -> String {
+    let prefix = course_prefix(course_title);
+    if original_title.starts_with(&prefix) {
+        original_title.to_owned()
+    } else {
+        prefix + original_title
+    }
+}
+
+pub(super) fn course_prefix(course_title: &str) -> String {
+    format!("【{course_title}】")
 }
 
 fn plan_assignments<'a>(
@@ -260,9 +309,19 @@ fn plan_assignment<'a>(
         return (PlanAction::Deferred(reason), false);
     };
 
-    let course_page_id = match resolve_course(assignment) {
-        CourseResolution::Unmapped => None,
-        CourseResolution::Mapped(id) => Some(id),
+    let (course_page_id, title) = match resolve_course(assignment) {
+        CourseResolution::Unmapped => (None, assignment.title.clone()),
+        CourseResolution::LegacyMapped(id) => (Some(id), assignment.title.clone()),
+        CourseResolution::Confirmed(course) => {
+            let title = display_title(&course.title, &assignment.title);
+            if !valid_title(&title) {
+                return (
+                    PlanAction::Deferred(DeferredReason::InvalidDisplayTitle),
+                    false,
+                );
+            }
+            (Some(course.page_id.as_str()), title)
+        }
         CourseResolution::AmbiguousLegacyMapping => {
             return (
                 PlanAction::Conflict(ConflictReason::AmbiguousCourseMapping),
@@ -278,6 +337,7 @@ fn plan_assignment<'a>(
         return (
             PlanAction::Create {
                 assignment: assignment.clone(),
+                display_title: title,
                 course_page_id: course_page_id.map(str::to_owned),
             },
             false,
@@ -303,7 +363,7 @@ fn plan_assignment<'a>(
     };
     let patch = AssignmentPatch {
         source: (page.source != Some(assignment.source)).then_some(assignment.source),
-        title: (page.title != assignment.title).then(|| assignment.title.clone()),
+        title: (page.title != title).then_some(title),
         deadline: (!deadline_matches).then(|| assignment.deadline.clone()),
         course_page_id,
     };

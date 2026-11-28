@@ -234,8 +234,8 @@ impl Arguments {
             }
             ["sync", "--dry-run"] => Command::Sync(false),
             #[cfg(target_os = "macos")]
-            ["sync", "recurring", option] => {
-                Command::ProductionRecurring(recurring::Action::parse(option)?)
+            ["sync", "recurring", options @ ..] => {
+                Command::ProductionRecurring(recurring::Action::parse(options)?)
             }
             #[cfg(target_os = "macos")]
             [
@@ -1066,7 +1066,7 @@ fn execute(args: Arguments) -> Result<u8, CliError> {
         );
         #[cfg(target_os = "macos")]
         println!(
-            "Production recurring sync: --config PATH sync recurring <--dry-run | --enable-writes | --apply | --disable-writes>"
+            "Production recurring sync: --config PATH sync recurring <--dry-run [--show-plan] | --enable-writes | --apply | --disable-writes>"
         );
         println!(
             "Offline WebClass preflight: university-check webclass --courses-only --check-local [--http-probe]"
