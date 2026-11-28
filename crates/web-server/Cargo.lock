@@ -90,6 +90,7 @@ dependencies = [
  "hyper",
  "ical",
  "keyring-core",
+ "libc",
  "quick-xml",
  "reqwest",
  "rpassword",
